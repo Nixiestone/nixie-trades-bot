@@ -1,0 +1,225 @@
+# Nix Trades Telegram Bot - Git Ignore File
+# NEVER commit sensitive data to version control
+
+# ==================== ENVIRONMENT ====================
+.env
+.env.local
+.env.production
+*.env
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# ==================== PYTHON ====================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# ==================== LOGS ====================
+*.log
+logs/
+*.log.*
+bot.log
+nix_trades_bot.log
+
+# ==================== DATABASE ====================
+*.db
+*.sqlite
+*.sqlite3
+*.sql.backup
+backups/
+
+# ==================== ML MODELS ====================
+# Large model files (>100MB should use Git LFS if needed)
+models/*.h5
+models/*.pkl
+models/*.joblib
+models/*.pth
+models/checkpoints/
+*.weights
+*.ckpt
+
+# Training data (too large for Git)
+data/raw/
+data/processed/
+*.csv.large
+historical_data/
+
+# ==================== MT5 SPECIFIC ====================
+# MT5 Terminal files (if accidentally in repo)
+*.ex5
+*.dll
+Terminal/
+MQL5/
+Experts/Logs/
+
+# ==================== IDE / EDITORS ====================
+# VSCode
+.vscode/
+.vscode-test/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.vim/
+
+# Emacs
+*~
+\#*\#
+
+# ==================== OS SPECIFIC ====================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+
+# ==================== TEMPORARY FILES ====================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+tmp/
+temp/
+
+# ==================== CHARTS ====================
+# Generated chart images (will be created dynamically)
+charts/
+*.png.generated
+screenshots/
+
+# ==================== SECRETS ====================
+# Credentials and keys
+secrets/
+*.key
+*.pem
+*.crt
+*.p12
+credentials.json
+service-account.json
+google-credentials.json
+firebase-adminsdk.json
+
+# Encryption keys
+encryption_key.txt
+fernet_key.txt
+
+# ==================== DEPLOYMENT ====================
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Ansible
+*.retry
+
+# ==================== DOCUMENTATION ====================
+# Compiled documentation
+docs/_build/
+docs/.doctrees/
+site/
+
+# ==================== JUPYTER NOTEBOOKS ====================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*.ipynb
+
+# ==================== NODE.JS (if using any JS tooling) ====================
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
+
+# ==================== PROJECT SPECIFIC ====================
+# User uploaded files (if stored locally instead of cloud)
+uploads/
+user_data/
+
+# Cache directories
+.cache/
+*.cache
+
+# Profiling data
+*.prof
+.prof/
+
+# ==================== SUPABASE ====================
+# Local Supabase development
+.supabase/
+
+# ==================== NOTES ====================
+# Notes:
+# - Always verify .env is in this file before committing
+# - ML models can be stored in Git LFS if version tracking needed
+# - Never commit API keys, passwords, or encryption keys
+# - Check git status before every commit
