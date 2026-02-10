@@ -1,0 +1,34 @@
+# Telegram Bot
+python-telegram-bot==20.7
+
+# Database
+supabase==2.3.0
+
+# MT5 Integration
+MetaTrader5==5.0.45
+
+# Machine Learning
+tensorflow==2.15.0
+scikit-learn==1.4.0
+xgboost==2.0.3
+numpy==1.26.3
+pandas==2.1.4
+
+# Data Fetching
+requests==2.31.0
+alpha-vantage==2.3.1
+
+# Scheduling
+APScheduler==3.10.4
+
+# Chart Generation
+matplotlib==3.8.2
+Pillow==10.2.0
+
+# Utilities
+python-dotenv==1.0.0
+pytz==2024.1
+cryptography==41.0.7
+
+# Logging
+loguru==0.7.2
