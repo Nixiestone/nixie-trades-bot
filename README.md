@@ -53,7 +53,7 @@ Before you begin, ensure you have:
 ### Step 1: Clone Repository
 
 ```bash
-git clone https://github.com/your-username/nix-trades-bot.git
+git clone https://github.com/Nixiestone/nix-trades-bot.git
 cd nix-trades-bot
 ```
 

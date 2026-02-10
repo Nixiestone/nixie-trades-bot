@@ -14,21 +14,15 @@ xgboost==2.0.3
 numpy==1.26.3
 pandas==2.1.4
 
-# Data Fetching
+# Data Fetching (NO Alpha Vantage - using MT5 data only)
 requests==2.31.0
-alpha-vantage==2.3.1
+beautifulsoup4==4.12.2
+lxml==5.1.0
 
 # Scheduling
 APScheduler==3.10.4
-
-# Chart Generation
-matplotlib==3.8.2
-Pillow==10.2.0
 
 # Utilities
 python-dotenv==1.0.0
 pytz==2024.1
 cryptography==41.0.7
-
-# Logging
-loguru==0.7.2
