@@ -1,390 +1,371 @@
 """
-Configuration file for Nix Trades Telegram Bot
-Contains constants, disclaimers, and configuration values
+NIX TRADES Configuration
+Production-ready constants and settings
 NO EMOJIS - Professional code only
 """
 
-# Branding
-PRODUCT_NAME = "Nix Trades"
+import os
+from typing import Dict, List
+
+# ==================== APPLICATION INFO ====================
+
+APP_NAME = "Nix Trades"
 BOT_USERNAME = "@NixTradesBot"
+VERSION = "1.0.0"
 COMPANY_NAME = "Nix Trades Limited"
-WATERMARK_TEXT = "NIX TRADES"
-TAGLINE = "Smart Money, Automated Logic"
-FOOTER = "Nix Trades | Smart Money, Automated Logic"
-SUPPORT_CONTACT = "@Nixiestone"
+SUPPORT_EMAIL = "support@nixtrades.com"
+WEBSITE = "nixtrades.com"
 
-# Legal Disclaimer - NO FORBIDDEN WORDS
-LEGAL_DISCLAIMER = """
-IMPORTANT LEGAL NOTICE - PLEASE READ CAREFULLY
+# ==================== TELEGRAM SETTINGS ====================
 
-This is an educational tool designed to demonstrate algorithmic trading concepts using Smart Money Concepts (SMC). By subscribing, you acknowledge and agree to the following:
+# Get from environment variables
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+MAX_MESSAGE_LENGTH = 4096
 
-1. NOT FINANCIAL ADVICE
-This bot does NOT provide investment advice, recommendations, or financial guidance. All automated setups are educational demonstrations of technical analysis patterns. You are solely responsible for all trading decisions.
+# ==================== SUPABASE DATABASE ====================
 
-2. EDUCATIONAL PURPOSE ONLY
-This tool is designed for learning about algorithmic trading, market structure, and order flow analysis. The historical success rates shown represent past performance of the underlying methodology and do NOT guarantee future results.
+SUPABASE_URL = os.getenv('SUPABASE_URL', '')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY', '')
 
-3. RISK DISCLOSURE
-Trading foreign exchange (forex), contracts for difference (CFDs), and leveraged instruments carries a high level of risk and may not be suitable for all investors. The high degree of leverage can work against you as well as for you. Before deciding to trade, you should carefully consider your investment objectives, level of experience, and risk appetite. You may lose some or all of your initial investment.
+# ==================== ENCRYPTION ====================
 
-4. USER CONTROLS ACCOUNT
-You maintain full control of your MetaTrader 5 account at all times. You can disconnect auto-execution, manually close trades, or modify parameters. This bot does not have custody of your funds.
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', '')
 
-5. NO GUARANTEED RETURNS
-There are NO guaranteed returns, profit guarantees, or risk-free trades. Every trade carries risk. Historical performance data reflects backtested results and does not guarantee future outcomes.
+# ==================== MT5 SETTINGS ====================
 
-6. MODEL AGREEMENT SCORES
-The "Model Agreement Score" represents the level of confluence between multiple technical analysis algorithms. It is NOT a prediction, forecast, or guarantee of trade outcome. Scores are educational metrics only.
+MT5_TIMEOUT = 60000  # milliseconds
+MT5_RETRY_ATTEMPTS = 3
+MT5_RETRY_DELAY = 2  # seconds
 
-7. PAST PERFORMANCE
-Past performance does not guarantee future results. Historical success rates are provided for educational reference only and do not indicate future trading outcomes.
+# Symbol normalization patterns
+SYMBOL_SUFFIXES = ['.pro', '.raw', '.m', '.i', '.a', '.b', '.c', '_']
 
-8. THIRD-PARTY BROKER
-This bot integrates with your self-selected MetaTrader 5 broker account. Nix Trades Limited is not affiliated with your broker and has no control over execution quality, spreads, slippage, or broker policies.
+# ==================== TRADING PARAMETERS ====================
 
-9. REGULATORY COMPLIANCE
-You are responsible for ensuring your use of this tool complies with all applicable laws and regulations in your jurisdiction. Some jurisdictions restrict or prohibit algorithmic trading.
+DEFAULT_RISK_PERCENT = 1.0  # 1% risk per trade
+MIN_RISK_PERCENT = 0.5
+MAX_RISK_PERCENT = 3.0
 
-10. ACKNOWLEDGMENT
-By clicking "I Understand and Accept," you confirm that:
-- You are 18 years or older
-- You understand this is an educational tool, not financial advice
-- You accept full responsibility for all trading decisions
-- You understand the risks involved in leveraged trading
-- You will not hold Nix Trades Limited liable for any trading losses
+# Risk-Reward ratios
+MIN_RR_RATIO = 1.5
+TARGET_RR_TP1 = 1.5
+TARGET_RR_TP2 = 2.5
 
-For questions or support, contact: {support_contact}
+# Breakeven settings
+BREAKEVEN_BUFFER_PIPS = 5
 
-Last updated: February 2026
-"""
+# Order expiry
+DEFAULT_ORDER_EXPIRY_HOURS = 1
 
-# Trading Sessions (UTC hours)
-TRADING_SESSIONS = {
-    'asian': {'start': 0, 'end': 7, 'unicorn_only': True},
-    'london_open': {'start': 7, 'end': 8, 'trading_disabled': True},
-    'london': {'start': 8, 'end': 16, 'all_setups': True},
-    'overlap': {'start': 13, 'end': 16, 'all_setups': True},
-    'newyork': {'start': 13, 'end': 21, 'all_setups': True},
-    'offhours': {'start': 21, 'end': 24, 'trading_disabled': True}
-}
+# ==================== MONITORED SYMBOLS ====================
 
-# Supported Currency Pairs
-CURRENCY_PAIRS = [
+MONITORED_SYMBOLS = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD',
-    'NZDUSD', 'USDCHF', 'EURGBP', 'EURJPY', 'GBPJPY',
-    'XAUUSD', 'XAGUSD'
+    'NZDUSD', 'EURJPY', 'GBPJPY', 'AUDJPY', 'EURGBP',
+    'XAUUSD', 'XAGUSD', 'BTCUSD', 'ETHUSD'
 ]
 
-# Pip Sizes by Symbol Type
-PIP_SIZES = {
-    'EURUSD': 0.0001, 'GBPUSD': 0.0001, 'AUDUSD': 0.0001,
-    'NZDUSD': 0.0001, 'USDCAD': 0.0001, 'EURGBP': 0.0001,
-    'USDJPY': 0.01, 'EURJPY': 0.01, 'GBPJPY': 0.01,
-    'USDCHF': 0.0001, 'XAUUSD': 0.10, 'XAGUSD': 0.01
+# ==================== PIP CALCULATIONS ====================
+
+PIP_VALUES = {
+    # Standard Forex Pairs (0.0001 = 1 pip)
+    'EURUSD': 0.0001,
+    'GBPUSD': 0.0001,
+    'AUDUSD': 0.0001,
+    'NZDUSD': 0.0001,
+    'USDCAD': 0.0001,
+    'USDCHF': 0.0001,
+    'EURGBP': 0.0001,
+    'EURAUD': 0.0001,
+    'EURNZD': 0.0001,
+    'EURCAD': 0.0001,
+    'EURCHF': 0.0001,
+    'GBPAUD': 0.0001,
+    'GBPNZD': 0.0001,
+    'GBPCAD': 0.0001,
+    'GBPCHF': 0.0001,
+    'AUDNZD': 0.0001,
+    'AUDCAD': 0.0001,
+    'AUDCHF': 0.0001,
+    'NZDCAD': 0.0001,
+    'NZDCHF': 0.0001,
+    'CADCHF': 0.0001,
+    
+    # JPY Pairs (0.01 = 1 pip)
+    'USDJPY': 0.01,
+    'EURJPY': 0.01,
+    'GBPJPY': 0.01,
+    'AUDJPY': 0.01,
+    'NZDJPY': 0.01,
+    'CADJPY': 0.01,
+    'CHFJPY': 0.01,
+    
+    # Precious Metals (0.10 = 1 pip)
+    'XAUUSD': 0.10,
+    'XAGUSD': 0.01,
+    
+    # Crypto (1.0 = 1 pip)
+    'BTCUSD': 1.0,
+    'ETHUSD': 0.10,
 }
 
-# Symbol Variations for Normalization
-SYMBOL_VARIATIONS = {
-    'EURUSD': ['EURUSD', 'EURUSD.pro', 'EURUSD.raw', 'EURUSD-a', 'EURUSDm', 'EUR/USD'],
-    'GBPUSD': ['GBPUSD', 'GBPUSD.pro', 'GBPUSD.raw', 'GBPUSD-a', 'GBPUSDm', 'GBP/USD'],
-    'USDJPY': ['USDJPY', 'USDJPY.pro', 'USDJPY.raw', 'USDJPY-a', 'USDJPYm', 'USD/JPY'],
-    'AUDUSD': ['AUDUSD', 'AUDUSD.pro', 'AUDUSD.raw', 'AUDUSD-a', 'AUDUSDm', 'AUD/USD'],
-    'USDCAD': ['USDCAD', 'USDCAD.pro', 'USDCAD.raw', 'USDCAD-a', 'USDCADm', 'USD/CAD'],
-    'NZDUSD': ['NZDUSD', 'NZDUSD.pro', 'NZDUSD.raw', 'NZDUSD-a', 'NZDUSDm', 'NZD/USD'],
-    'USDCHF': ['USDCHF', 'USDCHF.pro', 'USDCHF.raw', 'USDCHF-a', 'USDCHFm', 'USD/CHF'],
-    'EURGBP': ['EURGBP', 'EURGBP.pro', 'EURGBP.raw', 'EURGBP-a', 'EURGBPm', 'EUR/GBP'],
-    'EURJPY': ['EURJPY', 'EURJPY.pro', 'EURJPY.raw', 'EURJPY-a', 'EURJPYm', 'EUR/JPY'],
-    'GBPJPY': ['GBPJPY', 'GBPJPY.pro', 'GBPJPY.raw', 'GBPJPY-a', 'GBPJPYm', 'GBP/JPY'],
-    'XAUUSD': ['XAUUSD', 'XAUUSDm', 'XAUUSD.pro', 'GOLD', 'GOLD.pro', 'GOLD-a', 'GOLDm'],
-    'XAGUSD': ['XAGUSD', 'XAGUSDm', 'XAGUSD.pro', 'SILVER', 'SILVER.pro', 'SILVER-a']
+# Contract sizes
+CONTRACT_SIZES = {
+    'FOREX': 100000,  # Standard lot
+    'XAUUSD': 100,    # Gold
+    'XAGUSD': 5000,   # Silver
+    'BTCUSD': 1,      # Bitcoin
+    'ETHUSD': 1,      # Ethereum
 }
 
-# ML Configuration
-ML_THRESHOLD = 60  # Minimum model agreement score (0-100)
-ML_LSTM_WEIGHT = 0.7  # LSTM gets 70% weight in ensemble
-ML_XGBOOST_WEIGHT = 0.3  # XGBoost gets 30% weight
-ML_SEQUENCE_LENGTH = 100  # Number of candles for LSTM input
-ML_RETRAINING_INTERVAL = 100  # Retrain every N setups
+# ==================== SMC STRATEGY SETTINGS ====================
 
-# Risk Management
-DEFAULT_RISK_PERCENT = 1.0
-MAX_RISK_PIPS = 50
-MIN_LOT_SIZE = 0.01
-MAX_LOT_SIZE = 10.0
-MAX_CURRENCY_EXPOSURE = 3  # Max trades per currency
+# Volume confirmation thresholds
+VOLUME_MULTIPLIER_OB = 1.5  # OB candle must have 1.5x average volume
+VOLUME_MULTIPLIER_IMPULSE = 2.0  # Impulse must have 2x average volume
 
-# SMC Strategy Parameters
-VOLUME_THRESHOLD_OB = 1.5  # OB candle must have >= 1.5x avg volume
-VOLUME_THRESHOLD_IMPULSE = 2.0  # Impulse must have >= 2.0x avg volume
-INDUCEMENT_WICK_RATIO = 0.6  # Wick must be >= 60% of candle range
-INDUCEMENT_MIN_PIPS = 3
-INDUCEMENT_MAX_PIPS = 10
+# Confirmation candle requirements
+CONFIRMATION_BODY_RATIO = 0.5  # Body must be >50% of total candle
+CONFIRMATION_ATTEMPTS_MAX = 3
+
+# BOS requirements
+REQUIRED_BOS_COUNT = 2  # Double BOS required for continuations
+
+# Inducement validation
+INDUCEMENT_WICK_MIN_PIPS = 2
+INDUCEMENT_WICK_MAX_PIPS = 15
+INDUCEMENT_BODY_CLOSE_RATIO = 0.7
+
+# ATR settings
 ATR_PERIOD = 14
-ATR_MIN_RATIO = 0.7  # Minimum ATR ratio for valid volatility
-ATR_MAX_RATIO = 2.0  # Maximum ATR ratio for valid volatility
-BREAKEVEN_BUFFER_PIPS = 5  # Move SL to entry + 5 pips after TP1
+ATR_MIN_RATIO = 0.7  # Skip if ATR < 0.7x average
+ATR_MAX_RATIO = 2.0  # Skip if ATR > 2.0x average
 
-# News Proximity Filter
-NEWS_PROXIMITY_MINUTES = 30  # Don't trade within 30 min of high-impact news
+# Session filters
+AVOID_ASIAN_SESSION = True  # Lower liquidity
+PREFER_LONDON_NY_OVERLAP = True  # Best liquidity
 
-# Order Expiration
-LIMIT_ORDER_EXPIRY_MINUTES = 60
-STOP_ORDER_EXPIRY_MINUTES = 60
+# Fibonacci TP2 extension
+FIB_EXTENSION_LEVEL = 1.618
 
-# Order Type Detection Thresholds (in pips)
-MARKET_ORDER_THRESHOLD_PIPS = 2  # <= 2 pips = market order
-LIMIT_ORDER_THRESHOLD_PIPS = 20  # 3-20 pips = limit order
-# > 20 pips = stop order
+# Max concurrent exposure
+MAX_CORRELATED_POSITIONS = 2
+CORRELATION_THRESHOLD = 0.7
 
-# Drawdown-Based Risk Adjustment
-DRAWDOWN_LEVEL_1 = 3.0  # 0-3% drawdown = normal risk
-DRAWDOWN_LEVEL_2 = 5.0  # 3-5% drawdown = 70% risk
-DRAWDOWN_LEVEL_3 = 8.0  # 5-8% drawdown = 50% risk
-# > 8% drawdown = HALT trading
+# ==================== ML MODEL SETTINGS ====================
 
-RISK_MULTIPLIER_LEVEL_1 = 1.0
-RISK_MULTIPLIER_LEVEL_2 = 0.7
-RISK_MULTIPLIER_LEVEL_3 = 0.5
-RISK_MULTIPLIER_HALT = 0.0
+ML_ENSEMBLE_MODELS = ['LSTM', 'XGBOOST']
+ML_MIN_AGREEMENT_SCORE = 60  # Minimum to send setup
+ML_AUTO_EXECUTE_THRESHOLD = 75  # Auto-execute if >= 75%
 
-# Fibonacci Levels for Adaptive TP2
-FIBONACCI_LEVELS = {
-    'strong_trend': 1.0,    # 100% of range
-    'moderate_trend': 0.618,  # 61.8% Fibonacci
-    'weak_trend': 0.5       # 50% of range
-}
+# Model confidence tiers
+ML_TIER_PREMIUM = 75  # High confidence
+ML_TIER_STANDARD = 60  # Moderate confidence
+ML_TIER_DISCRETIONARY = 50  # Low confidence (optional)
 
-# FORBIDDEN WORDS - These must be filtered from all user-facing messages
-FORBIDDEN_WORDS = [
-    'signal', 'signals',
-    'prediction', 'predictions', 'predict',
-    'forecast', 'forecasts', 'forecasting',
-    'ai prediction', 'ai predictions',
-    'guaranteed win', 'guaranteed wins', 'guarantee',
-    'investment advice', 'financial advice',
-    'we recommend you buy', 'we recommend you sell',
-    'you should buy', 'you should sell',
-    'alpha generation', 'generate alpha',
-    'profit guarantee', 'guaranteed profit',
-    'sure thing', 'sure win',
-    "can't lose", 'cannot lose', 'cant lose',
-    'risk-free', 'risk free', 'no risk'
-]
+# ==================== NEWS SETTINGS ====================
 
-# Word Replacements - Map forbidden words to compliant alternatives
-WORD_REPLACEMENTS = {
-    'signal': 'automated setup',
-    'signals': 'automated setups',
-    'prediction': 'model agreement score',
-    'predictions': 'model agreement scores',
-    'predict': 'analyze',
-    'forecast': 'historical confluence rating',
-    'forecasts': 'historical confluence ratings',
-    'forecasting': 'analyzing historical patterns',
-    'ai prediction': 'model analysis',
-    'ai predictions': 'model analyses',
-    'guaranteed win': 'historical setup quality',
-    'guaranteed wins': 'historical setup quality',
-    'guarantee': 'historical data suggests',
-    'investment advice': 'educational parameter suggestion',
-    'financial advice': 'educational parameter suggestion',
-    'we recommend you buy': 'setup parameters suggest long position (user has final decision)',
-    'we recommend you sell': 'setup parameters suggest short position (user has final decision)',
-    'you should buy': 'educational parameters indicate long (your decision)',
-    'you should sell': 'educational parameters indicate short (your decision)',
-    'alpha generation': 'historical edge identification',
-    'generate alpha': 'identify historical edge',
-    'profit guarantee': 'historical success rate (past performance does not guarantee future results)',
-    'guaranteed profit': 'historical success rate (past performance does not guarantee future results)',
-    'sure thing': 'high-confluence setup',
-    'sure win': 'high-quality setup',
-    "can't lose": 'favorable risk-reward',
-    'cannot lose': 'favorable risk-reward',
-    'cant lose': 'favorable risk-reward',
-    'risk-free': 'risk-managed',
-    'risk free': 'risk-managed',
-    'no risk': 'controlled risk',
-    'win rate': 'historical success rate (past performance does not guarantee future results)'
-}
+NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')
+NEWS_BLACKOUT_BEFORE_MINUTES = 30
+NEWS_BLACKOUT_AFTER_MINUTES = 15
+NEWS_IMPACT_FILTER = 'HIGH'  # Only HIGH impact news
 
-# Bot Messages - All professional, NO EMOJIS, NO FORBIDDEN WORDS
-WELCOME_MESSAGE = """Welcome to {product_name}
+# ==================== SCHEDULER SETTINGS ====================
 
-Institutional-grade algorithmic trading using Smart Money Concepts (SMC) with precision refinements for high-probability forex entries.
-
-What you get:
-- Real-time automated setups via Telegram
-- Smart Money analysis (Order Blocks, Breaker Blocks, Market Structure)
-- Machine learning confidence scoring
-- Automatic execution on MetaTrader 5
-- Risk management with partial profit-taking
-
-This is an educational tool. NOT financial advice.
-
-Commands:
-/subscribe - Start receiving automated setups
-/help - Learn about features and SMC concepts
-/latest - View most recent setup
-
-Support: {support_contact}
-
-{footer}
-"""
-
-SUBSCRIPTION_SUCCESS = """Subscription activated successfully.
-
-You will receive automated setup alerts when market conditions align with Smart Money Concepts criteria.
-
-Daily market briefings will arrive at 8:00 AM in your local timezone.
-
-Want automatic trade execution?
-Use /connect_mt5 to link your MetaTrader 5 broker account.
-
-For questions: {support_contact}
-
-{footer}
-"""
-
-HELP_MESSAGE = """NIX TRADES - HELP GUIDE
-
-AVAILABLE COMMANDS:
-/start - Welcome message and overview
-/subscribe - Activate setup alerts
-/help - This help guide
-/connect_mt5 - Link your MT5 broker account
-/disconnect_mt5 - Unlink MT5 account
-/status - View subscription and trading statistics
-/latest - Get most recent automated setup
-/settings - Customize risk parameters and preferences
-/unsubscribe - Stop receiving alerts
-
-SETUP QUALITY LEVELS:
-• Unicorn Setup: Breaker Block + Fair Value Gap overlap
-  Historical success rate: 72-78% (past performance does not guarantee future results)
-• Standard Setup: Order Block or Breaker Block only
-  Historical success rate: 58-62% (past performance does not guarantee future results)
-
-SMC CONCEPTS EXPLAINED:
-• Order Block (OB): Last opposite candle before institutional impulse move
-• Breaker Block (BB): Failed supply/demand zone now acting as support/resistance
-• Fair Value Gap (FVG): Price imbalance where no trading occurred
-• Break of Structure (BOS): Price breaks swing high/low in trend direction
-• Market Structure Shift (MSS): Potential trend reversal breakout
-• Inducement: Liquidity sweep that triggers retail traders before reversal
-
-ORDER TYPES:
-• Market Order: Entry within 2 pips of current price, executes immediately
-• Limit Order: Entry 3-20 pips away, waits for pullback, expires in 1 hour
-• Stop Order: Entry >20 pips away, breakout entry, expires in 1 hour
-
-AUTO-EXECUTION FLOW:
-1. Setup generated when SMC criteria align
-2. Order placed on your MT5 account automatically
-3. Position monitored every 10 seconds
-4. TP1 hit: 50% closed, SL moved to breakeven
-5. TP2 hit: Remaining 50% closed, final results
-
-Need help? Contact {support_contact}
-
-{footer}
-"""
-
-ALREADY_SUBSCRIBED = """You are already subscribed to Nix Trades automated setup alerts.
-
-Use /status to view your subscription details and trading statistics.
-
-{footer}
-"""
-
-MT5_CONNECTED_ALREADY = """You are already connected to MetaTrader 5.
-
-Broker: {broker_name}
-Account: {account_number}
-
-Use /disconnect_mt5 if you need to change broker accounts.
-
-{footer}
-"""
-
-MT5_CONNECTION_SUCCESS = """MetaTrader 5 connection successful.
-
-Broker: {broker_name}
-Account: {account_number}
-Balance: {balance}
-
-Automatic trade execution is now enabled.
-You will receive notifications when trades are executed.
-
-{footer}
-"""
-
-MT5_DISCONNECTION_CONFIRM = """Are you sure you want to disconnect MetaTrader 5?
-
-This will disable automatic trade execution. You will still receive setup alerts, but trades will not execute automatically.
-
-{footer}
-"""
-
-MT5_DISCONNECTION_SUCCESS = """MetaTrader 5 disconnected successfully.
-
-Automatic trade execution is now disabled. You will continue to receive setup alerts.
-
-Use /connect_mt5 to reconnect anytime.
-
-{footer}
-"""
-
-NO_RECENT_SETUPS = """No automated setups generated in the last 24 hours.
-
-Current market conditions have not aligned with Smart Money Concepts criteria. This is normal and part of disciplined trading.
-
-Quality over quantity.
-
-{footer}
-"""
-
-UNSUBSCRIBE_CONFIRM = """Are you sure you want to unsubscribe?
-
-You will stop receiving automated setup alerts and daily market briefings.
-
-Your account data will be retained for 30 days. Use /subscribe to reactivate anytime.
-
-{footer}
-"""
-
-UNSUBSCRIBE_SUCCESS = """Unsubscribed successfully.
-
-You will no longer receive automated setup alerts.
-
-Your data remains for 30 days if you wish to reactivate.
-
-Thank you for using Nix Trades. For feedback: {support_contact}
-
-{footer}
-"""
-
-# Logging Configuration
-LOG_LEVEL = 'INFO'
-LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
-LOG_FILE_MAX_BYTES = 10 * 1024 * 1024  # 10MB
-LOG_FILE_BACKUP_COUNT = 7  # Keep 7 days of logs
-
-# Database Configuration
-DB_POOL_SIZE = 10
-DB_TIMEOUT_SECONDS = 30
-
-# Scheduler Configuration
-POSITION_MONITOR_INTERVAL_SECONDS = 10
+DAILY_ALERT_TIME_UTC = '08:00'  # 8 AM UTC daily setup alert
 MARKET_SCAN_INTERVAL_MINUTES = 15
-NEWS_UPDATE_INTERVAL_MINUTES = 15
-ALERT_CHECK_INTERVAL_MINUTES = 60  # Check for 8 AM alerts every hour
+POSITION_CHECK_INTERVAL_SECONDS = 10
 
-# HTTP Request Configuration
-REQUEST_TIMEOUT_SECONDS = 10
-REQUEST_MAX_RETRIES = 3
-REQUEST_BACKOFF_FACTOR = 2  # 1s, 2s, 4s
+# ==================== LEGAL & COMPLIANCE ====================
 
-# Encryption
-ENCRYPTION_ALGORITHM = 'Fernet'  # Symmetric encryption for MT5 passwords
+LEGAL_DISCLAIMER = """
+Educational tool. Not financial advice. You control your account. Past performance does not guarantee future results.
+"""
+
+PERPETUAL_FOOTER = f"""
+{APP_NAME} | Smart Money, Automated Logic
+"""
+
+SUBSCRIPTION_DISCLAIMER = """
+IMPORTANT LEGAL NOTICE
+
+By subscribing to automated setup alerts, you acknowledge:
+
+1. EDUCATIONAL PURPOSE: This service provides educational trading setups based on Smart Money Concepts and machine learning analysis. It is NOT financial advice.
+
+2. YOUR RESPONSIBILITY: You maintain full control of your trading account. All trading decisions are yours alone. You are responsible for understanding the risks involved.
+
+3. NO GUARANTEES: Past performance does not guarantee future results. Historical success rates are provided for educational reference only.
+
+4. RISK DISCLOSURE: Trading forex, gold, and cryptocurrencies carries substantial risk of loss. Only trade with capital you can afford to lose.
+
+5. NOT A LICENSED ADVISOR: {COMPANY_NAME} is not a registered investment advisor, broker, or financial planner.
+
+6. AUTO-EXECUTION RISK: If you connect your MT5 account for automated execution, trades will be placed automatically based on our algorithms. You can disconnect at any time.
+
+Do you understand and accept these terms?
+"""
+
+START_MESSAGE = f"""
+Welcome to {APP_NAME}
+
+I am your automated Smart Money Concepts trading assistant. I analyze forex, gold, and cryptocurrency markets using institutional trading strategies combined with machine learning.
+
+WHAT I DO:
+- Detect high-probability trading setups using SMC methodology
+- Provide automated entry, stop loss, and take profit levels
+- Calculate position sizes based on your risk tolerance
+- Optionally execute trades automatically via MT5 integration
+- Track and manage your positions with breakeven protection
+
+WHAT I DO NOT DO:
+- I do not provide financial advice or predictions
+- I do not guarantee profits or winning trades
+- I do not have access to insider information
+
+This is an educational tool. You maintain full control and responsibility for all trading decisions.
+
+Use /help to see all available commands.
+
+{LEGAL_DISCLAIMER}
+"""
+
+HELP_MESSAGE = f"""
+AVAILABLE COMMANDS:
+
+/start - Show welcome message
+/help - Display this help menu
+/subscribe - Activate automated setup alerts
+/unsubscribe - Stop receiving alerts
+/connect_mt5 - Link your MT5 account for auto-execution
+/disconnect_mt5 - Unlink your MT5 account
+/status - View subscription and trading statistics
+/latest - Get the most recent automated setup
+/settings - Adjust risk percentage per trade
+
+SMART MONEY CONCEPTS EXPLAINED:
+
+Order Block (OB): The last opposite-colored candle before a strong price move. Represents institutional buying or selling activity. Price often returns to these levels for continuation.
+
+Breaker Block (BB): A previously respected support or resistance level that has been broken. After breaking, it often becomes the new support or resistance. High-probability reversal zones.
+
+Fair Value Gap (FVG): A price imbalance on the chart where one candle's low is higher than two candles prior's high. Acts as a magnet for price, often filled before continuation.
+
+Break of Structure (BOS): When price breaks a recent swing high (bullish) or swing low (bearish). Indicates trend continuation. We require DOUBLE BOS for higher confidence.
+
+Market Structure Shift (MSS): When price breaks an internal structural level counter to the current trend. First sign of potential reversal. We wait for pullback to Order Block after MSS.
+
+Inducement: The first pullback that sweeps liquidity (stop losses) before reversing. Also called a liquidity grab or stop hunt. We enter AFTER inducement, not before.
+
+Unicorn Setup: When a Breaker Block overlaps with a Fair Value Gap. Highest probability setup due to double confluence. These receive priority.
+
+Risk-Reward Ratio (R:R): The relationship between your stop loss distance and take profit distance. We target minimum 1:1.5, with TP1 at 1:1.5 and TP2 at 1:2.5.
+
+{LEGAL_DISCLAIMER}
+"""
+
+SETTINGS_MESSAGE = """
+RISK SETTINGS
+
+Current risk per trade: {risk_percent}%
+
+You can adjust your risk percentage from 0.5% to 3.0% of your account balance per trade.
+
+Conservative: 0.5% - 1.0% (Recommended for beginners)
+Moderate: 1.0% - 2.0% (Standard approach)
+Aggressive: 2.0% - 3.0% (Higher risk, higher reward)
+
+Examples (on $10,000 account):
+- 1% risk = $100 max loss per trade
+- 2% risk = $200 max loss per trade
+- 3% risk = $300 max loss per trade
+
+To change your risk, send a number between 0.5 and 3.0
+Example: 1.5
+"""
+
+# ==================== ERROR MESSAGES ====================
+
+ERROR_MESSAGES = {
+    'no_mt5_connection': 'MT5 account not connected. Use /connect_mt5 to link your account.',
+    'invalid_credentials': 'Invalid MT5 credentials. Please check your login, password, and server.',
+    'connection_failed': 'Failed to connect to MT5. Please try again or contact support.',
+    'symbol_not_found': 'Symbol not found on your broker. Please check the symbol name.',
+    'insufficient_margin': 'Insufficient margin to place trade. Reduce position size or risk percentage.',
+    'trade_failed': 'Failed to place trade. Please check your MT5 connection and try again.',
+    'invalid_risk': 'Invalid risk percentage. Must be between 0.5% and 3.0%.',
+    'no_setups': 'No automated setups available at this time.',
+    'already_subscribed': 'You are already subscribed to automated setup alerts.',
+    'not_subscribed': 'You are not currently subscribed. Use /subscribe to activate alerts.',
+}
+
+# ==================== SUCCESS MESSAGES ====================
+
+SUCCESS_MESSAGES = {
+    'subscribed': 'Subscription activated. You will receive automated setup alerts when high-probability opportunities are detected.',
+    'unsubscribed': 'Subscription deactivated. You will no longer receive automated setup alerts.',
+    'mt5_connected': 'MT5 account connected successfully. Automated trade execution is now enabled.',
+    'mt5_disconnected': 'MT5 account disconnected. Automated trade execution is now disabled.',
+    'settings_updated': 'Settings updated successfully.',
+    'trade_opened': 'Trade opened successfully.',
+    'position_closed': 'Position closed successfully.',
+}
+
+# ==================== FORBIDDEN WORD REPLACEMENTS ====================
+
+# Legal compliance: Replace trading industry terms with educational language
+FORBIDDEN_WORDS = {
+    'signal': 'setup',
+    'signals': 'setups',
+    'call': 'educational opportunity',
+    'calls': 'educational opportunities',
+    'trade signal': 'automated setup',
+    'win rate': 'historical success rate',
+    'winning': 'successful',
+    'winner': 'successful trade',
+    'winners': 'successful trades',
+    'profit': 'favorable outcome',
+    'profits': 'favorable outcomes',
+    'guaranteed': 'historically successful',
+    'guarantee': 'historical pattern',
+    'prediction': 'analysis',
+    'predict': 'analyze',
+    'hot tip': 'educational insight',
+    'insider': 'institutional',
+    'sure thing': 'high-probability setup',
+    'can\'t lose': 'historically favorable',
+    'easy money': 'educational opportunity',
+    'get rich': 'potentially favorable',
+    'money-maker': 'historically successful pattern',
+    'investment advice': 'educational material',
+    'financial advice': 'educational information',
+    'buy now': 'consider entry at',
+    'sell now': 'consider exit at',
+}
+
+# ==================== TIMEFRAME MAPPINGS ====================
+
+TIMEFRAME_MAPPINGS = {
+    '1m': 'M1',
+    '5m': 'M5',
+    '15m': 'M15',
+    '30m': 'M30',
+    '1h': 'H1',
+    '4h': 'H4',
+    '1d': 'D1',
+    '1w': 'W1',
+    '1M': 'MN1',
+}
+
+# ==================== SESSION TIMES (UTC) ====================
+
+SESSIONS = {
+    'ASIAN': {'start': '00:00', 'end': '09:00'},
+    'LONDON': {'start': '08:00', 'end': '17:00'},
+    'NEW_YORK': {'start': '13:00', 'end': '22:00'},
+}
+
+# ==================== LOGGING ====================
+
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
