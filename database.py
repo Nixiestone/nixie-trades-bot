@@ -7,12 +7,16 @@ NO EMOJIS - Professional code only
 import logging
 import os
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+from dotenv import load_dotenv
 from supabase import create_client, Client
 from cryptography.fernet import Fernet
 import config
 import utils
+
+# Load .env file explicitly so bot.py, database.py, and all modules see it
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,7 @@ fernet = None
 def init_supabase() -> Client:
     """
     Initialize Supabase client connection.
+    Supports both old JWT key format and new sb_publishable_ key format.
     
     Returns:
         Client: Supabase client instance
@@ -38,23 +43,40 @@ def init_supabase() -> Client:
     
     try:
         # Get credentials from environment
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_KEY')
-        encryption_key_env = os.getenv('ENCRYPTION_KEY')
+        supabase_url = os.getenv('SUPABASE_URL', '').strip()
+        supabase_key = os.getenv('SUPABASE_KEY', '').strip()
+        encryption_key_env = os.getenv('ENCRYPTION_KEY', '').strip()
         
-        if not supabase_url or not supabase_key:
+        # Validate URL
+        if not supabase_url:
             raise ValueError(
-                "Missing SUPABASE_URL or SUPABASE_KEY environment variables. "
-                "Check your .env file."
+                "SUPABASE_URL is missing from your .env file.\n"
+                "Find it at: Supabase Dashboard → Settings → Data API → Project URL"
             )
         
+        if not supabase_url.startswith('https://'):
+            raise ValueError(
+                f"SUPABASE_URL looks wrong: '{supabase_url}'\n"
+                "It must start with https:// and end in .supabase.co"
+            )
+        
+        # Validate key
+        if not supabase_key:
+            raise ValueError(
+                "SUPABASE_KEY is missing from your .env file.\n"
+                "Find it at: Supabase Dashboard → Settings → Data API → Project API keys → Publishable"
+            )
+        
+        # Validate encryption key
         if not encryption_key_env:
             raise ValueError(
-                "Missing ENCRYPTION_KEY environment variable. "
-                "Generate one with: python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
+                "ENCRYPTION_KEY is missing from your .env file.\n"
+                "Generate one by running:\n"
+                "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
             )
         
         # Initialize Supabase client
+        # create_client works with both old eyJhbGci... and new sb_publishable_... keys
         supabase_client = create_client(supabase_url, supabase_key)
         logger.info("Supabase client initialized successfully")
         

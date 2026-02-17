@@ -8,7 +8,7 @@ NO EMOJIS - Professional code only
 import logging
 import asyncio
 from typing import List, Optional
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot

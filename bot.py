@@ -11,6 +11,11 @@ import signal
 import sys
 from typing import Optional
 from datetime import datetime
+
+# Load .env file FIRST before any other module reads environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,

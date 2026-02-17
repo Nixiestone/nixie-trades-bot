@@ -1,42 +1,41 @@
 # NIX TRADES - Python Dependencies
-# Production-ready with pinned versions
+# Ordered by dependency chain (foundations first)
+# ── Level 1: No dependencies ──────────────────────────────────────────────────
+websockets
+numpy
+pytz
+python-dateutil
+lxml
+colorlog
 
-# Core Framework
-python-telegram-bot==20.7
-python-telegram-bot[job-queue]==20.7
+# ── Level 2: Depend only on Level 1 ───────────────────────────────────────────
+pandas
+cryptography
+python-dotenv
+requests
+beautifulsoup4
 
-# MT5 Integration
-MetaTrader5==5.0.45
+# ── Level 3: Depend on Level 1 and 2 ──────────────────────────────────────────
+httpx
+pydantic
+scipy
 
-# Database
-supabase==2.3.0
-postgrest==0.13.0
+# ── Level 4: Supabase sub-packages ────────────────────────────────────────────
+# supabase 2.9.0+ supports the new sb_publishable_ key format
+# and works with websockets 10.4
+gotrue
+postgrest
+realtime
+storage3
 
-# Data Processing
-pandas==2.1.4
-numpy==1.26.2
+# ── Level 5: Main packages ────────────────────────────────────────────────────
+supabase
+python-telegram-bot
+APScheduler
+scikit-learn
 
-# Machine Learning
-scikit-learn==1.3.2
-xgboost==2.0.3
+# ── Level 6: Depend on scikit-learn and numpy ─────────────────────────────────
+xgboost
 
-# Scheduling
-APScheduler==3.10.4
-
-# Web Scraping (for Forex Factory)
-beautifulsoup4==4.12.2
-requests==2.31.0
-lxml==4.9.4
-
-# Encryption
-cryptography==41.0.7
-
-# Date/Time
-pytz==2023.3
-python-dateutil==2.8.2
-
-# Configuration
-python-dotenv==1.0.0
-
-# Logging
-colorlog==6.8.0
+# ── Level 7: MT5 (Windows only, standalone) ───────────────────────────────────
+MetaTrader5
