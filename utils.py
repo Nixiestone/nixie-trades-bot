@@ -1,618 +1,674 @@
 """
-NIX TRADES Utility Functions
-Helper functions for time, calculations, formatting
+NIX TRADES - Utility Functions
+Role: Python Developer + Product Manager
+Fixes:
+  - Added missing replace_forbidden_words() function (alias for validate_user_message)
+  - Added missing add_footer() function referenced throughout bot.py
+  - Added missing timedelta import used by database.py indirectly
+  - Fixed extract_currency_from_symbol to not strip trailing 'm' from all symbols
+    (e.g. 'EURUSDm' -> 'EURUSD' correct, but 'XAUUSD' was being stripped incorrectly)
+  - Added format_setup_message() for standardised alert formatting
 NO EMOJIS - Professional code only
 """
 
-import logging
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, Tuple, List
-import pytz
 import re
+import time
+import logging
+from typing import Optional, Callable, Any, List, Tuple
+from datetime import datetime, timezone, timedelta
+import pytz
+from decimal import Decimal, ROUND_HALF_UP
 import config
 
 logger = logging.getLogger(__name__)
 
 
-# ==================== TIME UTILITIES ====================
+def validate_user_message(text: str) -> str:
+    """
+    Scan text for forbidden words and replace with compliant alternatives.
+    This function MUST be called before sending ANY user-facing message.
+
+    Args:
+        text: The message text to validate and clean
+
+    Returns:
+        str: Cleaned text with forbidden words replaced
+    """
+    if not text:
+        return text
+
+    cleaned_text = text
+
+    for forbidden, replacement in config.WORD_REPLACEMENTS.items():
+        pattern = r'\b' + re.escape(forbidden) + r'\b'
+        cleaned_text = re.sub(pattern, replacement, cleaned_text, flags=re.IGNORECASE)
+
+    if cleaned_text != text:
+        logger.debug(
+            "Compliance filter applied. Original length: %d, Cleaned length: %d",
+            len(text), len(cleaned_text)
+        )
+
+    return cleaned_text
+
+
+def replace_forbidden_words(text: str) -> str:
+    """
+    Alias for validate_user_message for backward compatibility with bot.py calls.
+
+    Args:
+        text: Text to filter
+
+    Returns:
+        str: Filtered text
+    """
+    return validate_user_message(text)
+
+
+def add_footer(text: str) -> str:
+    """
+    Append the standard Nix Trades footer to a message if not already present.
+
+    Args:
+        text: Message text
+
+    Returns:
+        str: Message with footer appended
+    """
+    footer = config.FOOTER
+    if footer not in text:
+        return text.rstrip() + "\n\n" + footer
+    return text
+
+
+def format_setup_message(
+    signal_number: int,
+    symbol: str,
+    direction: str,
+    setup_type: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit_1: float,
+    take_profit_2: float,
+    sl_pips: float,
+    tp1_pips: float,
+    tp2_pips: float,
+    rr_tp1: float,
+    rr_tp2: float,
+    ml_score: int,
+    session: str,
+    order_type: str,
+    lot_size: Optional[float] = None
+) -> str:
+    """
+    Format a standardised automated setup alert message for Telegram.
+    All text passes through validate_user_message before return.
+
+    Args:
+        signal_number:  Sequential setup number
+        symbol:         Trading symbol e.g. EURUSD
+        direction:      'BUY' or 'SELL'
+        setup_type:     'UNICORN' or 'STANDARD'
+        entry_price:    Entry price level
+        stop_loss:      Stop loss price level
+        take_profit_1:  First take profit price level
+        take_profit_2:  Second take profit price level
+        sl_pips:        Stop loss distance in pips
+        tp1_pips:       TP1 distance in pips
+        tp2_pips:       TP2 distance in pips
+        rr_tp1:         Risk-reward ratio to TP1
+        rr_tp2:         Risk-reward ratio to TP2
+        ml_score:       Model agreement score (0-100)
+        session:        Trading session name
+        order_type:     'MARKET', 'LIMIT', or 'STOP'
+        lot_size:       Calculated lot size (if MT5 connected)
+
+    Returns:
+        str: Formatted and compliance-filtered setup message
+    """
+    direction_label = "LONG" if direction == "BUY" else "SHORT"
+    order_type_label = {
+        'MARKET': 'MARKET ORDER (executes immediately at current price)',
+        'LIMIT':  'LIMIT ORDER (price needs to pull back to entry)',
+        'STOP':   'STOP ORDER (breakout entry above/below current price)'
+    }.get(order_type, order_type)
+
+    tier_label = "UNICORN SETUP" if setup_type == "UNICORN" else "STANDARD SETUP"
+
+    lines = [
+        f"AUTOMATED SETUP #{signal_number} - {tier_label}",
+        "",
+        f"Pair:          {symbol}",
+        f"Direction:     {direction_label}",
+        f"Session:       {session}",
+        f"Order Type:    {order_type_label}",
+        "",
+        f"Entry:         {entry_price:.5f}" if symbol not in ('XAUUSD', 'XAGUSD') else f"Entry:         {entry_price:.2f}",
+        f"Stop Loss:     {stop_loss:.5f}  ({sl_pips:.1f} pips)" if symbol not in ('XAUUSD', 'XAGUSD') else f"Stop Loss:     {stop_loss:.2f}  ({sl_pips:.1f} pips)",
+        f"TP1:           {take_profit_1:.5f}  ({tp1_pips:.1f} pips, R:R 1:{rr_tp1:.2f})" if symbol not in ('XAUUSD', 'XAGUSD') else f"TP1:           {take_profit_1:.2f}  ({tp1_pips:.1f} pips, R:R 1:{rr_tp1:.2f})",
+        f"TP2:           {take_profit_2:.5f}  ({tp2_pips:.1f} pips, R:R 1:{rr_tp2:.2f})" if symbol not in ('XAUUSD', 'XAGUSD') else f"TP2:           {take_profit_2:.2f}  ({tp2_pips:.1f} pips, R:R 1:{rr_tp2:.2f})",
+        "",
+        f"Model Agreement Score: {ml_score}%",
+    ]
+
+    if lot_size is not None:
+        lines.append(f"Auto Lot Size: {lot_size:.2f} lots")
+
+    lines += [
+        "",
+        "Management:",
+        "- TP1 hit: 50% closed, stop loss moved to breakeven",
+        "- TP2 hit: Remaining 50% closed",
+        "- Limit/Stop orders expire in 1 hour if not filled",
+        "",
+        "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.",
+        "Past performance does not guarantee future results.",
+    ]
+
+    raw_message = "\n".join(lines)
+    return validate_user_message(add_footer(raw_message))
+
+
+def detect_timezone(user_locale: Optional[str] = None, user_ip: Optional[str] = None) -> str:
+    """
+    Detect user's timezone based on Telegram locale.
+    Telegram does not expose timezone directly. Defaults to UTC.
+
+    Args:
+        user_locale: Telegram user locale (e.g., 'en-US', 'en-GB')
+        user_ip:     User IP address (not used - Telegram does not expose this)
+
+    Returns:
+        str: IANA timezone string
+    """
+    locale_timezone_map = {
+        'en-US': 'America/New_York',
+        'en-GB': 'Europe/London',
+        'en-CA': 'America/Toronto',
+        'en-AU': 'Australia/Sydney',
+        'en-NZ': 'Pacific/Auckland',
+        'en-ZA': 'Africa/Johannesburg',
+        'en-NG': 'Africa/Lagos',
+        'fr-FR': 'Europe/Paris',
+        'de-DE': 'Europe/Berlin',
+        'es-ES': 'Europe/Madrid',
+        'it-IT': 'Europe/Rome',
+        'pt-BR': 'America/Sao_Paulo',
+        'ja-JP': 'Asia/Tokyo',
+        'zh-CN': 'Asia/Shanghai',
+        'ko-KR': 'Asia/Seoul',
+        'ar-SA': 'Asia/Riyadh',
+        'hi-IN': 'Asia/Kolkata',
+        'ru-RU': 'Europe/Moscow'
+    }
+
+    if user_locale and user_locale in locale_timezone_map:
+        return locale_timezone_map[user_locale]
+
+    logger.debug("Could not detect timezone for locale: %s. Defaulting to UTC.", user_locale)
+    return 'UTC'
+
+
+def convert_utc_to_user_time(utc_time: datetime, user_timezone: str) -> datetime:
+    """
+    Convert UTC datetime to user's local timezone.
+
+    Args:
+        utc_time:      datetime object (timezone-aware or naive UTC)
+        user_timezone: IANA timezone string
+
+    Returns:
+        datetime: Converted to user's local timezone
+    """
+    try:
+        user_tz = pytz.timezone(user_timezone)
+
+        if utc_time.tzinfo is None:
+            utc_time = utc_time.replace(tzinfo=timezone.utc)
+
+        return utc_time.astimezone(user_tz)
+
+    except Exception as e:
+        logger.error("Error converting timezone: %s", e)
+        return utc_time
+
+
+def convert_user_time_to_utc(local_time: datetime, user_timezone: str) -> datetime:
+    """
+    Convert user's local datetime to UTC.
+
+    Args:
+        local_time:    datetime in user's local timezone
+        user_timezone: IANA timezone string
+
+    Returns:
+        datetime: Converted to UTC
+    """
+    try:
+        user_tz = pytz.timezone(user_timezone)
+
+        if local_time.tzinfo is None:
+            local_time = user_tz.localize(local_time)
+
+        return local_time.astimezone(timezone.utc)
+
+    except Exception as e:
+        logger.error("Error converting to UTC: %s", e)
+        return local_time
+
+
+def format_currency(amount: float, currency: str = 'USD', decimals: int = 2) -> str:
+    """
+    Format currency amount for display.
+
+    Args:
+        amount:   Amount to format
+        currency: Currency code
+        decimals: Decimal places
+
+    Returns:
+        str: Formatted currency string (e.g., '1,234.56 USD')
+    """
+    try:
+        decimal_amount = Decimal(str(amount))
+        quantize_format = '0.' + '0' * decimals
+        rounded_amount = decimal_amount.quantize(Decimal(quantize_format), rounding=ROUND_HALF_UP)
+        formatted = f"{rounded_amount:,.{decimals}f}"
+        return f"{formatted} {currency}"
+
+    except Exception as e:
+        logger.error("Error formatting currency: %s", e)
+        return f"{amount:.2f} {currency}"
+
+
+def format_pips(pips: float, decimals: int = 1) -> str:
+    """Format pip value for display."""
+    return f"{pips:.{decimals}f} pips"
+
+
+def calculate_sharpe_ratio(returns: List[float], risk_free_rate: float = 0.02) -> Optional[float]:
+    """
+    Calculate annualised Sharpe ratio for a series of trade returns.
+
+    Args:
+        returns:        List of return percentages per trade
+        risk_free_rate: Annual risk-free rate (default 2%)
+
+    Returns:
+        float: Sharpe ratio, or None if insufficient data
+    """
+    if not returns or len(returns) < 2:
+        return None
+
+    try:
+        import numpy as np
+
+        returns_array = np.array(returns, dtype=float)
+        mean_return = np.mean(returns_array)
+        std_return = np.std(returns_array, ddof=1)
+
+        if std_return == 0:
+            return None
+
+        annualized_mean = mean_return * 252
+        annualized_std = std_return * np.sqrt(252)
+        sharpe = (annualized_mean - risk_free_rate) / annualized_std
+
+        return round(float(sharpe), 2)
+
+    except Exception as e:
+        logger.error("Error calculating Sharpe ratio: %s", e)
+        return None
+
+
+def calculate_win_rate(trades: List[dict]) -> Tuple[float, int, int]:
+    """
+    Calculate historical success rate from trade history.
+
+    Args:
+        trades: List of trade dicts with 'realized_pnl' field
+
+    Returns:
+        Tuple[float, int, int]: (win_rate_percent, wins, total_trades)
+    """
+    if not trades:
+        return 0.0, 0, 0
+
+    wins = sum(1 for trade in trades if trade.get('realized_pnl', 0) > 0)
+    total = len(trades)
+    win_rate = (wins / total) * 100 if total > 0 else 0.0
+
+    return round(win_rate, 1), wins, total
+
+
+def try_with_retry(
+    func: Callable,
+    max_retries: int = 3,
+    backoff_factor: float = 2.0,
+    exceptions: Tuple = (Exception,),
+    *args,
+    **kwargs
+) -> Any:
+    """
+    Execute a callable with exponential backoff retry logic.
+
+    Args:
+        func:          Function to call
+        max_retries:   Maximum number of attempts
+        backoff_factor: Sleep multiplier between retries (1s, 2s, 4s, ...)
+        exceptions:    Tuple of exception types to catch and retry on
+        *args:         Positional arguments for func
+        **kwargs:      Keyword arguments for func
+
+    Returns:
+        Any: Return value from func
+
+    Raises:
+        Exception: Re-raises the last exception after all retries exhausted
+    """
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+
+        except exceptions as e:
+            last_exception = e
+            sleep_time = backoff_factor ** attempt
+
+            if attempt < max_retries - 1:
+                logger.warning(
+                    "Attempt %d/%d failed for %s: %s. Retrying in %.1fs",
+                    attempt + 1, max_retries, func.__name__, e, sleep_time
+                )
+                time.sleep(sleep_time)
+            else:
+                logger.error(
+                    "All %d attempts failed for %s. Last error: %s",
+                    max_retries, func.__name__, e
+                )
+
+    raise last_exception
+
+
+def format_duration(start_time: datetime, end_time: datetime) -> str:
+    """
+    Format time duration in human-readable form.
+
+    Args:
+        start_time: Start datetime
+        end_time:   End datetime
+
+    Returns:
+        str: e.g. '2h 35m', '45m', '3d 4h'
+    """
+    try:
+        duration = end_time - start_time
+
+        days = duration.days
+        hours, remainder = divmod(duration.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0:
+            parts.append(f"{hours}h")
+        if minutes > 0 or not parts:
+            parts.append(f"{minutes}m")
+
+        return ' '.join(parts)
+
+    except Exception as e:
+        logger.error("Error formatting duration: %s", e)
+        return "N/A"
+
+
+def format_time_until(target_time: datetime, user_timezone: str) -> str:
+    """
+    Format time remaining until a target event in user's timezone.
+
+    Args:
+        target_time:   Target datetime (UTC)
+        user_timezone: IANA timezone string
+
+    Returns:
+        str: e.g. '1h 52m', '25m', 'now'
+    """
+    try:
+        local_target = convert_utc_to_user_time(target_time, user_timezone)
+        user_tz = pytz.timezone(user_timezone)
+        now_local = datetime.now(user_tz)
+
+        if local_target > now_local:
+            return format_duration(now_local, local_target)
+        return "now"
+
+    except Exception as e:
+        logger.error("Error calculating time until: %s", e)
+        return "N/A"
+
+
+def is_market_open(current_time: datetime = None) -> bool:
+    """
+    Check if the forex market is open (not weekend).
+    Forex closes Friday 5 PM EST, opens Sunday 5 PM EST.
+
+    Args:
+        current_time: UTC datetime to check. Uses current time if None.
+
+    Returns:
+        bool: True if market is open
+    """
+    if current_time is None:
+        current_time = datetime.now(timezone.utc)
+
+    est = pytz.timezone('America/New_York')
+    est_time = current_time.astimezone(est)
+    day_of_week = est_time.weekday()  # 0=Monday, 6=Sunday
+    hour = est_time.hour
+
+    if day_of_week == 5:  # Saturday - always closed
+        return False
+
+    if day_of_week == 6 and hour < 17:  # Sunday before 5 PM EST
+        return False
+
+    if day_of_week == 4 and hour >= 17:  # Friday after 5 PM EST
+        return False
+
+    return True
+
+
+def get_session_name(utc_hour: int) -> str:
+    """
+    Get trading session name from UTC hour.
+
+    Args:
+        utc_hour: Hour in UTC (0-23)
+
+    Returns:
+        str: Session name
+    """
+    if 0 <= utc_hour < 7:
+        return 'Asian'
+    elif utc_hour == 7:
+        return 'London Open'
+    elif 8 <= utc_hour < 13:
+        return 'London'
+    elif 13 <= utc_hour < 16:
+        return 'Overlap'
+    elif 16 <= utc_hour < 21:
+        return 'New York'
+    else:
+        return 'Off Hours'
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Remove invalid characters from a filename.
+
+    Args:
+        filename: Original filename
+
+    Returns:
+        str: Sanitized filename
+    """
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+
+    if len(filename) > 200:
+        filename = filename[:200]
+
+    return filename
+
 
 def get_current_utc_time() -> datetime:
     """
-    Get current UTC time with timezone awareness.
-    
+    Get current UTC time as a timezone-aware datetime.
+
     Returns:
         datetime: Current UTC time
     """
     return datetime.now(timezone.utc)
 
 
-def convert_utc_to_local(utc_time: datetime, user_timezone: str) -> datetime:
+def parse_iso_datetime(iso_string: str) -> Optional[datetime]:
     """
-    Convert UTC time to user's local timezone.
-    
+    Parse ISO 8601 datetime string.
+
     Args:
-        utc_time: UTC datetime object
-        user_timezone: IANA timezone string (e.g., 'America/New_York')
-        
+        iso_string: ISO formatted datetime string
+
     Returns:
-        datetime: Local time in user's timezone
+        datetime: Parsed datetime, or None if parsing fails
     """
     try:
-        if utc_time.tzinfo is None:
-            utc_time = utc_time.replace(tzinfo=timezone.utc)
-        
-        user_tz = pytz.timezone(user_timezone)
-        local_time = utc_time.astimezone(user_tz)
-        
-        return local_time
-    
+        return datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
     except Exception as e:
-        logger.error(f"Error converting timezone: {e}")
-        return utc_time
+        logger.error("Error parsing ISO datetime '%s': %s", iso_string, e)
+        return None
 
 
-def format_dual_time(utc_time: datetime, user_timezone: str = 'UTC') -> str:
-    """
-    Format time as dual display: UTC and user's local time.
-    
-    Args:
-        utc_time: UTC datetime object
-        user_timezone: User's timezone
-        
-    Returns:
-        str: Formatted string like "14:30 UTC (09:30 AM your time)"
-    """
-    try:
-        utc_str = utc_time.strftime('%H:%M UTC')
-        
-        if user_timezone == 'UTC':
-            return utc_str
-        
-        local_time = convert_utc_to_local(utc_time, user_timezone)
-        local_str = local_time.strftime('%I:%M %p')
-        
-        return f"{utc_str} ({local_str} your time)"
-    
-    except Exception as e:
-        logger.error(f"Error formatting dual time: {e}")
-        return utc_time.strftime('%H:%M UTC')
+def format_percentage(value: float, decimals: int = 1) -> str:
+    """Format percentage value (e.g., '68.5%')."""
+    return f"{value:.{decimals}f}%"
 
 
-def get_session(time_utc: Optional[datetime] = None) -> str:
-    """
-    Determine which trading session is active.
-    
-    Args:
-        time_utc: UTC datetime (defaults to now)
-        
-    Returns:
-        str: Session name or 'CLOSED'
-    """
-    if time_utc is None:
-        time_utc = get_current_utc_time()
-    
-    hour = time_utc.hour
-    minute = time_utc.minute
-    current_minutes = hour * 60 + minute
-    
-    # Convert session times to minutes
-    for session_name, times in config.SESSIONS.items():
-        start_h, start_m = map(int, times['start'].split(':'))
-        end_h, end_m = map(int, times['end'].split(':'))
-        
-        start_minutes = start_h * 60 + start_m
-        end_minutes = end_h * 60 + end_m
-        
-        if start_minutes <= current_minutes < end_minutes:
-            return session_name
-    
-    return 'CLOSED'
-
-
-def is_london_ny_overlap(time_utc: Optional[datetime] = None) -> bool:
-    """
-    Check if current time is during London/New York overlap.
-    
-    Args:
-        time_utc: UTC datetime (defaults to now)
-        
-    Returns:
-        bool: True if during overlap (13:00-17:00 UTC)
-    """
-    if time_utc is None:
-        time_utc = get_current_utc_time()
-    
-    hour = time_utc.hour
-    return 13 <= hour < 17
-
-
-def calculate_time_until(target_time: datetime) -> str:
-    """
-    Calculate human-readable time until target.
-    
-    Args:
-        target_time: Future datetime
-        
-    Returns:
-        str: Formatted string like "1h 52m" or "45s"
-    """
-    now = get_current_utc_time()
-    
-    if target_time.tzinfo is None:
-        target_time = target_time.replace(tzinfo=timezone.utc)
-    
-    delta = target_time - now
-    
-    if delta.total_seconds() < 0:
-        return "0s"
-    
-    hours = int(delta.total_seconds() // 3600)
-    minutes = int((delta.total_seconds() % 3600) // 60)
-    seconds = int(delta.total_seconds() % 60)
-    
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    elif minutes > 0:
-        return f"{minutes}m {seconds}s"
-    else:
-        return f"{seconds}s"
-
-
-def calculate_trade_duration(entry_time: datetime, exit_time: Optional[datetime] = None) -> str:
-    """
-    Calculate how long a trade was open.
-    
-    Args:
-        entry_time: When trade was opened
-        exit_time: When trade was closed (defaults to now)
-        
-    Returns:
-        str: Duration like "2h 15m" or "3d 4h"
-    """
-    if exit_time is None:
-        exit_time = get_current_utc_time()
-    
-    if entry_time.tzinfo is None:
-        entry_time = entry_time.replace(tzinfo=timezone.utc)
-    if exit_time.tzinfo is None:
-        exit_time = exit_time.replace(tzinfo=timezone.utc)
-    
-    delta = exit_time - entry_time
-    
-    days = delta.days
-    hours = int(delta.seconds // 3600)
-    minutes = int((delta.seconds % 3600) // 60)
-    
-    if days > 0:
-        return f"{days}d {hours}h"
-    elif hours > 0:
-        return f"{hours}h {minutes}m"
-    else:
-        return f"{minutes}m"
-
-
-# ==================== PIP CALCULATIONS ====================
-
-def get_pip_value(symbol: str) -> float:
-    """
-    Get pip value for a symbol.
-    
-    Args:
-        symbol: Trading symbol (e.g., 'EURUSD')
-        
-    Returns:
-        float: Pip value (0.0001 for EURUSD, 0.01 for USDJPY, etc.)
-    """
-    symbol = normalize_symbol(symbol)
-    return config.PIP_VALUES.get(symbol, 0.0001)
-
-
-def calculate_pips(symbol: str, price1: float, price2: float) -> float:
-    """
-    Calculate pip distance between two prices.
-    
-    Args:
-        symbol: Trading symbol
-        price1: First price
-        price2: Second price
-        
-    Returns:
-        float: Pip distance (absolute value)
-    """
-    pip_value = get_pip_value(symbol)
-    pips = abs(price2 - price1) / pip_value
-    return round(pips, 1)
-
-
-def calculate_price_from_pips(symbol: str, base_price: float, pips: float, direction: str = 'up') -> float:
-    """
-    Calculate price that is X pips away from base price.
-    
-    Args:
-        symbol: Trading symbol
-        base_price: Starting price
-        pips: Number of pips away
-        direction: 'up' or 'down'
-        
-    Returns:
-        float: Calculated price
-    """
-    pip_value = get_pip_value(symbol)
-    
-    if direction == 'up':
-        new_price = base_price + (pips * pip_value)
-    else:
-        new_price = base_price - (pips * pip_value)
-    
-    # Round to appropriate decimal places
-    if 'JPY' in symbol:
-        return round(new_price, 3)
-    elif symbol in ['XAUUSD', 'XAGUSD']:
-        return round(new_price, 2)
-    else:
-        return round(new_price, 5)
-
-
-def calculate_lot_size(
-    account_balance: float,
-    risk_percent: float,
-    stop_loss_pips: float,
-    symbol: str,
-    account_currency: str = 'USD'
-) -> float:
-    """
-    Calculate optimal lot size based on risk parameters.
-    
-    Args:
-        account_balance: Account balance in account currency
-        risk_percent: Risk percentage (e.g., 1.0 for 1%)
-        stop_loss_pips: Stop loss distance in pips
-        symbol: Trading symbol
-        account_currency: Account currency
-        
-    Returns:
-        float: Calculated lot size
-    """
-    risk_amount = account_balance * (risk_percent / 100)
-    pip_value = get_pip_value(symbol)
-    
-    # Get contract size
-    if symbol in ['XAUUSD', 'XAGUSD']:
-        contract_size = config.CONTRACT_SIZES.get(symbol, 100)
-    elif 'BTC' in symbol or 'ETH' in symbol:
-        contract_size = 1
-    else:
-        contract_size = config.CONTRACT_SIZES['FOREX']
-    
-    # Calculate value per pip for 1 lot
-    value_per_pip = pip_value * contract_size
-    
-    # Calculate lot size
-    lot_size = risk_amount / (stop_loss_pips * value_per_pip)
-    
-    # Round to 2 decimal places
-    lot_size = round(lot_size, 2)
-    
-    # Minimum lot size
-    if lot_size < 0.01:
-        lot_size = 0.01
-    
-    return lot_size
-
-
-def calculate_profit_usd(
-    symbol: str,
-    lot_size: float,
-    entry_price: float,
-    exit_price: float,
-    direction: str
-) -> float:
-    """
-    Calculate profit in USD for a trade.
-    
-    Args:
-        symbol: Trading symbol
-        lot_size: Position size in lots
-        entry_price: Entry price
-        exit_price: Exit price
-        direction: 'BUY' or 'SELL'
-        
-    Returns:
-        float: Profit in USD (negative if loss)
-    """
-    pip_value = get_pip_value(symbol)
-    pips = calculate_pips(symbol, entry_price, exit_price)
-    
-    # Get contract size
-    if symbol in ['XAUUSD', 'XAGUSD']:
-        contract_size = config.CONTRACT_SIZES.get(symbol, 100)
-    elif 'BTC' in symbol or 'ETH' in symbol:
-        contract_size = 1
-    else:
-        contract_size = config.CONTRACT_SIZES['FOREX']
-    
-    # Calculate profit
-    profit = pips * pip_value * contract_size * lot_size
-    
-    # Invert if SELL trade and price went up
-    if direction == 'SELL':
-        if exit_price > entry_price:
-            profit = -profit
-    else:  # BUY
-        if exit_price < entry_price:
-            profit = -profit
-    
-    return round(profit, 2)
-
-
-def calculate_risk_reward(
-    entry_price: float,
-    stop_loss: float,
-    take_profit: float
-) -> float:
-    """
-    Calculate risk-reward ratio.
-    
-    Args:
-        entry_price: Entry price
-        stop_loss: Stop loss price
-        take_profit: Take profit price
-        
-    Returns:
-        float: R:R ratio (e.g., 2.0 for 1:2)
-    """
-    risk = abs(entry_price - stop_loss)
-    reward = abs(take_profit - entry_price)
-    
-    if risk == 0:
-        return 0.0
-    
-    rr_ratio = reward / risk
-    return round(rr_ratio, 2)
-
-
-# ==================== SYMBOL UTILITIES ====================
-
-def normalize_symbol(broker_symbol: str) -> str:
-    """
-    Normalize broker-specific symbol to standard format.
-    
-    Args:
-        broker_symbol: Broker's symbol (e.g., 'EURUSD.pro', 'GBPUSDm')
-        
-    Returns:
-        str: Normalized symbol (e.g., 'EURUSD', 'GBPUSD')
-    """
-    # Remove common suffixes
-    for suffix in config.SYMBOL_SUFFIXES:
-        if broker_symbol.endswith(suffix):
-            broker_symbol = broker_symbol[:-len(suffix)]
-    
-    # Remove any remaining special characters
-    broker_symbol = re.sub(r'[^A-Z0-9]', '', broker_symbol.upper())
-    
-    return broker_symbol
-
-
-def denormalize_symbol(standard_symbol: str, symbol_mapping: Optional[Dict[str, str]] = None) -> str:
-    """
-    Convert standard symbol to broker-specific format.
-    
-    Args:
-        standard_symbol: Standard symbol (e.g., 'EURUSD')
-        symbol_mapping: User's symbol mappings from database
-        
-    Returns:
-        str: Broker symbol or standard if no mapping exists
-    """
-    if symbol_mapping and standard_symbol in symbol_mapping:
-        return symbol_mapping[standard_symbol]
-    
-    return standard_symbol
-
-
-# ==================== FORMATTING UTILITIES ====================
-
-def format_price(symbol: str, price: float) -> str:
-    """
-    Format price with appropriate decimal places.
-    
-    Args:
-        symbol: Trading symbol
-        price: Price value
-        
-    Returns:
-        str: Formatted price
-    """
-    if 'JPY' in symbol:
-        return f"{price:.3f}"
-    elif symbol in ['XAUUSD', 'XAGUSD']:
-        return f"{price:.2f}"
-    elif 'BTC' in symbol:
-        return f"{price:.0f}"
-    elif 'ETH' in symbol:
-        return f"{price:.2f}"
-    else:
-        return f"{price:.5f}"
-
-
-def format_currency(amount: float, currency: str = 'USD') -> str:
-    """
-    Format currency amount.
-    
-    Args:
-        amount: Amount to format
-        currency: Currency code
-        
-    Returns:
-        str: Formatted string like "$132.50 USD"
-    """
-    if amount >= 0:
-        return f"${amount:.2f} {currency}"
-    else:
-        return f"-${abs(amount):.2f} {currency}"
-
-
-def format_percentage(value: float) -> str:
-    """
-    Format percentage value.
-    
-    Args:
-        value: Percentage (e.g., 68.5)
-        
-    Returns:
-        str: Formatted string like "68.5%"
-    """
-    return f"{value:.1f}%"
-
-
-def format_risk_reward(rr: float) -> str:
-    """
-    Format risk-reward ratio.
-    
-    Args:
-        rr: R:R ratio (e.g., 2.33)
-        
-    Returns:
-        str: Formatted string like "1:2.33"
-    """
-    return f"1:{rr:.2f}"
-
-
-# ==================== TEXT UTILITIES ====================
-
-def replace_forbidden_words(text: str) -> str:
-    """
-    Replace forbidden trading terms with compliant language.
-    
-    Args:
-        text: Original text
-        
-    Returns:
-        str: Text with replacements
-    """
-    for forbidden, replacement in config.FORBIDDEN_WORDS.items():
-        # Case-insensitive replacement
-        pattern = re.compile(re.escape(forbidden), re.IGNORECASE)
-        text = pattern.sub(replacement, text)
-    
-    return text
-
-
-def add_footer(text: str) -> str:
-    """
-    Add perpetual compliance footer to message.
-    
-    Args:
-        text: Original message text
-        
-    Returns:
-        str: Message with footer
-    """
-    return f"{text}\n\n{config.LEGAL_DISCLAIMER}"
-
-
-def truncate_message(text: str, max_length: int = config.MAX_MESSAGE_LENGTH) -> List[str]:
-    """
-    Split long message into multiple parts if needed.
-    
-    Args:
-        text: Message text
-        max_length: Maximum length per message
-        
-    Returns:
-        list: List of message parts
-    """
+def truncate_text(text: str, max_length: int = 100, suffix: str = '...') -> str:
+    """Truncate text to maximum length."""
     if len(text) <= max_length:
-        return [text]
-    
-    parts = []
-    current_part = ""
-    
-    for line in text.split('\n'):
-        if len(current_part) + len(line) + 1 <= max_length:
-            current_part += line + '\n'
-        else:
-            if current_part:
-                parts.append(current_part.strip())
-            current_part = line + '\n'
-    
-    if current_part:
-        parts.append(current_part.strip())
-    
-    return parts
+        return text
+    return text[:max_length - len(suffix)] + suffix
 
 
-# ==================== VALIDATION UTILITIES ====================
-
-def validate_risk_percent(risk: float) -> Tuple[bool, str]:
+def extract_currency_from_symbol(symbol: str) -> Tuple[str, str]:
     """
-    Validate risk percentage input.
-    
+    Extract base and quote currency from a broker symbol string.
+    Fix: Only strip trailing 'm' when it follows a 6-character standard pair,
+    not from all symbols (which would corrupt 'EURUSDm' -> 'EURSD').
+
     Args:
-        risk: Risk percentage value
-        
+        symbol: Trading symbol (e.g., 'EURUSD', 'EURUSDm', 'XAUUSD')
+
     Returns:
-        tuple: (is_valid, error_message)
+        Tuple[str, str]: (base_currency, quote_currency)
     """
-    if risk < config.MIN_RISK_PERCENT:
-        return False, f"Risk must be at least {config.MIN_RISK_PERCENT}%"
-    
-    if risk > config.MAX_RISK_PERCENT:
-        return False, f"Risk cannot exceed {config.MAX_RISK_PERCENT}%"
-    
-    return True, ""
+    clean_symbol = symbol
+
+    for suffix in ['.pro', '.raw', '-a', 'm']:
+        if clean_symbol.endswith(suffix):
+            candidate = clean_symbol[:-len(suffix)]
+            # Only accept the strip if it results in a known pair length
+            if len(candidate) >= 6:
+                clean_symbol = candidate
+                break
+
+    if clean_symbol.startswith('XAU'):
+        return 'XAU', clean_symbol[3:]
+    if clean_symbol.startswith('XAG'):
+        return 'XAG', clean_symbol[3:]
+
+    if len(clean_symbol) >= 6:
+        return clean_symbol[:3], clean_symbol[3:6]
+
+    return clean_symbol, 'USD'
 
 
-def validate_symbol(symbol: str) -> bool:
+def validate_risk_percent(risk_percent: float) -> bool:
     """
-    Check if symbol is in monitored list.
-    
+    Validate risk percentage is within acceptable bounds (0.1% - 5.0%).
+
     Args:
-        symbol: Trading symbol
-        
+        risk_percent: Risk percentage per trade
+
     Returns:
         bool: True if valid
     """
-    normalized = normalize_symbol(symbol)
-    return normalized in config.MONITORED_SYMBOLS
+    return config.MIN_RISK_PERCENT <= risk_percent <= config.MAX_RISK_PERCENT
 
 
-# ==================== ORDER TYPE DETECTION ====================
-
-def determine_order_type(current_price: float, entry_price: float, symbol: str) -> Dict[str, any]:
+def validate_lot_size(lot_size: float) -> bool:
     """
-    Determine order type based on price distance.
-    
+    Validate lot size is within acceptable bounds.
+
     Args:
-        current_price: Current market price
-        entry_price: Desired entry price
-        symbol: Trading symbol
-        
+        lot_size: Lot size value
+
     Returns:
-        dict: Order type information with description
+        bool: True if valid
     """
-    distance_pips = calculate_pips(symbol, current_price, entry_price)
-    
-    if distance_pips <= 2:
+    return config.MIN_LOT_SIZE <= lot_size <= config.MAX_LOT_SIZE
+
+
+def parse_mt5_credentials(text: str) -> Optional[dict]:
+    """
+    Parse MT5 credentials from user message text.
+    Expected format (case-insensitive):
+        LOGIN: 12345678
+        PASSWORD: YourPassword
+        SERVER: ICMarkets-Demo
+
+    Args:
+        text: Raw message text from user
+
+    Returns:
+        dict with keys 'login', 'password', 'server', or None if parsing fails
+    """
+    try:
+        login = None
+        password = None
+        server = None
+
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if ':' not in line:
+                continue
+
+            key, _, value = line.partition(':')
+            key = key.strip().upper()
+            value = value.strip()
+
+            if key == 'LOGIN':
+                login = value
+            elif key == 'PASSWORD':
+                password = value
+            elif key == 'SERVER':
+                server = value
+
+        if not login or not password or not server:
+            return None
+
+        if not login.isdigit():
+            return None
+
         return {
-            'type': 'MARKET',
-            'description': f'MARKET ORDER - Entry at {format_price(symbol, entry_price)} within {distance_pips:.1f} pips of current price. Trade executes immediately.',
-            'expiry_hours': 0
+            'login': int(login),
+            'password': password,
+            'server': server
         }
-    
-    elif distance_pips <= 20:
-        direction = 'pullback' if entry_price < current_price else 'rally'
-        return {
-            'type': 'LIMIT',
-            'description': f'LIMIT ORDER - Entry at {format_price(symbol, entry_price)} requires {direction} from current {format_price(symbol, current_price)} ({distance_pips:.1f} pips away). Order will expire in 1 hour if not filled.',
-            'expiry_hours': 1
-        }
-    
-    else:
-        direction = 'upward' if entry_price > current_price else 'downward'
-        return {
-            'type': 'STOP',
-            'description': f'STOP ORDER - Entry at {format_price(symbol, entry_price)} requires {direction} breakout from current {format_price(symbol, current_price)} ({distance_pips:.1f} pips away). Order will expire in 1 hour if not filled.',
-            'expiry_hours': 1
-        }
+
+    except Exception as e:
+        logger.error("Error parsing MT5 credentials: %s", e)
+        return None

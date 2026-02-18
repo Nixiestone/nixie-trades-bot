@@ -1,900 +1,407 @@
 """
-NIX TRADES - MT5 Trading Connector
-MetaTrader 5 integration with auto-execution, rate limiting, and error recovery
-Production-ready, zero errors, zero placeholders
+NIX TRADES - MT5 Connector
+HTTP client that communicates with the MT5 Worker Service.
+Runs on the Linux bot server. Does NOT import MetaTrader5 directly.
+
+Role: Lead Architect + Quant Software Engineer
+Fixes:
+  - Replaced direct MetaTrader5 DLL calls with HTTP requests to mt5_worker.py
+    (the worker runs on Windows; this connector runs on the bot server)
+  - Per-user credential injection on every call (no global single-user state)
+  - Rate limiting preserved via request throttling
+  - Lot size calculation delegated to the worker (has live account data)
+  - All methods return (bool, data/message) tuples for consistent error handling
 NO EMOJIS - Professional code only
 """
 
 import logging
 import time
 from typing import Optional, Dict, List, Tuple, Any
-from datetime import datetime, timedelta
-import MetaTrader5 as mt5
-from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import requests
+
 import config
-import utils
+import database as db
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class MT5RateLimiter:
-    """Rate limiter for MT5 API calls to prevent broker throttling."""
-    max_calls_per_second: int = 10
-    max_calls_per_minute: int = 100
-    calls_last_second: List[float] = None
-    calls_last_minute: List[float] = None
-    
-    def __post_init__(self):
-        self.calls_last_second = []
-        self.calls_last_minute = []
-    
-    def wait_if_needed(self):
-        """Wait if rate limit would be exceeded."""
-        current_time = time.time()
-        
-        # Clean old calls
-        self.calls_last_second = [t for t in self.calls_last_second if current_time - t < 1.0]
-        self.calls_last_minute = [t for t in self.calls_last_minute if current_time - t < 60.0]
-        
-        # Check per-second limit
-        if len(self.calls_last_second) >= self.max_calls_per_second:
-            sleep_time = 1.0 - (current_time - self.calls_last_second[0])
-            if sleep_time > 0:
-                logger.debug(f"Rate limit: sleeping {sleep_time:.2f}s")
-                time.sleep(sleep_time)
-                current_time = time.time()
-                self.calls_last_second = []
-        
-        # Check per-minute limit
-        if len(self.calls_last_minute) >= self.max_calls_per_minute:
-            sleep_time = 60.0 - (current_time - self.calls_last_minute[0])
-            if sleep_time > 0:
-                logger.warning(f"Rate limit: sleeping {sleep_time:.2f}s (per-minute limit)")
-                time.sleep(sleep_time)
-                current_time = time.time()
-                self.calls_last_minute = []
-        
-        # Record this call
-        self.calls_last_second.append(current_time)
-        self.calls_last_minute.append(current_time)
-
-
 class MT5Connector:
     """
-    MetaTrader 5 connector with comprehensive trading functionality.
-    Handles connection, data fetching, order execution, and position management.
+    Client-side connector that translates bot requests into HTTP calls
+    to the MT5 Worker Service running on a Windows machine.
+
+    Each method retrieves the user's MT5 credentials from the database,
+    passes them to the worker, and returns the result.
+    This design allows unlimited simultaneous users.
     """
-    
+
     def __init__(self):
-        """Initialize MT5 Connector."""
         self.logger = logging.getLogger(f"{__name__}.MT5Connector")
-        self.connected = False
-        self.account_info = None
-        self.rate_limiter = MT5RateLimiter()
-        self.logger.info("MT5 Connector initialized")
-    
-    # ==================== CONNECTION MANAGEMENT ====================
-    
-    def connect(
-        self,
-        login: int,
-        password: str,
-        server: str,
-        timeout: int = config.MT5_TIMEOUT
-    ) -> Tuple[bool, str]:
+        self.base_url = config.MT5_WORKER_URL.rstrip('/')
+        self.api_key = config.MT5_WORKER_API_KEY
+        self.timeout = config.MT5_TIMEOUT
+        self.logger.info(
+            "MT5 Connector initialised. Worker URL: %s", self.base_url
+        )
+
+    # ==================== INTERNAL HELPERS ====================
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            'Content-Type': 'application/json',
+            'X-API-Key':    self.api_key
+        }
+
+    def _post(self, endpoint: str, payload: dict) -> Tuple[bool, Any]:
         """
-        Connect to MT5 terminal with triple-retry logic.
-        
+        Make a POST request to the MT5 worker with retry logic.
+
         Args:
-            login: MT5 account login
-            password: MT5 account password
-            server: Broker server name
-            timeout: Connection timeout in milliseconds
-            
+            endpoint: API endpoint path (e.g., '/connect')
+            payload:  JSON request body
+
         Returns:
-            tuple: (success, message)
+            Tuple[bool, Any]: (success, response_dict or error_message)
         """
+        url = f"{self.base_url}{endpoint}"
+
         for attempt in range(config.MT5_RETRY_ATTEMPTS):
             try:
-                # Initialize MT5
-                if not mt5.initialize():
-                    error = mt5.last_error()
-                    self.logger.error(f"MT5 initialization failed: {error}")
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, f"MT5 initialization failed: {error}"
-                
-                # Login to account
-                if not mt5.login(login, password=password, server=server, timeout=timeout):
-                    error = mt5.last_error()
-                    self.logger.error(f"MT5 login failed: {error}")
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        mt5.shutdown()
-                        continue
-                    else:
-                        mt5.shutdown()
-                        return False, f"Login failed: {error}"
-                
-                # Get account info
-                account_info = mt5.account_info()
-                if account_info is None:
-                    error = mt5.last_error()
-                    self.logger.error(f"Failed to get account info: {error}")
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, f"Failed to get account info: {error}"
-                
-                # Success
-                self.connected = True
-                self.account_info = account_info._asdict()
-                
-                self.logger.info(
-                    f"MT5 connected: Account {login}, "
-                    f"Balance: {self.account_info['balance']} {self.account_info['currency']}"
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=self._headers(),
+                    timeout=self.timeout
                 )
-                
-                # Add monitored symbols to Market Watch
-                self._add_symbols_to_market_watch(config.MONITORED_SYMBOLS)
-                
-                return True, "Connected successfully"
-            
-            except Exception as e:
-                self.logger.error(f"Connection attempt {attempt + 1} failed: {e}")
-                
+
+                if response.status_code == 401:
+                    return False, "MT5 Worker authentication failed. Check MT5_WORKER_API_KEY."
+
+                data = response.json()
+
+                if data.get('success'):
+                    return True, data
+
+                error_msg = data.get('error', 'Unknown error from MT5 worker')
+                self.logger.error(
+                    "MT5 Worker error on %s: %s", endpoint, error_msg
+                )
+                return False, error_msg
+
+            except requests.exceptions.ConnectionError:
+                self.logger.error(
+                    "MT5 Worker unreachable at %s (attempt %d/%d)",
+                    url, attempt + 1, config.MT5_RETRY_ATTEMPTS
+                )
                 if attempt < config.MT5_RETRY_ATTEMPTS - 1:
                     time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                else:
-                    return False, f"Connection error: {str(e)}"
-        
-        return False, "Connection failed after all retries"
-    
-    def disconnect(self) -> bool:
+
+            except requests.exceptions.Timeout:
+                self.logger.error(
+                    "MT5 Worker timeout on %s (attempt %d/%d)",
+                    url, attempt + 1, config.MT5_RETRY_ATTEMPTS
+                )
+                if attempt < config.MT5_RETRY_ATTEMPTS - 1:
+                    time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
+
+            except Exception as e:
+                self.logger.error(
+                    "Unexpected error calling MT5 worker %s: %s", endpoint, e
+                )
+                return False, str(e)
+
+        return False, f"MT5 Worker unreachable after {config.MT5_RETRY_ATTEMPTS} attempts"
+
+    def _get_credentials(self, telegram_id: int) -> Optional[dict]:
         """
-        Disconnect from MT5 terminal.
-        
-        Returns:
-            bool: True if disconnected successfully
-        """
-        try:
-            if self.connected:
-                mt5.shutdown()
-                self.connected = False
-                self.account_info = None
-                self.logger.info("MT5 disconnected")
-                return True
-            return True
-        
-        except Exception as e:
-            self.logger.error(f"Error disconnecting: {e}")
-            return False
-    
-    def is_connected(self) -> bool:
-        """
-        Check if MT5 is connected.
-        
-        Returns:
-            bool: True if connected
-        """
-        try:
-            if not self.connected:
-                return False
-            
-            # Verify connection is still alive
-            account_info = mt5.account_info()
-            if account_info is None:
-                self.connected = False
-                return False
-            
-            return True
-        
-        except:
-            self.connected = False
-            return False
-    
-    def _add_symbols_to_market_watch(self, symbols: List[str]) -> None:
-        """
-        Add symbols to Market Watch for real-time quotes.
-        
+        Retrieve decrypted MT5 credentials for a user.
+
         Args:
-            symbols: List of symbol names
-        """
-        try:
-            for symbol in symbols:
-                self.rate_limiter.wait_if_needed()
-                
-                # Try standard symbol first
-                if not mt5.symbol_select(symbol, True):
-                    # Try with common suffixes
-                    found = False
-                    for suffix in config.SYMBOL_SUFFIXES:
-                        broker_symbol = f"{symbol}{suffix}"
-                        if mt5.symbol_select(broker_symbol, True):
-                            self.logger.info(f"Added {broker_symbol} to Market Watch")
-                            found = True
-                            break
-                    
-                    if not found:
-                        self.logger.warning(f"Could not add {symbol} to Market Watch")
-                else:
-                    self.logger.info(f"Added {symbol} to Market Watch")
-        
-        except Exception as e:
-            self.logger.error(f"Error adding symbols to Market Watch: {e}")
-    
-    # ==================== ACCOUNT OPERATIONS ====================
-    
-    def get_account_info(self) -> Optional[Dict[str, Any]]:
-        """
-        Get current account information with rate limiting.
-        
+            telegram_id: Telegram user ID
+
         Returns:
-            dict: Account info or None if failed
+            dict with login/password/server, or None
         """
-        try:
-            if not self.is_connected():
-                return None
-            
-            self.rate_limiter.wait_if_needed()
-            
-            account_info = mt5.account_info()
-            if account_info is None:
-                return None
-            
-            info_dict = account_info._asdict()
-            self.account_info = info_dict
-            
-            return info_dict
-        
-        except Exception as e:
-            self.logger.error(f"Error getting account info: {e}")
-            return None
-    
-    def get_account_balance(self) -> Tuple[Optional[float], Optional[str]]:
-        """
-        Get account balance and currency.
-        
-        Returns:
-            tuple: (balance, currency) or (None, None)
-        """
-        info = self.get_account_info()
-        if info:
-            return info['balance'], info['currency']
-        return None, None
-    
-    def get_account_equity(self) -> Optional[float]:
-        """
-        Get account equity (balance + floating profit/loss).
-        
-        Returns:
-            float: Equity or None
-        """
-        info = self.get_account_info()
-        return info['equity'] if info else None
-    
-    def get_exchange_rates(self) -> Dict[str, float]:
-        """
-        Get exchange rates for all major currency pairs for lot size calculations.
-        
-        Returns:
-            dict: Exchange rates (e.g., {'EURUSD': 1.0850, 'GBPUSD': 1.2650})
-        """
-        rates = {}
-        
-        try:
-            # Major pairs
-            major_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD']
-            
-            for pair in major_pairs:
-                self.rate_limiter.wait_if_needed()
-                
-                symbol_info = self.get_symbol_info(pair)
-                if symbol_info and symbol_info['bid'] > 0:
-                    rates[pair] = symbol_info['bid']
-        
-        except Exception as e:
-            self.logger.error(f"Error getting exchange rates: {e}")
-        
-        return rates
-    
-    # ==================== SYMBOL OPERATIONS ====================
-    
-    def normalize_symbol(self, standard_symbol: str) -> Optional[str]:
-        """
-        Find broker's actual symbol name from standard symbol.
-        
-        Args:
-            standard_symbol: Standard symbol (e.g., 'EURUSD')
-            
-        Returns:
-            str: Broker's symbol or None if not found
-        """
-        try:
-            self.rate_limiter.wait_if_needed()
-            
-            # Try standard symbol first
-            symbol_info = mt5.symbol_info(standard_symbol)
-            if symbol_info is not None:
-                return standard_symbol
-            
-            # Try with suffixes
-            for suffix in config.SYMBOL_SUFFIXES:
-                broker_symbol = f"{standard_symbol}{suffix}"
-                symbol_info = mt5.symbol_info(broker_symbol)
-                if symbol_info is not None:
-                    self.logger.info(f"Normalized {standard_symbol} to {broker_symbol}")
-                    return broker_symbol
-            
-            self.logger.warning(f"Symbol {standard_symbol} not found on broker")
-            return None
-        
-        except Exception as e:
-            self.logger.error(f"Error normalizing symbol: {e}")
-            return None
-    
-    def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Get symbol information with rate limiting.
-        
-        Args:
-            symbol: Symbol name
-            
-        Returns:
-            dict: Symbol info or None
-        """
-        try:
-            self.rate_limiter.wait_if_needed()
-            
-            broker_symbol = self.normalize_symbol(symbol)
-            if not broker_symbol:
-                return None
-            
-            symbol_info = mt5.symbol_info(broker_symbol)
-            if symbol_info is None:
-                return None
-            
-            # Get current tick for prices
-            tick = mt5.symbol_info_tick(broker_symbol)
-            
-            info_dict = symbol_info._asdict()
-            
-            if tick:
-                info_dict['bid'] = tick.bid
-                info_dict['ask'] = tick.ask
-                info_dict['last'] = tick.last
-                info_dict['time'] = tick.time
-            
-            return info_dict
-        
-        except Exception as e:
-            self.logger.error(f"Error getting symbol info: {e}")
-            return None
-    
-    def get_current_price(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Get current bid and ask prices with rate limiting.
-        
-        Args:
-            symbol: Symbol name
-            
-        Returns:
-            tuple: (bid, ask) or (None, None)
-        """
-        try:
-            self.rate_limiter.wait_if_needed()
-            
-            broker_symbol = self.normalize_symbol(symbol)
-            if not broker_symbol:
-                return None, None
-            
-            tick = mt5.symbol_info_tick(broker_symbol)
-            if tick is None:
-                return None, None
-            
-            return tick.bid, tick.ask
-        
-        except Exception as e:
-            self.logger.error(f"Error getting current price: {e}")
-            return None, None
-    
-    # ==================== HISTORICAL DATA ====================
-    
-    def get_historical_data(
+        creds = db.get_mt5_credentials(telegram_id)
+        if not creds:
+            self.logger.warning("No MT5 credentials found for user %d", telegram_id)
+        return creds
+
+    # ==================== CONNECTION VERIFICATION ====================
+
+    def verify_credentials(
         self,
-        symbol: str,
-        timeframe: str,
-        bars: int = 1000
-    ) -> Optional[List[Dict]]:
+        telegram_id: int,
+        login: int,
+        password: str,
+        server: str
+    ) -> Tuple[bool, dict]:
         """
-        Get historical OHLCV data with rate limiting.
-        
+        Verify MT5 credentials and return account information.
+        Used during /connect_mt5 to validate before saving credentials.
+
         Args:
-            symbol: Symbol name
-            timeframe: Timeframe (M1, M5, M15, M30, H1, H4, D1, W1, MN1)
-            bars: Number of bars to fetch
-            
+            telegram_id: Telegram user ID
+            login:       MT5 login number
+            password:    MT5 password
+            server:      MT5 server name
+
         Returns:
-            list: List of OHLCV dicts or None
+            Tuple[bool, dict]: (success, account_info or error message)
+        """
+        payload = {
+            'telegram_id': telegram_id,
+            'login':       login,
+            'password':    password,
+            'server':      server
+        }
+
+        success, result = self._post('/connect', payload)
+        return success, result
+
+    def is_worker_reachable(self) -> bool:
+        """
+        Check if the MT5 Worker Service is online.
+
+        Returns:
+            bool: True if reachable
         """
         try:
-            self.rate_limiter.wait_if_needed()
-            
-            broker_symbol = self.normalize_symbol(symbol)
-            if not broker_symbol:
-                return None
-            
-            # Map timeframe string to MT5 constant
-            timeframe_map = {
-                'M1': mt5.TIMEFRAME_M1,
-                'M5': mt5.TIMEFRAME_M5,
-                'M15': mt5.TIMEFRAME_M15,
-                'M30': mt5.TIMEFRAME_M30,
-                'H1': mt5.TIMEFRAME_H1,
-                'H4': mt5.TIMEFRAME_H4,
-                'D1': mt5.TIMEFRAME_D1,
-                'W1': mt5.TIMEFRAME_W1,
-                'MN1': mt5.TIMEFRAME_MN1,
-            }
-            
-            mt5_timeframe = timeframe_map.get(timeframe)
-            if not mt5_timeframe:
-                self.logger.error(f"Invalid timeframe: {timeframe}")
-                return None
-            
-            # Fetch data
-            rates = mt5.copy_rates_from_pos(broker_symbol, mt5_timeframe, 0, bars)
-            
-            if rates is None or len(rates) == 0:
-                self.logger.error(f"No data for {broker_symbol} {timeframe}")
-                return None
-            
-            # Convert to list of dicts
-            data = []
-            for rate in rates:
-                data.append({
-                    'time': datetime.fromtimestamp(rate['time']),
-                    'open': rate['open'],
-                    'high': rate['high'],
-                    'low': rate['low'],
-                    'close': rate['close'],
-                    'volume': rate['tick_volume']
-                })
-            
-            self.logger.info(f"Fetched {len(data)} bars for {broker_symbol} {timeframe}")
-            return data
-        
-        except Exception as e:
-            self.logger.error(f"Error getting historical data: {e}")
-            return None
-    
+            response = requests.get(
+                f"{self.base_url}/health",
+                headers=self._headers(),
+                timeout=5
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
     # ==================== ORDER EXECUTION ====================
-    
+
     def place_order(
         self,
+        telegram_id: int,
         symbol: str,
         direction: str,
         lot_size: float,
-        entry_price: Optional[float] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
+        stop_loss: float,
+        take_profit: float,
         order_type: str = 'MARKET',
+        entry_price: Optional[float] = None,
         comment: str = 'Nix Trades',
-        magic_number: int = 123456,
-        expiration: Optional[datetime] = None
+        expiry_minutes: int = 60
     ) -> Tuple[bool, Optional[int], str]:
         """
-        Place trading order with triple-retry logic and rate limiting.
-        
+        Place a trade order on the user's MT5 account.
+
         Args:
-            symbol: Symbol name
-            direction: 'BUY' or 'SELL'
-            lot_size: Position size in lots
-            entry_price: Entry price (for limit/stop orders)
-            stop_loss: Stop loss price
-            take_profit: Take profit price
-            order_type: 'MARKET', 'LIMIT', or 'STOP'
-            comment: Order comment
-            magic_number: Magic number for identification
-            expiration: Order expiration time (for pending orders)
-            
+            telegram_id:    Telegram user ID
+            symbol:         Trading symbol (broker-specific)
+            direction:      'BUY' or 'SELL'
+            lot_size:       Lot size
+            stop_loss:      Stop loss price
+            take_profit:    Take profit price (TP2 used for initial order)
+            order_type:     'MARKET', 'LIMIT', or 'STOP'
+            entry_price:    Entry price for pending orders
+            comment:        Order comment (max 31 chars)
+            expiry_minutes: Minutes until pending order expires
+
         Returns:
-            tuple: (success, ticket_number, message)
+            Tuple[bool, Optional[int], str]: (success, ticket_number, message)
         """
-        for attempt in range(config.MT5_RETRY_ATTEMPTS):
-            try:
-                if not self.is_connected():
-                    return False, None, "Not connected to MT5"
-                
-                self.rate_limiter.wait_if_needed()
-                
-                broker_symbol = self.normalize_symbol(symbol)
-                if not broker_symbol:
-                    return False, None, f"Symbol {symbol} not found"
-                
-                # Get current prices
-                bid, ask = self.get_current_price(broker_symbol)
-                if not bid or not ask:
-                    return False, None, "Failed to get current prices"
-                
-                # Determine order type
-                if direction == 'BUY':
-                    trade_type = mt5.ORDER_TYPE_BUY if order_type == 'MARKET' else (
-                        mt5.ORDER_TYPE_BUY_LIMIT if order_type == 'LIMIT' else mt5.ORDER_TYPE_BUY_STOP
-                    )
-                    price = ask if order_type == 'MARKET' else entry_price
-                else:  # SELL
-                    trade_type = mt5.ORDER_TYPE_SELL if order_type == 'MARKET' else (
-                        mt5.ORDER_TYPE_SELL_LIMIT if order_type == 'LIMIT' else mt5.ORDER_TYPE_SELL_STOP
-                    )
-                    price = bid if order_type == 'MARKET' else entry_price
-                
-                # Get symbol info for lot size validation
-                symbol_info = mt5.symbol_info(broker_symbol)
-                if symbol_info is None:
-                    return False, None, "Failed to get symbol info"
-                
-                # Validate lot size
-                if lot_size < symbol_info.volume_min:
-                    lot_size = symbol_info.volume_min
-                if lot_size > symbol_info.volume_max:
-                    lot_size = symbol_info.volume_max
-                
-                # Round lot size to step
-                lot_step = symbol_info.volume_step
-                lot_size = round(lot_size / lot_step) * lot_step
-                
-                # Build request
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL if order_type == 'MARKET' else mt5.TRADE_ACTION_PENDING,
-                    "symbol": broker_symbol,
-                    "volume": lot_size,
-                    "type": trade_type,
-                    "price": price,
-                    "deviation": 20,
-                    "magic": magic_number,
-                    "comment": comment,
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-                
-                # Add SL/TP if provided
-                if stop_loss:
-                    request['sl'] = stop_loss
-                if take_profit:
-                    request['tp'] = take_profit
-                
-                # Add expiration for pending orders
-                if order_type != 'MARKET' and expiration:
-                    request['type_time'] = mt5.ORDER_TIME_SPECIFIED
-                    request['expiration'] = int(expiration.timestamp())
-                
-                # Send order
-                result = mt5.order_send(request)
-                
-                if result is None:
-                    error = mt5.last_error()
-                    self.logger.error(f"Order send failed (attempt {attempt + 1}): {error}")
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, None, f"Order failed: {error}"
-                
-                if result.retcode != mt5.TRADE_RETCODE_DONE:
-                    self.logger.error(
-                        f"Order rejected (attempt {attempt + 1}): "
-                        f"retcode={result.retcode}, comment={result.comment}"
-                    )
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, None, f"Order rejected: {result.comment}"
-                
-                # Success
-                ticket = result.order if order_type != 'MARKET' else result.deal
-                
-                self.logger.info(
-                    f"Order placed: {direction} {lot_size} lots {broker_symbol} "
-                    f"at {price}, ticket={ticket}"
-                )
-                
-                return True, ticket, "Order placed successfully"
-            
-            except Exception as e:
-                self.logger.error(f"Order placement error (attempt {attempt + 1}): {e}")
-                
-                if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                    time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                else:
-                    return False, None, f"Order error: {str(e)}"
-        
-        return False, None, "Order failed after all retries"
-    
+        creds = self._get_credentials(telegram_id)
+        if not creds:
+            return False, None, "MT5 credentials not found. Use /connect_mt5 first."
+
+        payload = {
+            'telegram_id':    telegram_id,
+            'login':          creds['login'],
+            'password':       creds['password'],
+            'server':         creds['server'],
+            'symbol':         symbol,
+            'direction':      direction,
+            'lot_size':       lot_size,
+            'stop_loss':      stop_loss,
+            'take_profit':    take_profit,
+            'order_type':     order_type,
+            'entry_price':    entry_price,
+            'comment':        comment[:31],
+            'expiry_minutes': expiry_minutes
+        }
+
+        success, result = self._post('/place_order', payload)
+
+        if success:
+            ticket = result.get('ticket')
+            price = result.get('price', 0.0)
+            self.logger.info(
+                "Order placed: user=%d %s %s %.2f lots ticket=%d price=%.5f",
+                telegram_id, direction, symbol, lot_size, ticket, price
+            )
+            return True, ticket, f"Order placed at {price:.5f}"
+
+        return False, None, str(result)
+
     # ==================== POSITION MANAGEMENT ====================
-    
-    def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Get all open positions with rate limiting.
-        
-        Args:
-            symbol: Filter by symbol (optional)
-            
-        Returns:
-            list: List of position dicts
-        """
-        try:
-            if not self.is_connected():
-                return []
-            
-            self.rate_limiter.wait_if_needed()
-            
-            if symbol:
-                broker_symbol = self.normalize_symbol(symbol)
-                if not broker_symbol:
-                    return []
-                positions = mt5.positions_get(symbol=broker_symbol)
-            else:
-                positions = mt5.positions_get()
-            
-            if positions is None or len(positions) == 0:
-                return []
-            
-            position_list = []
-            for pos in positions:
-                position_list.append({
-                    'ticket': pos.ticket,
-                    'symbol': pos.symbol,
-                    'type': 'BUY' if pos.type == mt5.ORDER_TYPE_BUY else 'SELL',
-                    'volume': pos.volume,
-                    'price_open': pos.price_open,
-                    'price_current': pos.price_current,
-                    'sl': pos.sl,
-                    'tp': pos.tp,
-                    'profit': pos.profit,
-                    'swap': pos.swap,
-                    'commission': pos.commission,
-                    'magic': pos.magic,
-                    'comment': pos.comment,
-                    'time': datetime.fromtimestamp(pos.time)
-                })
-            
-            return position_list
-        
-        except Exception as e:
-            self.logger.error(f"Error getting open positions: {e}")
-            return []
-    
+
     def modify_position(
         self,
+        telegram_id: int,
         ticket: int,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None
     ) -> Tuple[bool, str]:
         """
-        Modify position SL/TP with triple-retry logic and rate limiting.
-        
+        Modify stop loss / take profit on an open position.
+
         Args:
-            ticket: Position ticket number
-            stop_loss: New stop loss price
-            take_profit: New take profit price
-            
+            telegram_id: Telegram user ID
+            ticket:      MT5 position ticket
+            stop_loss:   New stop loss price (None = keep current)
+            take_profit: New take profit price (None = keep current)
+
         Returns:
-            tuple: (success, message)
+            Tuple[bool, str]: (success, message)
         """
-        for attempt in range(config.MT5_RETRY_ATTEMPTS):
-            try:
-                if not self.is_connected():
-                    return False, "Not connected to MT5"
-                
-                self.rate_limiter.wait_if_needed()
-                
-                # Get position
-                position = mt5.positions_get(ticket=ticket)
-                if not position or len(position) == 0:
-                    return False, f"Position {ticket} not found"
-                
-                position = position[0]
-                
-                # Build request
-                request = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "symbol": position.symbol,
-                    "position": ticket,
-                    "sl": stop_loss if stop_loss else position.sl,
-                    "tp": take_profit if take_profit else position.tp,
-                }
-                
-                # Send modification
-                result = mt5.order_send(request)
-                
-                if result is None:
-                    error = mt5.last_error()
-                    self.logger.error(f"Position modify failed (attempt {attempt + 1}): {error}")
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, f"Modify failed: {error}"
-                
-                if result.retcode != mt5.TRADE_RETCODE_DONE:
-                    self.logger.error(
-                        f"Position modify rejected (attempt {attempt + 1}): "
-                        f"retcode={result.retcode}, comment={result.comment}"
-                    )
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, f"Modify rejected: {result.comment}"
-                
-                # Success
-                self.logger.info(f"Position {ticket} modified: SL={stop_loss}, TP={take_profit}")
-                return True, "Position modified successfully"
-            
-            except Exception as e:
-                self.logger.error(f"Position modify error (attempt {attempt + 1}): {e}")
-                
-                if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                    time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                else:
-                    return False, f"Modify error: {str(e)}"
-        
-        return False, "Modify failed after all retries"
-    
-    def close_position(
+        creds = self._get_credentials(telegram_id)
+        if not creds:
+            return False, "MT5 credentials not found."
+
+        payload = {
+            'telegram_id': telegram_id,
+            'login':       creds['login'],
+            'password':    creds['password'],
+            'server':      creds['server'],
+            'ticket':      ticket,
+            'stop_loss':   stop_loss,
+            'take_profit': take_profit
+        }
+
+        success, result = self._post('/modify_position', payload)
+        return success, result.get('message', str(result)) if success else str(result)
+
+    def close_partial(
         self,
+        telegram_id: int,
         ticket: int,
-        percentage: float = 100.0,
-        comment: str = 'Nix Trades Close'
+        close_percent: float = 50.0
     ) -> Tuple[bool, str]:
         """
-        Close position (full or partial) with triple-retry logic and rate limiting.
-        
+        Close a percentage of an open position.
+
         Args:
-            ticket: Position ticket number
-            percentage: Percentage to close (50.0 for partial, 100.0 for full)
-            comment: Close comment
-            
+            telegram_id:   Telegram user ID
+            ticket:        MT5 position ticket
+            close_percent: Percentage of volume to close (default 50%)
+
         Returns:
-            tuple: (success, message)
+            Tuple[bool, str]: (success, message)
         """
-        for attempt in range(config.MT5_RETRY_ATTEMPTS):
-            try:
-                if not self.is_connected():
-                    return False, "Not connected to MT5"
-                
-                self.rate_limiter.wait_if_needed()
-                
-                # Get position
-                position = mt5.positions_get(ticket=ticket)
-                if not position or len(position) == 0:
-                    return False, f"Position {ticket} not found"
-                
-                position = position[0]
-                
-                # Calculate volume to close
-                volume_to_close = position.volume * (percentage / 100.0)
-                
-                # Get symbol info for rounding
-                symbol_info = mt5.symbol_info(position.symbol)
-                if symbol_info:
-                    volume_to_close = round(volume_to_close / symbol_info.volume_step) * symbol_info.volume_step
-                
-                # Determine close type (opposite of open)
-                close_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                
-                # Get current price
-                tick = mt5.symbol_info_tick(position.symbol)
-                if not tick:
-                    return False, "Failed to get current price"
-                
-                close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
-                
-                # Build request
-                request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": position.symbol,
-                    "volume": volume_to_close,
-                    "type": close_type,
-                    "position": ticket,
-                    "price": close_price,
-                    "deviation": 20,
-                    "magic": position.magic,
-                    "comment": comment,
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-                
-                # Send close order
-                result = mt5.order_send(request)
-                
-                if result is None:
-                    error = mt5.last_error()
-                    self.logger.error(f"Position close failed (attempt {attempt + 1}): {error}")
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, f"Close failed: {error}"
-                
-                if result.retcode != mt5.TRADE_RETCODE_DONE:
-                    self.logger.error(
-                        f"Position close rejected (attempt {attempt + 1}): "
-                        f"retcode={result.retcode}, comment={result.comment}"
-                    )
-                    
-                    if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                        time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                        continue
-                    else:
-                        return False, f"Close rejected: {result.comment}"
-                
-                # Success
-                close_type_str = "PARTIAL" if percentage < 100 else "FULL"
-                self.logger.info(
-                    f"Position {ticket} closed ({close_type_str}): "
-                    f"{volume_to_close} lots at {close_price}"
-                )
-                
-                return True, f"Position closed successfully ({percentage}%)"
-            
-            except Exception as e:
-                self.logger.error(f"Position close error (attempt {attempt + 1}): {e}")
-                
-                if attempt < config.MT5_RETRY_ATTEMPTS - 1:
-                    time.sleep(config.MT5_RETRY_DELAY * (attempt + 1))
-                else:
-                    return False, f"Close error: {str(e)}"
-        
-        return False, "Close failed after all retries"
-    
-    def cancel_pending_order(self, ticket: int) -> Tuple[bool, str]:
+        creds = self._get_credentials(telegram_id)
+        if not creds:
+            return False, "MT5 credentials not found."
+
+        payload = {
+            'telegram_id':  telegram_id,
+            'login':        creds['login'],
+            'password':     creds['password'],
+            'server':       creds['server'],
+            'ticket':       ticket,
+            'close_percent': close_percent
+        }
+
+        success, result = self._post('/close_partial', payload)
+        return success, result.get('message', str(result)) if success else str(result)
+
+    def get_open_positions(self, telegram_id: int) -> List[Dict[str, Any]]:
         """
-        Cancel pending order with rate limiting.
-        
+        Retrieve open positions for a user.
+
         Args:
-            ticket: Order ticket number
-            
+            telegram_id: Telegram user ID
+
         Returns:
-            tuple: (success, message)
+            list: Position dicts
         """
-        try:
-            if not self.is_connected():
-                return False, "Not connected to MT5"
-            
-            self.rate_limiter.wait_if_needed()
-            
-            request = {
-                "action": mt5.TRADE_ACTION_REMOVE,
-                "order": ticket,
-            }
-            
-            result = mt5.order_send(request)
-            
-            if result is None:
-                error = mt5.last_error()
-                return False, f"Cancel failed: {error}"
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                return False, f"Cancel rejected: {result.comment}"
-            
-            self.logger.info(f"Pending order {ticket} cancelled")
-            return True, "Order cancelled successfully"
-        
-        except Exception as e:
-            self.logger.error(f"Order cancel error: {e}")
-            return False, f"Cancel error: {str(e)}"
+        creds = self._get_credentials(telegram_id)
+        if not creds:
+            return []
+
+        payload = {
+            'telegram_id': telegram_id,
+            'login':       creds['login'],
+            'password':    creds['password'],
+            'server':      creds['server']
+        }
+
+        success, result = self._post('/get_positions', payload)
+        if success:
+            return result.get('positions', [])
+        return []
+
+    def calculate_lot_size(
+        self,
+        telegram_id: int,
+        symbol: str,
+        risk_percent: float,
+        sl_pips: float
+    ) -> float:
+        """
+        Calculate lot size using live account balance from MT5.
+
+        Args:
+            telegram_id: Telegram user ID
+            symbol:      Trading symbol
+            risk_percent: Risk per trade as a percentage (e.g., 1.0)
+            sl_pips:     Stop loss distance in pips
+
+        Returns:
+            float: Calculated lot size, or 0.01 if calculation fails
+        """
+        creds = self._get_credentials(telegram_id)
+        if not creds:
+            return 0.01
+
+        payload = {
+            'telegram_id': telegram_id,
+            'login':       creds['login'],
+            'password':    creds['password'],
+            'server':      creds['server'],
+            'symbol':      symbol,
+            'risk_percent': risk_percent,
+            'sl_pips':     sl_pips
+        }
+
+        success, result = self._post('/calculate_lot', payload)
+        if success:
+            return result.get('lot_size', 0.01)
+        return 0.01
+
+    # ==================== SYMBOL NORMALIZATION ====================
+
+    def normalize_symbol(self, symbol: str) -> str:
+        """
+        Normalize a standard symbol name by stripping broker-specific suffixes.
+        Returns the canonical symbol (e.g., 'EURUSDm' -> 'EURUSD').
+
+        Args:
+            symbol: Symbol with potential broker suffix
+
+        Returns:
+            str: Normalized symbol
+        """
+        for standard, variants in config.SYMBOL_VARIATIONS.items():
+            if symbol in variants:
+                return standard
+
+        # Fallback: strip known suffixes
+        clean = symbol.upper()
+        for suffix in ['.PRO', '.RAW', '-A', 'M', '.I', '.B', '.C']:
+            if clean.endswith(suffix) and len(clean) > len(suffix) + 3:
+                candidate = clean[:-len(suffix)]
+                if candidate in config.SYMBOL_VARIATIONS:
+                    return candidate
+
+        return symbol
