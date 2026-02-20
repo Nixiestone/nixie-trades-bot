@@ -22,7 +22,7 @@ SUPPORT_CONTACT = "@Nixiestone"
 PRODUCT_NAME = "Nixie Trades"
 WATERMARK_TEXT = "NIXIE TRADES"
 TAGLINE = "Smart Money, Automated Logic"
-FOOTER = "Nixie Trades | Smart Money, Automated Logic | Educational Tool (Not Financial Advice)"
+FOOTER = "Nixie Trades| Educational Tool (Not Financial Advice)"
 
 # ==================== TELEGRAM SETTINGS ====================
 
@@ -237,7 +237,6 @@ WORD_REPLACEMENTS = {
 }
 
 # ==================== LEGAL DISCLAIMER ====================
-# Fix: {support_contact} placeholder is now resolved at definition time
 
 LEGAL_DISCLAIMER = (
     "IMPORTANT LEGAL NOTICE - PLEASE READ CAREFULLY\n\n"
@@ -258,18 +257,18 @@ LEGAL_DISCLAIMER = (
     "You maintain full control of your MetaTrader 5 account at all times. You can "
     "disconnect auto-execution, manually close trades, or modify parameters at any time.\n\n"
     "5. NO GUARANTEED RETURNS\n"
-    "There are NO guaranteed returns, profit guarantees, or risk-free trades. Every trade "
-    "carries risk. Historical performance reflects backtested results only.\n\n"
+    "There are no guaranteed returns, no profit guarantees, and no risk-free trades. "
+    "Every trade carries risk. Historical performance reflects backtested results only.\n\n"
     "6. ACKNOWLEDGMENT\n"
     "By clicking 'I Understand and Accept,' you confirm that:\n"
     "- You are 18 years or older\n"
     "- You understand this is an educational tool, not financial advice\n"
     "- You accept full responsibility for all trading decisions\n"
     "- You understand the risks of leveraged trading\n"
-    "- You will not hold Nix Trades Limited liable for any trading losses\n\n"
+    "- You will not hold Nixie Trades Limited liable for any trading losses\n\n"
     f"For support: {SUPPORT_CONTACT}\n\n"
-    "Last updated: February 2026"
-)
+    f"{FOOTER}")
+
 
 # ==================== BOT MESSAGES ====================
 
@@ -279,7 +278,7 @@ WELCOME_MESSAGE = (
     "with precision refinements for high-probability forex entries.\n\n"
     "What you get:\n"
     "- Real-time automated setups via Telegram\n"
-    "- Smart Money analysis (Order Blocks, Breaker Blocks, Market Structure)\n"
+    "- Smart Money analysis (Order Blocks, Breaker Blocks, Market Structure, e.t.c)\n"
     "- Machine learning confidence scoring\n"
     "- Automatic execution on MetaTrader 5\n"
     "- Risk management with partial profit-taking\n\n"
@@ -296,7 +295,8 @@ SUBSCRIPTION_SUCCESS = (
     "Subscription activated successfully.\n\n"
     "You will receive automated setup alerts when market conditions align "
     "with Smart Money Concepts criteria.\n\n"
-    "Daily market briefings will arrive at 8:00 AM UTC.\n\n"
+    "Daily market briefings will arrive at 8:00 AM UTC. \n"
+    "Use /settings to set your timezone and risk. \n \n"
     "Want automatic trade execution?\n"
     "Use /connect_mt5 to link your MetaTrader 5 broker account.\n\n"
     "For questions: {support_contact}\n\n"
@@ -304,7 +304,7 @@ SUBSCRIPTION_SUCCESS = (
 )
 
 HELP_MESSAGE = (
-    "NIX TRADES - HELP GUIDE\n\n"
+    "NIXIE TRADES - HELP GUIDE\n\n"
     "AVAILABLE COMMANDS:\n"
     "/start - Welcome message and overview\n"
     "/subscribe - Activate automated setup alerts\n"
@@ -316,7 +316,7 @@ HELP_MESSAGE = (
     "/settings - Customize risk parameters and preferences\n"
     "/unsubscribe - Stop receiving alerts\n\n"
     "SETUP QUALITY LEVELS:\n"
-    "- Unicorn Setup: Breaker Block + Fair Value Gap overlap\n"
+    "- Unicorn Setup: Breaker Block plus Fair Value Gap overlap\n"
     "  Historical success rate: 72-78% (past performance does not guarantee future results)\n"
     "- Standard Setup: Order Block or Breaker Block only\n"
     "  Historical success rate: 58-62% (past performance does not guarantee future results)\n\n"
@@ -330,7 +330,7 @@ HELP_MESSAGE = (
     "ORDER TYPES:\n"
     "- Market Order: Entry within 2 pips of current price, executes immediately\n"
     "- Limit Order: Entry 3-20 pips away, waits for pullback, expires in 1 hour\n"
-    "- Stop Order: Entry >20 pips away, breakout entry, expires in 1 hour\n\n"
+    "- Stop Order: Entry greater than 20 pips away, breakout entry, expires in 1 hour\n\n"
     "AUTO-EXECUTION FLOW:\n"
     "1. Setup generated when SMC criteria align\n"
     "2. Order placed on your MT5 account automatically\n"
@@ -342,7 +342,7 @@ HELP_MESSAGE = (
 )
 
 ALREADY_SUBSCRIBED = (
-    "You are already subscribed to Nix Trades automated setup alerts.\n\n"
+    "You are already subscribed to Nixie Trades automated setup alerts.\n\n"
     "Use /status to view your subscription details and trading statistics.\n\n"
     "{footer}"
 )
