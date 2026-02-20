@@ -22,7 +22,7 @@ SUPPORT_CONTACT = "@Nixiestone"
 PRODUCT_NAME = "Nixie Trades"
 WATERMARK_TEXT = "NIXIE TRADES"
 TAGLINE = "Smart Money, Automated Logic"
-FOOTER = "Nixie Trades| Educational Tool (Not Financial Advice)"
+FOOTER = "Nixie Trades | Educational Tool (Not Financial Advice)"
 
 # ==================== TELEGRAM SETTINGS ====================
 
@@ -215,8 +215,6 @@ WORD_REPLACEMENTS = {
     'guaranteed win':          'historical setup quality',
     'guaranteed wins':         'historical setup quality',
     'guarantee':               'historical data suggests',
-    'investment advice':       'educational parameter suggestion',
-    'financial advice':        'educational parameter suggestion',
     'we recommend you buy':    'setup parameters suggest long position (user has final decision)',
     'we recommend you sell':   'setup parameters suggest short position (user has final decision)',
     'you should buy':          'educational parameters indicate long (your decision)',
@@ -242,8 +240,8 @@ LEGAL_DISCLAIMER = (
     "IMPORTANT LEGAL NOTICE - PLEASE READ CAREFULLY\n\n"
     "This is an educational tool designed to demonstrate algorithmic trading concepts "
     "using Smart Money Concepts (SMC). By subscribing, you acknowledge and agree:\n\n"
-    "1. NOT FINANCIAL ADVICE\n"
-    "This bot does NOT provide investment advice, recommendations, or financial guidance. "
+    "1. FINANCIAL ADVICE\n"
+    "This tool does NOT provide investment advice, recommendations, or financial guidance. "
     "All automated setups are educational demonstrations of technical analysis patterns. "
     "You are solely responsible for all trading decisions.\n\n"
     "2. EDUCATIONAL PURPOSE ONLY\n"
@@ -298,7 +296,7 @@ SUBSCRIPTION_SUCCESS = (
     "Daily market briefings will arrive at 8:00 AM UTC. \n"
     "Use /settings to set your timezone and risk. \n \n"
     "Want automatic trade execution?\n"
-    "Use /connect_mt5 to link your MetaTrader 5 broker account.\n\n"
+    "Use /connect_mt5 to link your MT5 broker account.\n\n"
     "For questions: {support_contact}\n\n"
     "{footer}"
 )
@@ -412,7 +410,7 @@ UNSUBSCRIBE_SUCCESS = (
     "Unsubscribed successfully.\n\n"
     "You will no longer receive automated setup alerts.\n\n"
     "Your data remains for 30 days if you wish to reactivate.\n\n"
-    "Thank you for using Nix Trades. For feedback: {support_contact}\n\n"
+    "Thank you for using Nixie Trades. For feedback: {support_contact}\n\n"
     "{footer}"
 )
 
