@@ -80,7 +80,7 @@ class UserSession:
 
     def __init__(self, telegram_id: int):
         self.telegram_id = telegram_id
-        self.connected = False
+        self.connected = True
         self.last_active = time.time()
         self.lock = threading.Lock()
 
