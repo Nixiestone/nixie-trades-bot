@@ -629,9 +629,7 @@ class NixTradesBot:
         try:
             await update.message.delete()
         except Exception:
-            pass
-        else:
-            # In private chats bots cannot delete user messages - instruct user
+            # Cannot delete in private chats - instruct user manually
             try:
                 await update.message.reply_text(
                     "For your security, please delete the message containing your account number."
@@ -1464,9 +1462,7 @@ class NixTradesBot:
                     "Download sent to user %d: %d trades (no admin access for setups).",
                     telegram_id, len(trades) if trades else 0)
 
-            self.logger.info(
-                "Download sent to user %d: %d trades, %d setups.",
-                telegram_id, len(trades), len(signals))
+            
 
         except Exception as e:
             self.logger.error("Download error for user %d: %s", telegram_id, e)
