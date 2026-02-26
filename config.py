@@ -1,33 +1,51 @@
 """
 NIX TRADES - Configuration Module
-Production-ready constants, settings, and message templates
 Role: Lead Architect + Python Developer
-Fixes: Added missing import os, fixed unformatted {support_contact} placeholder in LEGAL_DISCLAIMER,
-       added missing environment variable keys, corrected LOG_LEVEL to read from environment,
-       removed bullet-point characters that render as encoding issues in non-unicode terminals.
-NO EMOJIS - Professional code only
+
+Changes in this version:
+  - Added ML_TIER_PREMIUM / ML_TIER_STANDARD / ML_TIER_DISCRETIONARY (thresholds)
+  - Added ML_AUTO_EXECUTE_THRESHOLD
+  - Added POSITION_CHECK_INTERVAL_SECONDS (was POSITION_MONITOR_INTERVAL_SECONDS)
+  - Added MAX_DAILY_LOSS_PERCENT
+  - Added MAGIC_NUMBER
+  - Added TARGET_RR_TP1 / TARGET_RR_TP2 used by smc_strategy.calculate_take_profits
+  - Added FIB_EXTENSION_LEVEL used by smc_strategy.calculate_take_profits
+  - Added CONFIRMATION_BODY_RATIO used by smc_strategy._check_confirmation_candle
+  - Added INDUCEMENT_WICK_MIN_PIPS / INDUCEMENT_WICK_MAX_PIPS / INDUCEMENT_BODY_CLOSE_RATIO
+  - Added ATR_MAX_RATIO (was truncated in previous version)
+  - Added TRADE_HISTORY_LOG_FILE / TRADE_HISTORY_MAX_BYTES / TRADE_HISTORY_BACKUP_COUNT
+    for the dedicated 50 MB rotating trade history log
+
+NO EMOJIS - Enterprise code only
 """
 
 import os
 
 # ==================== APPLICATION INFO ====================
 
-APP_NAME = "Nixie Trades"
-BOT_USERNAME = "@NixieTradesBot"
-VERSION = "1.0.0"
-COMPANY_NAME = "Nixie Trades Limited"
-SUPPORT_EMAIL = "support@nixietrades.com"
-WEBSITE = "nixietrades.com"
-SUPPORT_CONTACT = "@Nixiestone"
-PRODUCT_NAME = "Nixie Trades"
-WATERMARK_TEXT = "NIXIE TRADES"
-TAGLINE = "Smart Money, Automated Logic"
-FOOTER = "Nixie Trades | Educational Tool (Not Financial Advice)"
+APP_NAME         = "Nixie Trades"
+BOT_USERNAME     = "@NixieTradesBot"
+VERSION          = "1.0.0"
+COMPANY_NAME     = "Nixie Trades Limited"
+SUPPORT_EMAIL    = "support@nixietrades.com"
+WEBSITE          = "nixietrades.com"
+SUPPORT_CONTACT  = "@Nixiestone"
+PRODUCT_NAME     = "Nixie Trades"
+WATERMARK_TEXT   = "NIXIE TRADES"
+TAGLINE          = "Smart Money, Automated Logic"
+FOOTER           = "Nixie Trades | Educational Tool (Not Financial Advice)"
 
 # ==================== TELEGRAM SETTINGS ====================
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 MAX_MESSAGE_LENGTH = 4096
+
+# Admin Telegram user IDs. Only these users can download the ML setups CSV.
+# Add your personal Telegram numeric ID here.
+# To find your ID: message @userinfobot on Telegram.
+ADMIN_USER_IDS: list = [
+    int(x.strip()) for x in os.getenv('ADMIN_USER_IDS', '').split(',') if x.strip().isdigit()
+]
 
 # ==================== SUPABASE DATABASE ====================
 
@@ -44,36 +62,39 @@ NEWS_API_KEY = os.getenv('NEWS_API_KEY', '')
 
 # ==================== MT5 WORKER SERVICE ====================
 
-# The MT5 Worker runs on a separate Windows machine/VPS
-# It exposes a REST API that this bot calls to execute trades
-# This allows headless, multi-user trading without any terminal open
-MT5_WORKER_URL = os.getenv('MT5_WORKER_URL', 'http://localhost:8000')
+MT5_WORKER_URL     = os.getenv('MT5_WORKER_URL', 'http://localhost:8000')
 MT5_WORKER_API_KEY = os.getenv('MT5_WORKER_API_KEY', '')
-MT5_TIMEOUT = 30  # seconds for HTTP requests to MT5 Worker
+MT5_TIMEOUT        = 30   # seconds for HTTP requests to MT5 Worker
 MT5_RETRY_ATTEMPTS = 3
-MT5_RETRY_DELAY = 2  # seconds between retries
+MT5_RETRY_DELAY    = 2    # seconds between retries
 
-# Symbol normalization patterns
 SYMBOL_SUFFIXES = ['.pro', '.raw', '.m', '.i', '.a', '.b', '.c', '_']
+
+# ==================== TRADE EXECUTION ====================
+
+MAGIC_NUMBER = 234567    # Unique identifier for all orders placed by this bot
 
 # ==================== TRADING PARAMETERS ====================
 
-DEFAULT_RISK_PERCENT = 1.0
-MIN_RISK_PERCENT = 0.1
-MAX_RISK_PERCENT = 5.0
+DEFAULT_RISK_PERCENT  = 1.0
+MIN_RISK_PERCENT      = 0.1
+MAX_RISK_PERCENT      = 5.0
+MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios
-MIN_RR_RATIO = 1.5  # Minimum acceptable risk-reward ratio for any setup
-TP1_MULTIPLE = 1.5  # TP1 is placed at 1.5x the SL distance
-TP2_MULTIPLE = 2.5  # TP2 is placed at 2.5x the SL distance
+MIN_RR_RATIO   = 1.5    # Minimum acceptable risk-reward ratio for any setup
+
+
+# Fibonacci extension level for TP2 (1.618 = golden ratio)
+FIB_EXTENSION_LEVEL = 1.618
 
 # Breakeven settings
 BREAKEVEN_BUFFER_PIPS = 5
 
 # Order expiry
-DEFAULT_ORDER_EXPIRY_HOURS = 1
-LIMIT_ORDER_EXPIRY_MINUTES = 60
-STOP_ORDER_EXPIRY_MINUTES = 60
+DEFAULT_ORDER_EXPIRY_HOURS   = 1
+LIMIT_ORDER_EXPIRY_MINUTES   = 60
+STOP_ORDER_EXPIRY_MINUTES    = 60
 
 # ==================== MONITORED SYMBOLS ====================
 
@@ -83,10 +104,8 @@ MONITORED_SYMBOLS = [
     'XAUUSD', 'XAGUSD'
 ]
 
-# Supported Currency Pairs (same list, kept for compatibility)
 CURRENCY_PAIRS = MONITORED_SYMBOLS
 
-# Pip Sizes by Symbol Type
 PIP_SIZES = {
     'EURUSD': 0.0001, 'GBPUSD': 0.0001, 'AUDUSD': 0.0001,
     'NZDUSD': 0.0001, 'USDCAD': 0.0001, 'EURGBP': 0.0001,
@@ -94,7 +113,6 @@ PIP_SIZES = {
     'USDCHF': 0.0001, 'XAUUSD': 0.10,   'XAGUSD': 0.01
 }
 
-# Symbol Variations for Normalization
 SYMBOL_VARIATIONS = {
     'EURUSD': ['EURUSD', 'EURUSD.pro', 'EURUSD.raw', 'EURUSD-a', 'EURUSDm', 'EUR/USD'],
     'GBPUSD': ['GBPUSD', 'GBPUSD.pro', 'GBPUSD.raw', 'GBPUSD-a', 'GBPUSDm', 'GBP/USD'],
@@ -112,39 +130,71 @@ SYMBOL_VARIATIONS = {
 
 # ==================== ML CONFIGURATION ====================
 
-ML_THRESHOLD = 60
-ML_LSTM_WEIGHT = 0.7
-ML_XGBOOST_WEIGHT = 0.3
-ML_SEQUENCE_LENGTH = 100
+# Legacy threshold (kept for backward compatibility)
+ML_THRESHOLD          = 60
+ML_LSTM_WEIGHT        = 0.4   # Updated to match ensemble (XGB=60%, LSTM=40%)
+ML_XGBOOST_WEIGHT     = 0.6
+ML_SEQUENCE_LENGTH    = 100
 ML_RETRAINING_INTERVAL = 100
+
+# Tier thresholds: consensus_score decides which setups get sent
+ML_TIER_PREMIUM        = 70   # 70%+ = Unicorn / Premium tier, can auto-execute
+ML_TIER_STANDARD       = 60   # 60-69% = Standard tier, sent to subscribers
+ML_TIER_DISCRETIONARY  = 55   # 55-59% = Discretionary (optional, lower confidence)
+
+# Auto-execution threshold: only execute trades when ML agrees this strongly
+ML_AUTO_EXECUTE_THRESHOLD = 70
 
 # ==================== RISK MANAGEMENT ====================
 
-DEFAULT_RISK_PERCENT = 1.0
-MAX_RISK_PIPS = 50
-MIN_LOT_SIZE = 0.01
-MAX_LOT_SIZE = 10.0
+MAX_RISK_PIPS        = 50
+MIN_LOT_SIZE         = 0.01
+MAX_LOT_SIZE         = 10.0
 MAX_CURRENCY_EXPOSURE = 3
 
 # ==================== SMC STRATEGY PARAMETERS ====================
 
-VOLUME_THRESHOLD_OB = 1.5
+VOLUME_THRESHOLD_OB      = 1.5
 VOLUME_THRESHOLD_IMPULSE = 2.0
-INDUCEMENT_WICK_RATIO = 0.6
-INDUCEMENT_MIN_PIPS = 3
-INDUCEMENT_MAX_PIPS = 10
-ATR_PERIOD = 14
-ATR_MIN_RATIO = 0.7
-ATR_MAX_RATIO = 2.0
+VOLUME_MULTIPLIER_OB      = VOLUME_THRESHOLD_OB       # Alias used by smc_strategy.py
+VOLUME_MULTIPLIER_IMPULSE = VOLUME_THRESHOLD_IMPULSE  # Alias used by smc_strategy.py
+
+# Inducement quality filters (used by smc_strategy.detect_inducement)
+INDUCEMENT_WICK_RATIO          = 0.6    # Legacy alias
+INDUCEMENT_MIN_PIPS            = 3      # Legacy alias
+INDUCEMENT_MAX_PIPS            = 10     # Legacy alias
+INDUCEMENT_WICK_MIN_PIPS       = 3      # Minimum pips the wick sweeps liquidity
+INDUCEMENT_WICK_MAX_PIPS       = 10     # Maximum pips (larger = liquidity grab, not inducement)
+INDUCEMENT_BODY_CLOSE_RATIO    = 0.6    # Candle body must be at least 60% of total range
+
+# ATR filter parameters
+ATR_PERIOD    = 14
+ATR_MIN_RATIO = 0.7    # Setup rejected if ATR is below 70% of average
+ATR_MAX_RATIO = 2.0    # Setup rejected if ATR is above 200% of average (too volatile)
+
+# Confirmation candle requirements (for entry confirmation)
+CONFIRMATION_BODY_RATIO = 0.6   # Body must be at least 60% of candle range
 
 # ==================== NEWS FILTER ====================
 
 NEWS_PROXIMITY_MINUTES = 30
 
+# News blackout window (minutes)
+NEWS_PROXIMITY_MINUTES       = 30
+NEWS_BLACKOUT_BEFORE_MINUTES = 30    # Block trading 30 min before high-impact news
+NEWS_BLACKOUT_AFTER_MINUTES  = 15    # Block trading 15 min after high-impact news
+
+# Session filter switches
+AVOID_ASIAN_SESSION       = True     # Only Unicorn setups allowed during Asian session
+PREFER_LONDON_NY_OVERLAP  = True     # Prioritise 13:00-16:00 UTC overlap
+
+# Correlation exposure limit
+MAX_CORRELATED_POSITIONS  = 2        # Max open trades in the same currency direction
+
 # ==================== ORDER TYPE DETECTION ====================
 
 MARKET_ORDER_THRESHOLD_PIPS = 2
-LIMIT_ORDER_THRESHOLD_PIPS = 20
+LIMIT_ORDER_THRESHOLD_PIPS  = 20
 
 # ==================== DRAWDOWN-BASED RISK ADJUSTMENT ====================
 
@@ -155,21 +205,17 @@ DRAWDOWN_LEVEL_3 = 8.0
 RISK_MULTIPLIER_LEVEL_1 = 1.0
 RISK_MULTIPLIER_LEVEL_2 = 0.7
 RISK_MULTIPLIER_LEVEL_3 = 0.5
-RISK_MULTIPLIER_HALT = 0.0
+RISK_MULTIPLIER_HALT    = 0.0
 
 # ==================== FIBONACCI LEVELS ====================
 
-# Fibonacci Levels for Adaptive TP2
-# TP2 is placed using Fibonacci extensions based on HTF swing range
-# Strong trend: 100% of HTF range, Moderate: 61.8%, Weak: 50%
 FIBONACCI_LEVELS = {
-    'strong_trend':    1.0,      # 100% extension of HTF swing range
-    'moderate_trend':  0.618,    # 61.8% Fibonacci retracement
-    'weak_trend':      0.5       # 50% of range
+    'strong_trend':   1.0,
+    'moderate_trend': 0.618,
+    'weak_trend':     0.5
 }
 
-# TP2 Fibonacci calculation mode
-USE_FIBONACCI_TP2 = True  # If False, uses fixed TP2_MULTIPLE instead
+USE_FIBONACCI_TP2 = True
 
 # ==================== TRADING SESSIONS (UTC hours) ====================
 
@@ -202,46 +248,82 @@ FORBIDDEN_WORDS = [
 ]
 
 WORD_REPLACEMENTS = {
-    'signal':                  'automated setup',
-    'signals':                 'automated setups',
-    'prediction':              'model agreement score',
-    'predictions':             'model agreement scores',
-    'predict':                 'analyze',
-    'forecast':                'historical confluence rating',
-    'forecasts':               'historical confluence ratings',
-    'forecasting':             'analyzing historical patterns',
-    'ai prediction':           'model analysis',
-    'ai predictions':          'model analyses',
-    'guaranteed win':          'historical setup quality',
-    'guaranteed wins':         'historical setup quality',
-    'guarantee':               'historical data suggests',
-    'we recommend you buy':    'setup parameters suggest long position (user has final decision)',
-    'we recommend you sell':   'setup parameters suggest short position (user has final decision)',
-    'you should buy':          'educational parameters indicate long (your decision)',
-    'you should sell':         'educational parameters indicate short (your decision)',
-    'alpha generation':        'historical edge identification',
-    'generate alpha':          'identify historical edge',
-    'profit guarantee':        'historical success rate (past performance does not guarantee future results)',
-    'guaranteed profit':       'historical success rate (past performance does not guarantee future results)',
-    'sure thing':              'high-confluence setup',
-    'sure win':                'high-quality setup',
-    "can't lose":              'favorable risk-reward',
-    'cannot lose':             'favorable risk-reward',
-    'cant lose':               'favorable risk-reward',
-    'risk-free':               'risk-managed',
-    'risk free':               'risk-managed',
-    'no risk':                 'controlled risk',
-    'win rate':                'historical success rate (past performance does not guarantee future results)'
+    'signal':             'setup',
+    'signals':            'setups',
+    'prediction':         'analysis',
+    'predictions':        'analyses',
+    'predict':            'analyse',
+    'forecast':           'analyse',
+    'forecasts':          'analyses',
+    'forecasting':        'analysing',
+    'ai prediction':      'model agreement score',
+    'ai predictions':     'model agreement scores',
+    'guaranteed win':     'historical pattern',
+    'guaranteed wins':    'historical patterns',
+    'guarantee':          'historical performance',
+    'investment advice':  'technical analysis',
+    'financial advice':   'technical analysis',
+    'we recommend you buy':  'the setup indicates a long opportunity',
+    'we recommend you sell': 'the setup indicates a short opportunity',
+    'you should buy':     'the setup indicates a long opportunity',
+    'you should sell':    'the setup indicates a short opportunity',
+    'alpha generation':   'performance optimisation',
+    'generate alpha':     'optimise performance',
+    'profit guarantee':   'historical performance metric',
+    'guaranteed profit':  'historical performance metric',
+    'sure thing':         'high-probability setup',
+    'sure win':           'high-probability setup',
+    "can't lose":         'high-probability setup',
+    'cannot lose':        'high-probability setup',
+    'cant lose':          'high-probability setup',
+    'risk-free':          'managed risk',
+    'risk free':          'managed risk',
+    'no risk':            'managed risk',
+    'win rate':           'historical success rate',
 }
+
+# ==================== LOGGING CONFIGURATION ====================
+
+LOG_LEVEL             = os.getenv('LOG_LEVEL', 'INFO')
+LOG_FORMAT            = '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
+LOG_DATE_FORMAT       = '%Y-%m-%d %H:%M:%S'
+LOG_FILE_MAX_BYTES    = 10 * 1024 * 1024   # 10 MB per main log file
+LOG_FILE_BACKUP_COUNT = 5                   # 5 backups = 50 MB max for main log
+
+# Dedicated trade history log (separate from main application log)
+# Rotating: 5 files x 10 MB = 50 MB maximum total on disk
+TRADE_HISTORY_LOG_FILE     = os.getenv('TRADE_HISTORY_LOG_FILE', 'trade_history.log')
+TRADE_HISTORY_MAX_BYTES    = 10 * 1024 * 1024   # 10 MB per file
+TRADE_HISTORY_BACKUP_COUNT = 4                   # 4 backups + 1 active = 5 files = 50 MB
+
+# ==================== DATABASE CONFIGURATION ====================
+
+DB_POOL_SIZE       = 10
+DB_TIMEOUT_SECONDS = 30
+
+# ==================== SCHEDULER CONFIGURATION ====================
+
+POSITION_MONITOR_INTERVAL_SECONDS = 10    # How often position monitor checks MT5
+POSITION_CHECK_INTERVAL_SECONDS   = 10    # Alias used by position_monitor.py
+MARKET_SCAN_INTERVAL_MINUTES      = 15
+NEWS_UPDATE_INTERVAL_MINUTES      = 15
+ALERT_CHECK_INTERVAL_MINUTES      = 60
+
+# ==================== HTTP REQUEST CONFIGURATION ====================
+
+REQUEST_TIMEOUT_SECONDS = 10
+REQUEST_MAX_RETRIES     = 3
+REQUEST_BACKOFF_FACTOR  = 2
+
+# ==================== ENCRYPTION ====================
+
+ENCRYPTION_ALGORITHM = 'Fernet'
 
 # ==================== LEGAL DISCLAIMER ====================
 
 LEGAL_DISCLAIMER = (
-    "IMPORTANT LEGAL NOTICE - PLEASE READ CAREFULLY\n\n"
-    "This is an educational tool designed to demonstrate algorithmic trading concepts "
-    "using Smart Money Concepts (SMC). By subscribing, you acknowledge and agree:\n\n"
-    "1. FINANCIAL ADVICE\n"
-    "This tool does NOT provide investment advice, recommendations, or financial guidance. "
+    "RISK DISCLOSURE AND TERMS OF USE\n\n"
+    "1. NOT FINANCIAL ADVICE\n"
     "All automated setups are educational demonstrations of technical analysis patterns. "
     "You are solely responsible for all trading decisions.\n\n"
     "2. EDUCATIONAL PURPOSE ONLY\n"
@@ -263,10 +345,10 @@ LEGAL_DISCLAIMER = (
     "- You understand this is an educational tool, not financial advice\n"
     "- You accept full responsibility for all trading decisions\n"
     "- You understand the risks of leveraged trading\n"
-    "- You will not hold Nixie Trades Limited liable for any trading losses\n\n"
+    f"- You will not hold {COMPANY_NAME} liable for any trading losses\n\n"
     f"For support: {SUPPORT_CONTACT}\n\n"
-    f"{FOOTER}")
-
+    f"{FOOTER}"
+)
 
 # ==================== BOT MESSAGES ====================
 
@@ -276,7 +358,7 @@ WELCOME_MESSAGE = (
     "with precision refinements for high-probability forex entries.\n\n"
     "What you get:\n"
     "- Real-time automated setups via Telegram\n"
-    "- Smart Money analysis (Order Blocks, Breaker Blocks, Market Structure, e.t.c)\n"
+    "- Smart Money analysis (Order Blocks, Breaker Blocks, Market Structure)\n"
     "- Machine learning confidence scoring\n"
     "- Automatic execution on MetaTrader 5\n"
     "- Risk management with partial profit-taking\n\n"
@@ -284,17 +366,33 @@ WELCOME_MESSAGE = (
     "Commands:\n"
     "/subscribe - Start receiving automated setups\n"
     "/help - Learn about features and SMC concepts\n"
-    "/latest - View most recent automated setup\n\n"
+    "/latest - View most recent automated setup\n"
+    "/download - Download your trading history as CSV\n\n"
     "Support: {support_contact}\n\n"
     "{footer}"
 )
 
-SUBSCRIPTION_SUCCESS = (
+ALREADY_SUBSCRIBED = (
+    "You already have an active subscription.\n\n"
+    "You are already receiving automated setup alerts.\n\n"
+    "Use /status to see your account details.\n"
+    "Use /settings to adjust your risk percentage.\n\n"
+    f"{FOOTER}"
+)
+
+NO_RECENT_SETUPS = (
+    "No setups have been detected in the last 24 hours.\n\n"
+    "The system scans every 15 minutes. "
+    "A setup will be sent automatically when conditions align.\n\n"
+    f"{FOOTER}"
+)
+
+SUBSCRIBE_SUCCESS = (
     "Subscription activated successfully.\n\n"
     "You will receive automated setup alerts when market conditions align "
     "with Smart Money Concepts criteria.\n\n"
-    "Daily market briefings will arrive at 8:00 AM UTC. \n"
-    "Use /settings to set your timezone and risk. \n \n"
+    "Daily market briefings will arrive at 8:00 AM UTC.\n"
+    "Use /settings to set your timezone and risk.\n\n"
     "Want automatic trade execution?\n"
     "Use /connect_mt5 to link your MT5 broker account.\n\n"
     "For questions: {support_contact}\n\n"
@@ -312,12 +410,13 @@ HELP_MESSAGE = (
     "/status - View subscription and trading statistics\n"
     "/latest - Get most recent automated setup\n"
     "/settings - Customize risk parameters and preferences\n"
+    "/download - Download your trading history and ML results as CSV\n"
     "/unsubscribe - Stop receiving alerts\n\n"
     "SETUP QUALITY LEVELS:\n"
-    "- Unicorn Setup: Breaker Block plus Fair Value Gap overlap\n"
-    "  Historical success rate: 72-78% (past performance does not guarantee future results)\n"
-    "- Standard Setup: Order Block or Breaker Block only\n"
-    "  Historical success rate: 58-62% (past performance does not guarantee future results)\n\n"
+    "- Unicorn Setup: Breaker Block plus Fair Value Gap overlap (70%+ ML score)\n"
+    "  Historical success rate: 72-78% (past performance only)\n"
+    "- Standard Setup: Order Block or Breaker Block only (60-69% ML score)\n"
+    "  Historical success rate: 58-62% (past performance only)\n\n"
     "SMC CONCEPTS EXPLAINED:\n"
     "- Order Block (OB): Last opposite candle before institutional impulse move\n"
     "- Breaker Block (BB): Failed supply/demand zone now acting as support/resistance\n"
@@ -325,85 +424,20 @@ HELP_MESSAGE = (
     "- Break of Structure (BOS): Price breaks swing high/low in trend direction\n"
     "- Market Structure Shift (MSS): Potential trend reversal breakout\n"
     "- Inducement: Liquidity sweep that triggers retail traders before reversal\n\n"
-    "ORDER TYPES:\n"
-    "- Market Order: Entry within 2 pips of current price, executes immediately\n"
-    "- Limit Order: Entry 3-20 pips away, waits for pullback, expires in 1 hour\n"
-    "- Stop Order: Entry greater than 20 pips away, breakout entry, expires in 1 hour\n\n"
     "AUTO-EXECUTION FLOW:\n"
     "1. Setup generated when SMC criteria align\n"
     "2. Order placed on your MT5 account automatically\n"
     "3. Position monitored every 10 seconds\n"
     "4. TP1 hit: 50% closed, SL moved to breakeven\n"
-    "5. TP2 hit: Remaining 50% closed, final results\n\n"
-    "Need help? Contact {support_contact}\n\n"
-    "{footer}"
-)
-
-ALREADY_SUBSCRIBED = (
-    "You are already subscribed to Nixie Trades automated setup alerts.\n\n"
-    "Use /status to view your subscription details and trading statistics.\n\n"
-    "{footer}"
-)
-
-MT5_CONNECTED_ALREADY = (
-    "You are already connected to MetaTrader 5.\n\n"
-    "Broker: {broker_name}\n"
-    "Account: {account_number}\n\n"
-    "Use /disconnect_mt5 if you need to change broker accounts.\n\n"
-    "{footer}"
-)
-
-MT5_CONNECTION_PROMPT = (
-    "CONNECT YOUR METATRADER 5 ACCOUNT\n\n"
-    "Send your credentials in this exact format (one per line):\n\n"
-    "LOGIN: 12345678\n"
-    "PASSWORD: YourPassword123\n"
-    "SERVER: ICMarkets-Demo\n\n"
-    "Your message will be deleted immediately after processing for security.\n"
-    "Credentials are encrypted before storage.\n\n"
-    "To find your server name: Open MT5 -> File -> Login -> Server dropdown.\n\n"
-    "Cancel: Send /cancel\n\n"
-    "{footer}"
-)
-
-MT5_CONNECTION_SUCCESS = (
-    "Account connected successfully.\n\n"
-    "Broker: {broker_name}\n"
-    "Account: {account_number}\n"
-    "Balance: {balance}\n\n"
-    "Automatic execution is now enabled.\n"
-    "You will receive notifications when trades are executed.\n\n"
-    "{footer}"
-)
-
-MT5_DISCONNECTION_CONFIRM = (
-    "Are you sure you want to disconnect MetaTrader 5?\n\n"
-    "This will disable automatic trade execution. You will still receive "
-    "automated setup alerts, but trades will not execute automatically.\n\n"
-    "{footer}"
-)
-
-MT5_DISCONNECTION_SUCCESS = (
-    "MetaTrader 5 disconnected successfully.\n\n"
-    "Automatic trade execution is now disabled. You will continue to receive "
-    "automated setup alerts.\n\n"
-    "Use /connect_mt5 to reconnect anytime.\n\n"
-    "{footer}"
-)
-
-NO_RECENT_SETUPS = (
-    "No automated setups generated in the last 24 hours.\n\n"
-    "Current market conditions have not aligned with Smart Money Concepts criteria. "
-    "This is normal and part of disciplined trading.\n\n"
-    "Quality over quantity.\n\n"
-    "{footer}"
+    "5. TP2 hit: Remaining 50% closed\n\n"
+    f"Need help? Contact {SUPPORT_CONTACT}\n\n"
+    f"{FOOTER}"
 )
 
 UNSUBSCRIBE_CONFIRM = (
     "Are you sure you want to unsubscribe?\n\n"
-    "You will stop receiving automated setup alerts and daily market briefings.\n\n"
-    "Your account data will be retained for 30 days. Use /subscribe to reactivate anytime.\n\n"
-    "{footer}"
+    "You will no longer receive automated setup alerts.\n\n"
+    "Your data remains for 30 days if you wish to reactivate."
 )
 
 UNSUBSCRIBE_SUCCESS = (
@@ -417,57 +451,22 @@ UNSUBSCRIBE_SUCCESS = (
 ERROR_MESSAGES = {
     'not_subscribed': (
         "This feature requires an active subscription.\n\n"
-        "Use /subscribe to get started.\n\n"
-        f"{FOOTER}"
+        f"Use /subscribe to get started.\n\n{FOOTER}"
     ),
     'general_error': (
         "Something went wrong. Please try again in a moment.\n\n"
-        f"If this continues, contact {SUPPORT_CONTACT}\n\n"
-        f"{FOOTER}"
+        f"If this continues, contact {SUPPORT_CONTACT}\n\n{FOOTER}"
     ),
     'mt5_not_connected': (
         "Your trading account is not connected.\n\n"
-        "Use /connect_mt5 to enable automatic execution.\n\n"
-        f"{FOOTER}"
+        f"Use /connect_mt5 to enable automatic execution.\n\n{FOOTER}"
     ),
     'invalid_format': (
         "The format you entered is not recognized.\n\n"
-        "Please follow the instructions and try again.\n\n"
-        f"{FOOTER}"
+        f"Please follow the instructions and try again.\n\n{FOOTER}"
     ),
     'service_unavailable': (
         "The service is temporarily unavailable.\n\n"
-        "Please try again in a few minutes.\n\n"
-        f"{FOOTER}"
+        f"Please try again in a few minutes.\n\n{FOOTER}"
     )
 }
-
-# ==================== LOGGING CONFIGURATION ====================
-
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
-LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
-LOG_FILE_BACKUP_COUNT = 7
-
-# ==================== DATABASE CONFIGURATION ====================
-
-DB_POOL_SIZE = 10
-DB_TIMEOUT_SECONDS = 30
-
-# ==================== SCHEDULER CONFIGURATION ====================
-
-POSITION_MONITOR_INTERVAL_SECONDS = 10
-MARKET_SCAN_INTERVAL_MINUTES = 15
-NEWS_UPDATE_INTERVAL_MINUTES = 15
-ALERT_CHECK_INTERVAL_MINUTES = 60
-
-# ==================== HTTP REQUEST CONFIGURATION ====================
-
-REQUEST_TIMEOUT_SECONDS = 10
-REQUEST_MAX_RETRIES = 3
-REQUEST_BACKOFF_FACTOR = 2
-
-# ==================== ENCRYPTION ====================
-
-ENCRYPTION_ALGORITHM = 'Fernet'

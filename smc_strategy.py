@@ -435,60 +435,59 @@ class SMCStrategy:
         """
         Detect Break of Structure (trend continuation).
         Requires DOUBLE BOS for confirmation.
-        
+
         Args:
             data: OHLCV DataFrame
-            htf_trend: Current HTF trend
-            
+            htf_trend: Current HTF trend direction string
+
         Returns:
             list: BOS events
         """
         bos_events = []
-        
+
         try:
-            swings = self._identify_swings(data.tail(50))
-            
+            tail_data = data.tail(50)
+            swings    = self._identify_swings(tail_data)
+
             if htf_trend == 'BULLISH':
-                # Look for breaks of swing highs
                 for i in range(len(swings) - 1):
                     if swings[i]['direction'] == 'HIGH':
-                        swing_high = swings[i]['price']
-                        
-                        # Check if subsequent price broke above
-                        later_candles = data.iloc[swings[i]['index']:]
-                        
+                        swing_high  = swings[i]['price']
+                        # Convert positional index within tail_data to an actual label
+                        swing_label = tail_data.index[swings[i]['index']]
+                        later_candles = data.loc[swing_label:]
+
                         if later_candles['close'].max() > swing_high:
                             bos_events.append({
-                                'type': 'BOS',
+                                'type':      'BOS',
                                 'direction': 'BULLISH',
-                                'level': swing_high,
-                                'timestamp': later_candles.index[later_candles['close'].idxmax()]
+                                'level':     swing_high,
+                                # idxmax() returns a label directly - do not wrap in .index[]
+                                'timestamp': later_candles['close'].idxmax(),
                             })
-            
+
             else:  # BEARISH
-                # Look for breaks of swing lows
                 for i in range(len(swings) - 1):
                     if swings[i]['direction'] == 'LOW':
-                        swing_low = swings[i]['price']
-                        
-                        later_candles = data.iloc[swings[i]['index']:]
-                        
+                        swing_low   = swings[i]['price']
+                        swing_label = tail_data.index[swings[i]['index']]
+                        later_candles = data.loc[swing_label:]
+
                         if later_candles['close'].min() < swing_low:
                             bos_events.append({
-                                'type': 'BOS',
+                                'type':      'BOS',
                                 'direction': 'BEARISH',
-                                'level': swing_low,
-                                'timestamp': later_candles.index[later_candles['close'].idxmin()]
+                                'level':     swing_low,
+                                'timestamp': later_candles['close'].idxmin(),
                             })
-            
-            # Check for Double BOS
+
             if len(bos_events) >= 2:
-                self.logger.info(f"Double BOS confirmed for {htf_trend} trend")
-            
+                self.logger.info("Double BOS confirmed for %s trend", htf_trend)
+
             return bos_events
-        
+
         except Exception as e:
-            self.logger.error(f"Error detecting BOS: {e}")
+            self.logger.error("Error detecting BOS: %s", e)
             return []
     
     # ==================== PHASE 3: INDUCEMENT & ENTRY ====================
@@ -766,60 +765,52 @@ class SMCStrategy:
         """
         try:
             risk_pips = utils.calculate_pips(symbol, entry, stop_loss)
-            
-            # TP1: 1.5R (Standard)
-            tp1_pips = risk_pips * config.TARGET_RR_TP1
-            tp1 = utils.calculate_price_from_pips(
-                symbol,
-                entry,
-                tp1_pips,
-                'up' if direction == 'BUY' else 'down'
-            )
-            
-            # TP2: Fibonacci 1.618 extension OR 2.5R (whichever is closer)
-            if direction == 'BUY':
-                fib_tp2 = entry + ((entry - stop_loss) * config.FIB_EXTENSION_LEVEL)
+            if risk_pips <= 0:
+                raise ValueError("Risk pips is zero - entry equals stop loss.")
+
+            # TP1: Internal structural target.
+            # Place at the midpoint between entry and the full HTF swing level.
+            # This targets internal liquidity before the full range completes.
+            if direction in ('BULLISH', 'BUY'):
+                tp1 = entry + ((htf_swing - entry) * 0.5)
             else:
-                fib_tp2 = entry - ((stop_loss - entry) * config.FIB_EXTENSION_LEVEL)
-            
-            standard_tp2_pips = risk_pips * config.TARGET_RR_TP2
-            standard_tp2 = utils.calculate_price_from_pips(
-                symbol,
-                entry,
-                standard_tp2_pips,
-                'up' if direction == 'BUY' else 'down'
-            )
-            
-            # Use whichever is more conservative
-            if direction == 'BUY':
-                tp2 = min(fib_tp2, standard_tp2, htf_swing)
-            else:
-                tp2 = max(fib_tp2, standard_tp2, htf_swing)
-            
+                tp1 = entry - ((entry - htf_swing) * 0.5)
+
+            tp1_pips = utils.calculate_pips(symbol, entry, tp1)
+            tp1_rr   = round(tp1_pips / risk_pips, 2) if risk_pips > 0 else 0.0
+
+            if tp1_rr < config.MIN_RR_RATIO:
+                raise ValueError(
+                    "TP1 R:R %.2f is below minimum %.1f. "
+                    "Structure does not offer sufficient reward. Setup rejected." % (
+                        tp1_rr, config.MIN_RR_RATIO)
+                )
+
+            # TP2: Full external structural target - the complete HTF swing level.
+            tp2      = htf_swing
+            tp2_pips = utils.calculate_pips(symbol, entry, tp2)
+            tp2_rr   = round(tp2_pips / risk_pips, 2) if risk_pips > 0 else 0.0
+
+            # If TP2 does not clear the minimum, collapse it to TP1 (single-target trade).
+            if tp2_rr < config.MIN_RR_TP2:
+                tp2      = tp1
+                tp2_pips = tp1_pips
+                tp2_rr   = tp1_rr
+
             return {
-                'tp1': round(tp1, 5),
-                'tp2': round(tp2, 5),
-                'tp1_pips': tp1_pips,
-                'tp2_pips': utils.calculate_pips(symbol, entry, tp2),
-                'tp1_rr': config.TARGET_RR_TP1,
-                'tp2_rr': utils.calculate_pips(symbol, entry, tp2) / risk_pips
+                'tp1':      round(tp1, 5),
+                'tp2':      round(tp2, 5),
+                'tp1_pips': round(tp1_pips, 1),
+                'tp2_pips': round(tp2_pips, 1),
+                'tp1_rr':   tp1_rr,
+                'tp2_rr':   tp2_rr,
             }
         
+        except ValueError:
+            raise
         except Exception as e:
-            self.logger.error(f"Error calculating take profits: {e}")
-            # Fallback
-            risk_pips = abs(entry - stop_loss) / utils.get_pip_value(symbol)
-            tp1 = entry + (risk_pips * 1.5 * utils.get_pip_value(symbol) * (1 if direction == 'BUY' else -1))
-            tp2 = entry + (risk_pips * 2.5 * utils.get_pip_value(symbol) * (1 if direction == 'BUY' else -1))
-            
-            return {
-                'tp1': round(tp1, 5),
-                'tp2': round(tp2, 5),
-                'tp1_pips': risk_pips * 1.5,
-                'tp2_pips': risk_pips * 2.5,
-                'tp1_rr': 1.5,
-                'tp2_rr': 2.5
-            }
+            self.logger.error("Error calculating take profits: %s", e)
+            raise ValueError("TP calculation failed: %s" % e)
     
     # ==================== REFINEMENT FILTERS ====================
     
@@ -854,18 +845,21 @@ class SMCStrategy:
         Returns:
             tuple: (pass_filter, reason)
         """
-        session = utils.get_session(timestamp)
-        
-        if config.AVOID_ASIAN_SESSION and session == 'ASIAN':
+        utc_hour = timestamp.hour if hasattr(timestamp, 'hour') else datetime.utcnow().hour
+        session  = utils.get_session_name(utc_hour)
+
+        if config.AVOID_ASIAN_SESSION and session == 'Asian':
             return False, "Asian session - lower liquidity"
-        
-        if config.PREFER_LONDON_NY_OVERLAP and utils.is_london_ny_overlap(timestamp):
+
+            # London/New York overlap window: 13:00-16:00 UTC
+        is_overlap = 13 <= utc_hour < 16
+        if config.PREFER_LONDON_NY_OVERLAP and is_overlap:
             return True, "London/NY overlap - optimal liquidity"
-        
-        if session in ['LONDON', 'NEW_YORK']:
-            return True, f"{session} session - good liquidity"
-        
-        return False, f"{session} session - avoid"
+
+        if session in ('London', 'New York', 'Overlap', 'London Open'):
+            return True, "%s session - acceptable liquidity" % session
+
+        return False, "%s session - insufficient liquidity" % session
     
     def check_correlation_filter(
         self,
@@ -1028,3 +1022,36 @@ class SMCStrategy:
                     }
         
         return None
+    
+    def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
+        """
+        Calculate Average True Range.
+        Used by the scheduler's filter check and stop loss calculation.
+
+        Args:
+            data: OHLCV DataFrame
+            period: ATR lookback period (default 14)
+
+        Returns:
+            float: ATR value, or 0.0 if insufficient data
+        """
+        try:
+            if len(data) < period + 1:
+                return 0.0
+
+            high  = data['high']
+            low   = data['low']
+            close = data['close'].shift(1)
+
+            tr1 = high - low
+            tr2 = (high - close).abs()
+            tr3 = (low  - close).abs()
+
+            tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean().iloc[-1]
+
+            return float(atr) if not pd.isna(atr) else 0.0
+
+        except Exception as e:
+            self.logger.error("Error calculating ATR: %s", e)
+            return 0.0

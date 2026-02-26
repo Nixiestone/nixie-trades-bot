@@ -188,3 +188,109 @@ DO $$
 BEGIN
     RAISE NOTICE 'All tables created successfully!';
 END $$;
+
+
+
+
+
+
+
+
+-- NIX TRADES - Database Migration v2
+-- Run this in the Supabase SQL Editor.
+-- This version matches the actual column names in create_tables.sql.
+-- Safe to run multiple times (all statements use IF NOT EXISTS or DO blocks).
+
+-- ==================== telegram_users: disclaimer columns ====================
+
+ALTER TABLE telegram_users
+    ADD COLUMN IF NOT EXISTS disclaimer_accepted    BOOLEAN     NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS disclaimer_accepted_at TIMESTAMPTZ;
+
+-- ==================== signals: timeframe and expiry columns ====================
+
+ALTER TABLE signals
+    ADD COLUMN IF NOT EXISTS timeframe    TEXT    NOT NULL DEFAULT 'M15',
+    ADD COLUMN IF NOT EXISTS expiry_hours INTEGER NOT NULL DEFAULT 2;
+
+-- ==================== trades: outcome and performance columns ====================
+-- The trades table uses mt5_ticket (not ticket) per create_tables.sql.
+
+ALTER TABLE trades
+    ADD COLUMN IF NOT EXISTS fill_price   NUMERIC(18, 5),
+    ADD COLUMN IF NOT EXISTS outcome      TEXT
+                                          CHECK (outcome IN ('WIN', 'LOSS', 'BREAKEVEN')),
+    ADD COLUMN IF NOT EXISTS profit_pips  NUMERIC(10, 2);
+
+-- close_price, rr_achieved, and status already exist in create_tables.sql.
+
+-- ==================== queued_messages ====================
+-- The original create_tables.sql creates message_queue.
+-- This block creates a queued_messages view over it so database.py works,
+-- OR creates the table from scratch if message_queue does not exist.
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'message_queue'
+    ) THEN
+        DROP VIEW IF EXISTS queued_messages;
+        EXECUTE $q$
+            CREATE VIEW queued_messages AS
+            SELECT
+                id,
+                telegram_id,
+                message_text,
+                message_type,
+                (status = 'SENT')  AS delivered,
+                created_at,
+                sent_at            AS delivered_at
+            FROM message_queue
+        $q$;
+        RAISE NOTICE 'queued_messages view created over message_queue.';
+    ELSE
+        CREATE TABLE IF NOT EXISTS queued_messages (
+            id           BIGSERIAL   PRIMARY KEY,
+            telegram_id  BIGINT      NOT NULL
+                                     REFERENCES telegram_users(telegram_id)
+                                     ON DELETE CASCADE,
+            message_text TEXT        NOT NULL,
+            message_type TEXT        NOT NULL DEFAULT 'GENERAL',
+            delivered    BOOLEAN     NOT NULL DEFAULT FALSE,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            delivered_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_queued_messages_telegram_id
+            ON queued_messages (telegram_id)
+            WHERE delivered = FALSE;
+        RAISE NOTICE 'queued_messages table created.';
+    END IF;
+END
+$$;
+
+-- ==================== Performance indexes ====================
+
+CREATE INDEX IF NOT EXISTS idx_signals_symbol_direction_created
+    ON signals (symbol, direction, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_trades_telegram_status
+    ON trades (telegram_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_trades_mt5_ticket_idx
+    ON trades (mt5_ticket);
+
+
+# --------------------------------------------------------------------------
+# SQL: Add this table to your Supabase project (SQL Editor > New Query)
+# --------------------------------------------------------------------------
+   CREATE TABLE IF NOT EXISTS ml_training_data (
+       id            BIGSERIAL PRIMARY KEY,
+       mt5_ticket    BIGINT,
+       features_json TEXT NOT NULL,
+       outcome       NUMERIC(3,1) NOT NULL,  -- 1.0 = WIN, 0.0 = LOSS
+       created_at    TIMESTAMPTZ DEFAULT NOW()
+   );
+
+   CREATE INDEX IF NOT EXISTS idx_ml_training_created
+       ON ml_training_data (created_at DESC);

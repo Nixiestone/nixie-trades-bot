@@ -50,3 +50,6 @@ python-telegram-bot==20.7
 # DO NOT install these on your Linux bot server
 # Only install on Windows VPS where mt5_worker.py runs:
 #   pip install MetaTrader5 flask flask-limiter pywin32
+
+aiohttp
+waitress

@@ -9,7 +9,7 @@ import logging
 import time
 import requests
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 import config
 
@@ -152,19 +152,21 @@ class NewsFetcher:
             # Fetch new data
             events = []
             
-            # Try NewsAPI.org first (if API key provided)
-            if self.api_key and self.api_key != '':
+            # Priority 1: Forex Factory - most accurate economic calendar
+            events = self._fetch_from_forex_factory(hours_ahead)
+
+            # Priority 2: Investing.com - fallback when FF is blocked (403)
+            if not events:
+                events = self._fetch_from_investing_com(hours_ahead)
+
+            # Priority 3: NewsAPI - last resort, general financial news only
+            if not events and self.api_key:
                 self.rate_limiter.wait_if_needed()
                 events = self._fetch_from_newsapi(hours_ahead)
-            
-            # Fallback to Forex Factory if NewsAPI failed or no API key
-            if not events:
-                events = self._fetch_from_forex_factory(hours_ahead)
-            
-            # Final fallback to static calendar if Forex Factory also failed
+
+            # Priority 4: Static calendar - always available, fixed recurring events
             if not events:
                 events = self._fetch_from_static_calendar(hours_ahead)
-            
             # Filter by impact
             if impact_filter != 'ALL':
                 events = [e for e in events if e.impact == impact_filter]
@@ -306,7 +308,7 @@ class NewsFetcher:
             
             events = []
             current_date = None
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             future_time = now + timedelta(hours=hours_ahead)
             
             # Parse calendar rows
@@ -435,6 +437,99 @@ class NewsFetcher:
             self.logger.error(f"Error scraping Forex Factory: {e}")
             return []
     
+    def _fetch_from_investing_com(self, hours_ahead: int) -> list:
+        """
+        Fetch economic calendar from Investing.com.
+        Used as fallback when Forex Factory returns 403.
+        """
+        try:
+            url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+            headers = {
+                'User-Agent':       'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer':          'https://www.investing.com/economic-calendar/',
+            }
+            payload = {
+                'country[]':    ['5', '4', '17', '39', '7', '14', '10'],
+                'importance[]': ['3'],
+                'timeZone':     '55',
+                'timeFilter':   'timeRemain',
+                'currentTab':   'custom',
+                'submitFilters': '1',
+                'limit_from':   '0',
+            }
+            import time as _time
+            _time.sleep(1)
+            resp = requests.post(url, headers=headers, data=payload, timeout=15)
+            if resp.status_code != 200:
+                self.logger.error("Investing.com returned status %d", resp.status_code)
+                return []
+
+            data = resp.json()
+            html_content = data.get('data', '')
+            if not html_content:
+                return []
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
+            rows = soup.find_all('tr', class_='js-event-item')
+
+            events = []
+            now    = datetime.now(timezone.utc)
+            future = now + timedelta(hours=hours_ahead)
+
+            for row in rows:
+                try:
+                    time_cell     = row.find('td', class_='time')
+                    currency_cell = row.find('td', class_='flagCur')
+                    event_cell    = row.find('td', class_='event')
+                    bull_icons    = row.find_all('i', class_='grayFullBullishIcon')
+
+                    if not time_cell or not currency_cell or not event_cell:
+                        continue
+                    if len(bull_icons) < 3:
+                        continue
+
+                    time_str = time_cell.get_text(strip=True)
+                    currency = currency_cell.get_text(strip=True).replace('\xa0', '').strip()[-3:]
+                    title    = event_cell.get_text(strip=True)
+
+                    if not time_str or not currency or len(currency) != 3:
+                        continue
+
+                    try:
+                        evt_time = datetime.strptime(time_str, '%H:%M').replace(
+                            year=now.year, month=now.month, day=now.day,
+                            tzinfo=timezone.utc
+                        )
+                        if evt_time < now:
+                            evt_time = evt_time + timedelta(days=1)
+                    except Exception:
+                        continue
+
+                    if now <= evt_time <= future:
+                        events.append(NewsEvent(
+                            title=title,
+                            currency=currency,
+                            impact='HIGH',
+                            timestamp=evt_time,
+                            source='Investing.com',
+                        ))
+                except Exception as row_err:
+                    self.logger.debug("Error parsing Investing.com row: %s", row_err)
+                    continue
+
+            self.logger.info("Fetched %d events from Investing.com", len(events))
+            return events
+
+        except ImportError:
+            self.logger.warning(
+                "beautifulsoup4 not installed. Run: pip install beautifulsoup4")
+            return []
+        except Exception as e:
+            self.logger.error("Investing.com fetch error: %s", e)
+            return []
+    
     def _fetch_from_static_calendar(self, hours_ahead: int) -> List[NewsEvent]:
         """
         Fetch news from static economic calendar.
@@ -467,7 +562,7 @@ class NewsFetcher:
                 {'title': 'UK GDP', 'currency': 'GBP', 'hour': 7, 'minute': 0, 'day_of_month': 10},
             ]
             
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             future_time = now + timedelta(hours=hours_ahead)
             events = []
             
@@ -593,7 +688,7 @@ class NewsFetcher:
             # Get upcoming news
             events = self.get_red_folder_events(hours_ahead=2)
             
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             
             for event in events:
                 # Check if event affects this symbol
@@ -601,7 +696,10 @@ class NewsFetcher:
                     continue
                 
                 # Calculate time until event
-                time_until = (event.timestamp - now).total_seconds() / 60  # minutes
+                event_ts = event.timestamp
+                if event_ts.tzinfo is None:
+                    event_ts = event_ts.replace(tzinfo=timezone.utc)
+                time_until = (event_ts - now).total_seconds() / 60
                 
                 # Check if within blackout window
                 if -config.NEWS_BLACKOUT_AFTER_MINUTES <= time_until <= config.NEWS_BLACKOUT_BEFORE_MINUTES:
