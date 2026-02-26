@@ -263,7 +263,6 @@ class NixTradesBot:
             fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
             per_user=True,
             per_chat=True,
-            per_message=True,
         )
         app.add_handler(subscribe_conv)
 
@@ -288,6 +287,9 @@ class NixTradesBot:
         app.add_handler(mt5_conv)
 
         # ---- Settings conversation ----
+        # entry_points has TWO triggers:
+        #   1. /settings command -> shows keyboard
+        #   2. "Set Timezone" button press -> opens TZ text input state
         settings_conv = ConversationHandler(
             entry_points=[
                 CommandHandler('settings', self.cmd_settings),
@@ -325,7 +327,7 @@ class NixTradesBot:
             self.callback_mt5_reconnect_cancel, pattern='^mt5_reconnect_cancel$'
         ))
         app.add_handler(CallbackQueryHandler(
-            self.callback_settings_risk, pattern='^settings_risk$'
+            self.callback_settings_risk, pattern=r'^risk_\d+\.?\d*$'
         ))
         app.add_handler(CallbackQueryHandler(
             self.callback_settings_done, pattern='^settings_done$'
@@ -337,9 +339,7 @@ class NixTradesBot:
         app.add_handler(CallbackQueryHandler(
             self.callback_settings_risk, pattern=r'^risk_\d+\.?\d*$'
         ))
-        app.add_handler(CallbackQueryHandler(
-            self.callback_settings_tz_prompt, pattern='^settings_tz_prompt$'
-        ))
+   
 
         self.logger.info("All handlers registered.")
 
@@ -988,8 +988,8 @@ class NixTradesBot:
     ) -> int:
         """
         Handle /settings.
-        Shows risk percentage options as inline keyboard buttons.
-        Also provides timezone text input option.
+        Shows risk percentage as inline keyboard buttons.
+        Timezone is set by pressing the timezone button (separate conversation entry).
         """
         if not self._check_rate_limit(update):
             await self._reply(update, "You are sending commands too quickly. Please wait a moment.")
@@ -1006,29 +1006,29 @@ class NixTradesBot:
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "0.5% %s" % ('(current)' if current == 0.5 else ''),
+                        f"0.5%{'  (current)' if current == 0.5 else ''}",
                         callback_data='risk_0.5'),
                     InlineKeyboardButton(
-                        "1%   %s" % ('(current)' if current == 1.0 else ''),
+                        f"1%{'  (current)' if current == 1.0 else ''}",
                         callback_data='risk_1.0'),
                     InlineKeyboardButton(
-                        "1.5% %s" % ('(current)' if current == 1.5 else ''),
+                        f"1.5%{'  (current)' if current == 1.5 else ''}",
                         callback_data='risk_1.5'),
                 ],
                 [
                     InlineKeyboardButton(
-                        "2%   %s" % ('(current)' if current == 2.0 else ''),
+                        f"2%{'  (current)' if current == 2.0 else ''}",
                         callback_data='risk_2.0'),
                     InlineKeyboardButton(
-                        "3%   %s" % ('(current)' if current == 3.0 else ''),
+                        f"3%{'  (current)' if current == 3.0 else ''}",
                         callback_data='risk_3.0'),
                     InlineKeyboardButton(
-                        "5%   %s" % ('(current)' if current == 5.0 else ''),
+                        f"5%{'  (current)' if current == 5.0 else ''}",
                         callback_data='risk_5.0'),
                 ],
                 [
                     InlineKeyboardButton(
-                        "Set Timezone (type after pressing)",
+                        "Set Timezone",
                         callback_data='settings_tz_prompt'),
                 ],
                 [
@@ -1039,16 +1039,16 @@ class NixTradesBot:
             await self._reply(
                 update,
                 utils.validate_user_message(
-                    "SETTINGS\n\n"
-                    "Current risk per trade: %s%%\n"
-                    "Current timezone:       %s\n\n"
-                    "Select a new risk percentage below.\n"
-                    "Risk is the percentage of your account balance risked per trade.\n\n"
-                    "Recommended levels:\n"
-                    "  Beginner:     0.5%%\n"
-                    "  Intermediate: 1%% - 2%%\n"
-                    "  Advanced:     2%% - 3%%\n\n"
-                    "%s" % (current, tz, config.FOOTER)
+                    f"SETTINGS\n\n"
+                    f"Current risk per trade: {current}%\n"
+                    f"Current timezone:       {tz}\n\n"
+                    f"Tap a risk percentage to change it.\n"
+                    f"Tap 'Set Timezone' to change your timezone.\n\n"
+                    f"Recommended risk levels:\n"
+                    f"  Beginner:     0.5%\n"
+                    f"  Intermediate: 1% - 2%\n"
+                    f"  Advanced:     2% - 3%\n\n"
+                    f"{config.FOOTER}"
                 ),
                 reply_markup=keyboard,
             )
@@ -1062,26 +1062,27 @@ class NixTradesBot:
     async def callback_settings_risk(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle risk percentage selection from inline keyboard."""
+        """Handle risk percentage button press from settings keyboard."""
         query = update.callback_query
         await query.answer()
         telegram_id = query.from_user.id
         try:
+            # callback_data is like "risk_1.5" - split on underscore, take last part
             risk = float(query.data.split('_')[1])
             if not (config.MIN_RISK_PERCENT <= risk <= config.MAX_RISK_PERCENT):
                 await query.edit_message_text(
                     utils.validate_user_message(
-                        "Invalid risk percentage. Please use /settings again.\n\n%s" % config.FOOTER
+                        f"Invalid risk value. Please use /settings again.\n\n{config.FOOTER}"
                     )
                 )
                 return
             db.update_risk_percent(telegram_id, risk)
             await query.edit_message_text(
                 utils.validate_user_message(
-                    "Risk per trade set to %s%%.\n\n"
-                    "This will apply to all future automated trades.\n\n"
-                    "Use /settings to change it again at any time.\n\n"
-                    "%s" % (risk, config.FOOTER)
+                    f"Risk per trade set to {risk}%.\n\n"
+                    f"This applies to all future automated trades.\n\n"
+                    f"Use /settings to change it again.\n\n"
+                    f"{config.FOOTER}"
                 )
             )
         except Exception as e:
@@ -1091,20 +1092,24 @@ class NixTradesBot:
     async def callback_settings_tz_prompt(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
-        """Prompt user to type their timezone."""
+        """
+        Handle 'Set Timezone' button press.
+        This is a ConversationHandler entry point - it opens the TZ input state.
+        """
         query = update.callback_query
         await query.answer()
         await query.edit_message_text(
             utils.validate_user_message(
-                "Please type your timezone name.\n\n"
+                "CHANGE TIMEZONE\n\n"
+                "Please type your timezone name and send it.\n\n"
                 "Examples:\n"
                 "  Africa/Lagos\n"
                 "  Europe/London\n"
                 "  America/New_York\n"
                 "  Asia/Tokyo\n\n"
-                "A full list is at: en.wikipedia.org/wiki/List_of_tz_database_time_zones\n\n"
+                "Full list: en.wikipedia.org/wiki/List_of_tz_database_time_zones\n\n"
                 "Send /cancel to go back without changing.\n\n"
-                "%s" % config.FOOTER
+                f"{config.FOOTER}"
             )
         )
         return SETTINGS_WAITING_TZ
