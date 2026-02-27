@@ -1,23 +1,3 @@
-"""
-NIX TRADES - Main Telegram Bot Application
-Role: Python Developer + Security Engineer + Product Manager + QA Engineer
-
-All bugs fixed in this version:
-  - Graceful shutdown: uses Application.stop() correctly via post_stop hook
-  - Scheduler and position monitor started inside post_init (runs after event loop starts)
-  - Global error handler registered (catches all unhandled errors including network drops)
-  - PTBUserWarning fixed: per_message=True added to ConversationHandlers with CallbackQuery
-  - MT5 credential deletion: deletes in group chats, sends self-delete instruction in private
-  - Rate limiting: 20 commands per 60 seconds per user via RateLimiter
-  - Sample setup alert and news notification in /latest and /help
-  - All f-string logging replaced with % formatting
-  - Scheduler import added and wired up correctly
-  - position_monitor.py _send_notification now actually sends (wired via bot reference)
-  - No emojis, no placeholders
-
-NO EMOJIS - Enterprise code only
-"""
-
 import asyncio
 import logging
 import sys

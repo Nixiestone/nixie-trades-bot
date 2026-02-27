@@ -1,23 +1,3 @@
-"""
-NIX TRADES - Database Operations
-Role: Data Engineer + Security Engineer + Python Developer
-
-Changes in this version:
-  - _db_retry decorator: 4 attempts with exponential backoff on all Supabase calls
-  - disclaimer_accepted and disclaimer_accepted_at fields added to user record
-  - recent_signal_exists() for signal deduplication per timeframe expiry
-  - get_signal_count() for sequential signal numbering
-  - get_daily_loss_percent() for daily loss limit enforcement per user
-  - queue_message() and get_pending_messages() for offline user message delivery
-  - mark_messages_delivered() clears delivered queued messages
-  - save_signal() updated to include timeframe and expiry_hours
-  - get_subscribed_users() now includes disclaimer_accepted field
-  - Passwords are never logged (scrubbed before any log call)
-
-NO EMOJIS - Enterprise code only
-NO PLACEHOLDERS - All functions are fully implemented
-"""
-
 import json
 import logging
 import os

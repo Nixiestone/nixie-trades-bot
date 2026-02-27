@@ -1,8 +1,3 @@
--- NIXIE TRADES - Complete Database Schema
--- Run this ENTIRE file in Supabase SQL Editor
--- It will drop old tables and create fresh ones
--- Role: Data Engineer + Infrastructure Engineer
-
 -- ==================== DROP OLD TABLES ====================
 
 DROP TABLE IF EXISTS model_metrics CASCADE;

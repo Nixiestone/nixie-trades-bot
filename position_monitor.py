@@ -1,25 +1,3 @@
-"""
-NIX TRADES - Position Monitor
-Role: Quantitative Developer + Risk Engineer
-
-Fixes in this version:
-  - _send_notification() actually sends Telegram messages instead of being empty.
-    Position monitor runs in a background thread. Telegram requires the async event
-    loop. This is solved by capturing the event loop at start() time and using
-    asyncio.run_coroutine_threadsafe() to schedule sends from the thread.
-  - _log_trade_completion() now calls db.update_trade() so trade results are saved
-    to the database and fed back to the ML model for auto-retraining.
-  - All f-string logger calls replaced with %s formatting (production standard).
-  - position.opened_at is set to datetime.now() when a position is added, not None.
-  - position.profit field defaults to 0.0 to avoid AttributeError.
-  - Broadcast rate limit: 40ms sleep between each Telegram send.
-  - start() no longer accepts event_loop argument - it captures the loop itself
-    using asyncio.get_event_loop() from inside _post_init.
-
-NO EMOJIS - Enterprise code only
-NO PLACEHOLDERS - Complete implementation
-"""
-
 import asyncio
 import logging
 import threading

@@ -1,33 +1,3 @@
-"""
-NIX TRADES - Machine Learning Ensemble  (Part 1 of 2)
-Role: Senior Quantitative Developer + Data Scientist
-
-KEY CHANGE from previous version:
-  Training now uses the REAL SMCStrategy class for POI detection.
-  Previously _generate_training_samples() had its own hand-rolled POI
-  finder. That meant training data came from different logic than live
-  signals, so models learned patterns the live system would never see.
-
-  Now the training pipeline mirrors the live pipeline exactly:
-    Step 1: smc.determine_htf_trend(d1_window)   - same as scheduler
-    Step 2: smc.detect_break_of_structure(h1_window, direction)
-            smc.detect_market_structure_shift(h1_window, direction)
-            smc.detect_breaker_blocks(h1_window, ...)  - same as scheduler
-            smc.detect_order_blocks(h1_window, direction) - same as scheduler
-    Step 3: smc.calculate_entry_price(poi, ...) + calculate_stop_loss()
-            to get real entry and SL for WIN/LOSS labeling
-    Step 4: extract_features(window, poi, htf_trend, setup_type) - same fn
-            called by both training AND live prediction
-
-  The result: models learn from the exact same setups that the live bot
-  would send, making predictions genuinely predictive.
-
-Disk persistence, auto-retrain, ensemble scoring: all unchanged.
-
-NO EMOJIS - Enterprise code only
-NO PLACEHOLDERS - All logic complete
-"""
-
 import logging
 import os
 import pickle

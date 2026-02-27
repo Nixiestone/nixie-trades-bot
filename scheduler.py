@@ -1,23 +1,3 @@
-"""
-NIX TRADES - Scheduler
-Role: Quantitative Developer + DevOps Engineer
-
-Fixes in this version:
-  - All f-string logger calls replaced with %s formatting
-  - _broadcast_setup uses utils.format_setup_message (consistent format)
-  - asyncio.sleep(0.04) between each Telegram send (Telegram limit: 30/sec)
-  - Telegram Forbidden/NetworkError caught per-user so one blocked user
-    does not stop the broadcast to everyone else
-  - _auto_execute_trade fully wired: lot size, place_order, position monitor
-  - _format_setup_alert removed: all formatting via utils.format_setup_message
-  - stop() uses scheduler.shutdown(wait=False) to avoid blocking on join
-  - ml_features stored in setup_data so position_monitor can call
-    record_trade_outcome for auto-retraining
-
-NO EMOJIS - Enterprise code only
-NO PLACEHOLDERS - All logic complete
-"""
-
 import asyncio
 import logging
 from datetime import datetime

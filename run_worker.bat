@@ -1,6 +1,3 @@
-# Nixie Trades - MT5 Worker Auto-Restart Script
-# Right-click this file > Run with PowerShell
-
 $projectDir = "C:\Users\NIXIE\Desktop\projects\nixie-trades-bot"
 $python = "$projectDir\venv\Scripts\python.exe"
 $worker = "$projectDir\mt5_worker.py"

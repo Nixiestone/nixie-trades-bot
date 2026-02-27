@@ -1,29 +1,3 @@
-"""
-NIX TRADES - MT5 Worker Service
-Role: Lead Architect + Quant Software Engineer + Infrastructure Engineer +
-      DevOps Engineer + QA Engineer + Security Engineer + Data Engineer
-
-DEPLOYMENT:
-  Windows VPS with MetaTrader 5 terminal installed.
-  1. pip install MetaTrader5 flask waitress python-dotenv
-  2. Set environment variable MT5_WORKER_API_KEY to a long random string.
-  3. Set MT5_TERMINAL_PATH to the full path of terminal64.exe.
-  4. Run: waitress-serve --host=0.0.0.0 --port=8000 --threads=32 mt5_worker:app
-  5. For parallel execution (5000+ users): run 4 copies on ports 8001-8004
-     behind nginx. The MetaTrader5 library is process-bound (one account per
-     process at a time). Multiple processes give true parallelism.
-
-ARCHITECTURE NOTE - SINGLE LOCK PER PROCESS:
-  The MetaTrader5 Python library can only hold one active connection at a time
-  within a single Python process. The _mt5_lock is therefore process-scoped.
-  When running with waitress (32 threads), all threads share this one lock.
-  This is correct and intentional. For higher throughput, run multiple
-  independent processes on different ports behind nginx.
-
-NO EMOJIS - Enterprise code only
-NO PLACEHOLDERS - All logic is complete and production-ready
-"""
-
 import os
 import logging
 import threading

@@ -1,24 +1,3 @@
-"""
-NIX TRADES - One-Time ML Model Training Script
-Role: Senior Quantitative Developer
-
-Run this script ONCE on your Windows VPS (the same machine running mt5_worker.py)
-before starting the main bot. It connects to MT5, downloads 6 years of historical
-data for all monitored symbols, trains both ML models, and saves them to disk.
-
-After this script completes successfully, the bot will load the trained models
-automatically on every startup without needing to retrain.
-
-Usage:
-  1. Make sure mt5_worker.py is running (in a separate terminal)
-  2. Open a new terminal in your project folder
-  3. Run: python train_models.py
-  4. Wait for it to finish (usually 10-30 minutes depending on data volume)
-  5. Start the bot normally: python bot.py
-
-The trained models are saved to the 'models/' folder in your project directory.
-"""
-
 import os
 import sys
 import logging

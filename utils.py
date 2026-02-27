@@ -1,18 +1,3 @@
-"""
-NIX TRADES - Utility Functions
-Role: Python Developer + Product Manager
-
-Changes in this version:
-  - Added get_session() - returns current trading session name (called by scheduler)
-  - Added calculate_price_from_pips() - used by smc_strategy.calculate_take_profits
-  - Added determine_order_type() - used by scheduler broadcast formatting
-  - Added calculate_time_until() - used by news_fetcher integration
-  - Added format_risk_reward() - used by scheduler setup formatting
-  - All existing functions preserved and unchanged
-
-NO EMOJIS - Professional code only
-"""
-
 import re
 import time
 import logging

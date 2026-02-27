@@ -1,21 +1,3 @@
-"""
-NIX TRADES - MT5 Connector
-Role: Lead Architect + Quant Software Engineer + Security Engineer
-
-HTTP client that communicates with the MT5 Worker Service running on Windows.
-This module runs on the Linux bot server. It does NOT import MetaTrader5 directly.
-
-Changes in this version:
-  - place_order now accepts sl_pips and risk_percent; lot_size=0.0 tells
-    the worker to calculate lot size server-side using the correct formula
-  - All HTTP calls use exponential backoff retry (4 attempts: 0s, 1s, 3s, 9s)
-  - Credential scrubbing: passwords are never logged
-  - get_current_price returns (bid, ask) tuple, called synchronously
-    so the async scheduler can use run_in_executor
-
-NO EMOJIS - Enterprise code only
-"""
-
 import logging
 import time
 from typing import Optional, Dict, Tuple, Any

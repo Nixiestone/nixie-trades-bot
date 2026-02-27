@@ -1,10 +1,3 @@
-"""
-NIX TRADES - SMC Strategy Engine
-Smart Money Concepts implementation with 8 precision refinements
-Production-ready, zero errors, zero placeholders
-NO EMOJIS - Professional code only
-"""
-
 import logging
 import numpy as np
 import pandas as pd

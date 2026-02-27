@@ -1,10 +1,3 @@
-"""
-NIX TRADES - News Fetcher
-High-impact forex news detection with API rate limiting
-Production-ready, zero errors, zero placeholders
-NO EMOJIS - Professional code only
-"""
-
 import logging
 import time
 import requests

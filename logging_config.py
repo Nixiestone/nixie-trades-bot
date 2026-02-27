@@ -1,22 +1,3 @@
-"""
-NIX TRADES - Logging Configuration
-Role: DevOps Engineer + Security Engineer
-
-Changes in this version:
-  - Added get_trade_logger() returning a 50 MB rotating trade history logger
-    (5 files x 10 MB each) that is completely separate from the main log.
-  - Trade logger uses propagate=False so trade records never pollute main log.
-  - setup_logging() now initialises the trade logger as well.
-
-Existing behaviour preserved:
-  - Credential scrubbing filter on all handlers
-  - Colour-coded console (graceful fallback if colorlog not installed)
-  - Third-party library noise suppressed
-  - 50 MB main log (5 x 10 MB rotating)
-
-NO EMOJIS - Enterprise code only
-"""
-
 import logging
 import logging.handlers
 import os

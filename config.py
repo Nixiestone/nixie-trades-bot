@@ -1,24 +1,3 @@
-"""
-NIX TRADES - Configuration Module
-Role: Lead Architect + Python Developer
-
-Changes in this version:
-  - Added ML_TIER_PREMIUM / ML_TIER_STANDARD / ML_TIER_DISCRETIONARY (thresholds)
-  - Added ML_AUTO_EXECUTE_THRESHOLD
-  - Added POSITION_CHECK_INTERVAL_SECONDS (was POSITION_MONITOR_INTERVAL_SECONDS)
-  - Added MAX_DAILY_LOSS_PERCENT
-  - Added MAGIC_NUMBER
-  - Added TARGET_RR_TP1 / TARGET_RR_TP2 used by smc_strategy.calculate_take_profits
-  - Added FIB_EXTENSION_LEVEL used by smc_strategy.calculate_take_profits
-  - Added CONFIRMATION_BODY_RATIO used by smc_strategy._check_confirmation_candle
-  - Added INDUCEMENT_WICK_MIN_PIPS / INDUCEMENT_WICK_MAX_PIPS / INDUCEMENT_BODY_CLOSE_RATIO
-  - Added ATR_MAX_RATIO (was truncated in previous version)
-  - Added TRADE_HISTORY_LOG_FILE / TRADE_HISTORY_MAX_BYTES / TRADE_HISTORY_BACKUP_COUNT
-    for the dedicated 50 MB rotating trade history log
-
-NO EMOJIS - Enterprise code only
-"""
-
 import os
 
 # ==================== APPLICATION INFO ====================
