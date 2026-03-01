@@ -209,16 +209,45 @@ class PositionMonitor:
             return
 
         try:
-            mt5_positions = self.mt5.get_open_positions()
+            # Fetch open positions per user to avoid relying on a non-existent
+            # connector method that has no telegram_id context.
+            user_ids          = {p.telegram_id for p in self.monitored_positions.values()}
+            mt5_positions     = []
+            unavailable_users = set()
+
+            for tid in user_ids:
+                ok, user_positions = self.mt5.get_positions(tid)
+                if not ok:
+                    unavailable_users.add(tid)
+                    self.logger.warning(
+                        "Could not fetch open positions for user %d. "
+                        "Skipping closure checks for this user in this cycle.",
+                        tid,
+                    )
+                    continue
+                for pos in (user_positions or []):
+                    pos_copy = dict(pos)
+                    pos_copy['telegram_id'] = tid
+                    mt5_positions.append(pos_copy)
         except Exception as e:
             self.logger.error("Could not get open positions from MT5: %s", e)
             return
 
-        mt5_map          = {int(p.get('ticket', 0)): p for p in (mt5_positions or [])}
+        mt5_map = {}
+        for p in (mt5_positions or []):
+            try:
+                t = int(p.get('ticket', 0))
+            except (TypeError, ValueError):
+                continue
+            if t > 0:
+                mt5_map[t] = p
         tickets_to_remove = []
 
         for ticket, position in list(self.monitored_positions.items()):
             try:
+                if position.telegram_id in unavailable_users:
+                    continue
+
                 if ticket not in mt5_map:
                     # No longer in MT5 - stop loss hit or manually closed
                     self._handle_position_closed(position)
@@ -422,8 +451,10 @@ class PositionMonitor:
         """Close remaining 50% and record WIN."""
         self.logger.info("TP2 hit for ticket %d (%s).", position.ticket, position.symbol)
         try:
-            success, message = self.mt5.close_position(
-                position.ticket, percentage=100.0, comment='TP2 Full Close'
+            success, message = self.mt5.close_partial_position(
+                telegram_id=position.telegram_id,
+                ticket=position.ticket,
+                close_pct=1.0,
             )
             if success:
                 position.status = 'TP2_HIT'
@@ -465,10 +496,10 @@ class PositionMonitor:
                 position.entry_price + buffer if position.direction == 'BUY'
                 else position.entry_price - buffer
             )
-            success, message = self.mt5.modify_position(
-                position.ticket,
-                stop_loss=be_price,
-                take_profit=position.take_profit_2,
+            success, message = self.mt5.modify_stop_loss(
+                telegram_id=position.telegram_id,
+                ticket=position.ticket,
+                new_sl=be_price,
             )
             if success:
                 position.stop_loss    = be_price
@@ -586,16 +617,13 @@ class PositionMonitor:
             # Update the trade record that was created when the order was placed
             db.update_trade(
                 ticket=position.ticket,
-                updates={
-                    'status':       'CLOSED',
-                    'close_price':  position.current_price,
-                    'outcome':      outcome,
-                    'profit_pips':  round(pips, 2),
-                    'realized_pnl': round(profit, 2),
-                    'rr_achieved':  round(rr, 2),
-                    'closed_at':    datetime.now().isoformat(),
-                    'updated_at':   datetime.now().isoformat(),
-                },
+                status='CLOSED',
+                close_price=position.current_price,
+                outcome=outcome,
+                profit_pips=round(pips, 2),
+                realized_pnl=round(profit, 2),
+                rr_achieved=round(rr, 2),
+                closed_at=datetime.now().isoformat(),
             )
             self.logger.info(
                 "Trade %d logged: outcome=%s pips=%.1f profit=%.2f rr=%.2f.",

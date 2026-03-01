@@ -194,6 +194,7 @@ class NixTradesBot:
             smc_strategy=self.smc,
             ml_ensemble=self.ml,
             news_fetcher=self.news,
+            position_monitor=self.position_monitor,
         )
         self.scheduler_obj.start()
 
@@ -243,6 +244,7 @@ class NixTradesBot:
             fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
             per_user=True,
             per_chat=True,
+            per_message=False,
         )
         app.add_handler(subscribe_conv)
 
@@ -284,6 +286,7 @@ class NixTradesBot:
             fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
             per_user=True,
             per_chat=True,
+            per_message=False,
         )
         app.add_handler(settings_conv)
 
@@ -316,9 +319,10 @@ class NixTradesBot:
             self.callback_partial_close,
             pattern=r'^partial_close_(yes|no)_\d+$'
         ))
-        app.add_handler(CallbackQueryHandler(
-            self.callback_settings_risk, pattern=r'^risk_\d+\.?\d*$'
-        ))
+        app.add_handler(CommandHandler('test_briefing', self.cmd_test_briefing))
+        app.add_handler(CommandHandler('test_news',     self.cmd_test_news))
+        app.add_handler(CommandHandler('test_weekly',   self.cmd_test_weekly))
+        app.add_handler(CommandHandler('test_scan',     self.cmd_test_scan))
    
 
         self.logger.info("All handlers registered.")
@@ -1277,8 +1281,10 @@ class NixTradesBot:
 
         if action == 'yes':
             half_lots = round(position.volume / 2, 2)
-            success, msg = self.mt5.close_position(
-                ticket, percentage=50.0, comment='TP1 Partial Close User Confirmed'
+            success, msg = self.mt5.close_partial_position(
+                telegram_id=telegram_id,
+                ticket=ticket,
+                close_pct=0.5,
             )
             if success:
                 await query.edit_message_text(
@@ -1320,10 +1326,10 @@ class NixTradesBot:
                 if position.direction == 'BUY'
                 else position.entry_price - buffer
             )
-            success, msg = self.mt5.modify_position(
-                position.ticket,
-                stop_loss=be_price,
-                take_profit=position.take_profit_2,
+            success, msg = self.mt5.modify_stop_loss(
+                telegram_id=telegram_id,
+                ticket=position.ticket,
+                new_sl=be_price,
             )
             if not success:
                 self.logger.warning(
@@ -1455,6 +1461,56 @@ class NixTradesBot:
 
     # ==================== PUBLIC NOTIFICATION METHODS ====================
 
+    async def cmd_test_briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin only: Force-send the 06:30 daily briefing right now."""
+        telegram_id = update.effective_user.id
+        if telegram_id not in config.ADMIN_USER_IDS:
+            await self._reply(update, "This command is for administrators only.")
+            return
+        await self._reply(update, "Sending daily briefing now...")
+        if self.scheduler_obj:
+            await self.scheduler_obj.trigger_daily_briefing_now(telegram_id)
+        else:
+            await self._reply(update, "Scheduler is not running.")
+
+    async def cmd_test_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin only: Force-send the 08:00 news alert right now."""
+        telegram_id = update.effective_user.id
+        if telegram_id not in config.ADMIN_USER_IDS:
+            await self._reply(update, "This command is for administrators only.")
+            return
+        await self._reply(update, "Sending news alert now...")
+        if self.scheduler_obj:
+            await self.scheduler_obj.trigger_news_alert_now(telegram_id)
+        else:
+            await self._reply(update, "Scheduler is not running.")
+
+    async def cmd_test_weekly(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin only: Force-send the Sunday weekly analysis right now."""
+        telegram_id = update.effective_user.id
+        if telegram_id not in config.ADMIN_USER_IDS:
+            await self._reply(update, "This command is for administrators only.")
+            return
+        await self._reply(update, "Sending weekly analysis now...")
+        if self.scheduler_obj:
+            await self.scheduler_obj.trigger_weekly_analysis_now(telegram_id)
+        else:
+            await self._reply(update, "Scheduler is not running.")
+
+    async def cmd_test_scan(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin only: Force-run a full market scan right now."""
+        telegram_id = update.effective_user.id
+        if telegram_id not in config.ADMIN_USER_IDS:
+            await self._reply(update, "This command is for administrators only.")
+            return
+        await self._reply(update, "Running market scan now. This takes 1-3 minutes...")
+        if self.scheduler_obj:
+            await self.scheduler_obj.trigger_market_scan_now()
+            await self._reply(update, "Market scan complete. Check your messages for any setups found.")
+        else:
+            await self._reply(update, "Scheduler is not running.")
+
+
     async def send_setup_alert(
         self,
         telegram_id: int,
@@ -1471,7 +1527,7 @@ class NixTradesBot:
                 signal_number=setup_data.get('signal_number', 0),
                 symbol=setup_data['symbol'],
                 direction=setup_data['direction'],
-                setup_type=setup_data['setup_type'],
+                setup_type=setup_data.get('setup_label', setup_data['setup_type']),
                 entry_price=setup_data['entry_price'],
                 stop_loss=setup_data['stop_loss'],
                 take_profit_1=setup_data['take_profit_1'],

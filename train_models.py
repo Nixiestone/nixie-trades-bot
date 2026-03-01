@@ -30,9 +30,12 @@ signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 def main():
+    start_date = '2020-01-01'
+    end_date = '2026-02-24'
+
     logger.info("=" * 60)
     logger.info("NIX TRADES - ML MODEL TRAINING")
-    logger.info("Training on MT5 historical data from 2020 to 2026")
+    logger.info("Training on MT5 historical data from %s to %s", start_date, end_date)
     logger.info("=" * 60)
 
     # ---- Step 1: Connect to MT5 worker ----
@@ -73,7 +76,7 @@ def main():
     logger.info(
         "Symbols: %s", ', '.join(getattr(config, 'MONITORED_SYMBOLS',
         ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'GBPJPY', 'AUDUSD'])))
-    logger.info("Period: 2020-01-01 to 2026-02-24")
+    logger.info("Period: %s to %s", start_date, end_date)
     logger.info("This may take 10-30 minutes. Please wait ...")
 
     start_time = time.time()
@@ -81,8 +84,8 @@ def main():
     success = ml.train_on_historical_data(
         symbols=getattr(config, 'MONITORED_SYMBOLS',
                         ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'GBPJPY', 'AUDUSD']),
-        start_date='2020-01-01',
-        end_date='2026-02-24',
+        start_date=start_date,
+        end_date=end_date,
     )
 
     elapsed = time.time() - start_time

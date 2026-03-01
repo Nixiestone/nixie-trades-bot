@@ -89,7 +89,7 @@ class NewsAPIRateLimiter:
 class NewsFetcher:
     """
     Fetches high-impact forex news events.
-    Uses free NewsAPI.org with fallback to manual calendar.
+    Uses live sources only (Forex Factory, Investing.com, NewsAPI).
     """
     
     def __init__(self):
@@ -99,7 +99,9 @@ class NewsFetcher:
         self.rate_limiter = NewsAPIRateLimiter(calls_per_hour=100)
         self.cache: Dict[str, List[NewsEvent]] = {}
         self.cache_expiry: Dict[str, datetime] = {}
-        self.cache_duration = timedelta(minutes=30)
+        self.cache_duration = timedelta(
+            minutes=max(15, int(getattr(config, 'NEWS_UPDATE_INTERVAL_MINUTES', 120)))
+        )
         
         # Red folder keywords (HIGH impact events)
         self.red_folder_keywords = [
@@ -136,11 +138,17 @@ class NewsFetcher:
         try:
             # Check cache first
             cache_key = f"{hours_ahead}_{impact_filter}"
-            
-            if cache_key in self.cache:
-                if datetime.now() < self.cache_expiry[cache_key]:
-                    self.logger.debug(f"Returning cached news ({len(self.cache[cache_key])} events)")
+            now_utc = datetime.now(timezone.utc)
+
+            if cache_key in self.cache and cache_key in self.cache_expiry:
+                if now_utc < self.cache_expiry[cache_key]:
+                    self.logger.debug(
+                        "Returning cached news (%d events)",
+                        len(self.cache[cache_key]),
+                    )
                     return self.cache[cache_key]
+
+            stale_cache = self.cache.get(cache_key, [])
             
             # Fetch new data
             events = []
@@ -156,20 +164,62 @@ class NewsFetcher:
             if not events and self.api_key:
                 self.rate_limiter.wait_if_needed()
                 events = self._fetch_from_newsapi(hours_ahead)
-
-            # Priority 4: Static calendar - always available, fixed recurring events
             if not events:
-                events = self._fetch_from_static_calendar(hours_ahead)
+                self.logger.warning(
+                    "No live news events available from configured sources "
+                    "(hours_ahead=%d, impact_filter=%s).",
+                    hours_ahead,
+                    impact_filter,
+                )
+                if stale_cache:
+                    stale_filtered = []
+                    stale_cutoff = now_utc + timedelta(hours=hours_ahead)
+                    for event in stale_cache:
+                        ts = event.timestamp
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        else:
+                            ts = ts.astimezone(timezone.utc)
+                        if now_utc <= ts <= stale_cutoff:
+                            event.timestamp = ts
+                            stale_filtered.append(event)
+                    self.logger.warning(
+                        "Using stale cached news (%d events) for hours_ahead=%d.",
+                        len(stale_filtered),
+                        hours_ahead,
+                    )
+                    stale_filtered.sort(key=lambda x: x.timestamp)
+                    self.cache[cache_key] = stale_filtered
+                    self.cache_expiry[cache_key] = now_utc + self.cache_duration
+                    return stale_filtered
             # Filter by impact
             if impact_filter != 'ALL':
                 events = [e for e in events if e.impact == impact_filter]
+
+            # De-duplicate (source overlap can return same event multiple times)
+            deduped = {}
+            for event in events:
+                ts = event.timestamp
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                else:
+                    ts = ts.astimezone(timezone.utc)
+                key = (
+                    event.currency.upper().strip(),
+                    event.title.strip().lower(),
+                    ts.replace(second=0, microsecond=0).isoformat(),
+                )
+                if key not in deduped:
+                    event.timestamp = ts
+                    deduped[key] = event
+            events = list(deduped.values())
             
             # Sort by timestamp
             events.sort(key=lambda x: x.timestamp)
             
             # Update cache
             self.cache[cache_key] = events
-            self.cache_expiry[cache_key] = datetime.now() + self.cache_duration
+            self.cache_expiry[cache_key] = now_utc + self.cache_duration
             
             self.logger.info(f"Fetched {len(events)} news events (next {hours_ahead}h)")
             return events
@@ -191,6 +241,7 @@ class NewsFetcher:
         try:
             # NewsAPI endpoint
             url = "https://newsapi.org/v2/everything"
+            now_utc = datetime.now(timezone.utc)
             
             # Search for forex-related news
             params = {
@@ -199,8 +250,8 @@ class NewsFetcher:
                 'language': 'en',
                 'sortBy': 'publishedAt',
                 'pageSize': 20,
-                'from': datetime.now().isoformat(),
-                'to': (datetime.now() + timedelta(hours=hours_ahead)).isoformat()
+                'from': now_utc.isoformat(),
+                'to': (now_utc + timedelta(hours=hours_ahead)).isoformat()
             }
             
             response = requests.get(url, params=params, timeout=10)
@@ -259,175 +310,133 @@ class NewsFetcher:
     
     def _fetch_from_forex_factory(self, hours_ahead: int) -> List[NewsEvent]:
         """
-        Fetch news from Forex Factory economic calendar.
-        Fallback when NewsAPI unavailable.
-        
-        Args:
-            hours_ahead: Look ahead hours
-            
-        Returns:
-            list: NewsEvent objects
+        Fetch news from Forex Factory's public JSON calendar API.
+        This endpoint is stable and does not block automated requests.
+        URLs:
+          This week: https://nfs.faireconomy.media/ff_calendar_thisweek.json
+          Next week: https://nfs.faireconomy.media/ff_calendar_nextweek.json
         """
         try:
-            from bs4 import BeautifulSoup
-            
-            self.logger.info("Fetching news from Forex Factory...")
-            
-            # Forex Factory calendar URL
-            url = "https://www.forexfactory.com/calendar"
-            
-            # Headers to mimic browser
+            now        = datetime.now(timezone.utc)
+            future     = now + timedelta(hours=hours_ahead)
+            events     = []
+
+            urls = [
+                'https://nfs.faireconomy.media/ff_calendar_thisweek.json',
+                'https://nfs.faireconomy.media/ff_calendar_nextweek.json',
+            ]
+
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+                'Accept': 'application/json',
             }
-            
-            # Rate limiting for web scraping (be respectful)
-            time.sleep(2)  # 2 second delay between requests
-            
-            response = requests.get(url, headers=headers, timeout=15)
-            
-            if response.status_code != 200:
-                self.logger.error(f"Forex Factory returned status {response.status_code}")
-                return []
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find calendar table
-            calendar_table = soup.find('table', class_='calendar__table')
-            
-            if not calendar_table:
-                self.logger.error("Could not find calendar table on Forex Factory")
-                return []
-            
-            events = []
-            current_date = None
-            now = datetime.now(timezone.utc)
-            future_time = now + timedelta(hours=hours_ahead)
-            
-            # Parse calendar rows
-            rows = calendar_table.find_all('tr', class_='calendar__row')
-            
-            for row in rows:
+
+            for url in urls:
                 try:
-                    # Check if this is a date row
-                    date_cell = row.find('td', class_='calendar__cell calendar__date')
-                    if date_cell and date_cell.get_text(strip=True):
-                        date_str = date_cell.get_text(strip=True)
-                        # Parse date (format: "Mon Jan 15")
-                        try:
-                            current_date = datetime.strptime(f"{date_str} {now.year}", "%a %b %d %Y").date()
-                        except:
-                            continue
-                    
-                    if not current_date:
-                        continue
-                    
-                    # Get time
-                    time_cell = row.find('td', class_='calendar__cell calendar__time')
-                    if not time_cell:
-                        continue
-                    
-                    time_str = time_cell.get_text(strip=True)
-                    if not time_str or time_str == 'All Day' or time_str == 'Tentative':
-                        continue
-                    
-                    # Get currency
-                    currency_cell = row.find('td', class_='calendar__cell calendar__currency')
-                    if not currency_cell:
-                        continue
-                    
-                    currency = currency_cell.get_text(strip=True)
-                    if not currency or len(currency) != 3:
-                        continue
-                    
-                    # Get impact (shown as colored icons)
-                    impact_cell = row.find('td', class_='calendar__cell calendar__impact')
-                    impact = 'LOW'
-                    if impact_cell:
-                        impact_span = impact_cell.find('span')
-                        if impact_span:
-                            impact_class = impact_span.get('class', [])
-                            if 'icon--ff-impact-red' in impact_class:
-                                impact = 'HIGH'
-                            elif 'icon--ff-impact-ora' in impact_class or 'icon--ff-impact-orange' in impact_class:
-                                impact = 'MEDIUM'
-                    
-                    # Only process HIGH impact events
-                    if impact != 'HIGH':
-                        continue
-                    
-                    # Get event title
-                    event_cell = row.find('td', class_='calendar__cell calendar__event')
-                    if not event_cell:
-                        continue
-                    
-                    event_title = event_cell.get_text(strip=True)
-                    if not event_title:
-                        continue
-                    
-                    # Get forecast, previous, actual (if available)
-                    forecast = None
-                    previous = None
-                    actual = None
-                    
-                    forecast_cell = row.find('td', class_='calendar__cell calendar__forecast')
-                    if forecast_cell:
-                        forecast = forecast_cell.get_text(strip=True)
-                    
-                    previous_cell = row.find('td', class_='calendar__cell calendar__previous')
-                    if previous_cell:
-                        previous = previous_cell.get_text(strip=True)
-                    
-                    actual_cell = row.find('td', class_='calendar__cell calendar__actual')
-                    if actual_cell:
-                        actual = actual_cell.get_text(strip=True)
-                    
-                    # Parse time and create datetime
-                    try:
-                        # Time format: "1:30pm" or "13:30"
-                        if 'am' in time_str.lower() or 'pm' in time_str.lower():
-                            event_time = datetime.strptime(time_str, "%I:%M%p").time()
-                        else:
-                            event_time = datetime.strptime(time_str, "%H:%M").time()
-                        
-                        event_datetime = datetime.combine(current_date, event_time)
-                        
-                        # Check if event is in our time window
-                        if now <= event_datetime <= future_time:
-                            event = NewsEvent(
-                                title=event_title,
-                                currency=currency,
-                                impact=impact,
-                                timestamp=event_datetime,
-                                forecast=forecast,
-                                previous=previous,
-                                actual=actual,
-                                source='Forex Factory'
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    if resp.status_code != 200:
+                        if resp.status_code in (403, 404, 429):
+                            self.logger.debug(
+                                "FF JSON endpoint unavailable (%d): %s",
+                                resp.status_code,
+                                url,
                             )
-                            
-                            events.append(event)
-                    
-                    except Exception as e:
-                        self.logger.debug(f"Error parsing time '{time_str}': {e}")
+                        else:
+                            self.logger.warning(
+                                "FF JSON API returned %d for %s", resp.status_code, url)
                         continue
-                
-                except Exception as e:
-                    self.logger.debug(f"Error parsing row: {e}")
+
+                    data = resp.json()
+                    if not isinstance(data, list):
+                        continue
+
+                    for item in data:
+                        try:
+                            impact = item.get('impact', '').strip().upper()
+                            if impact != 'HIGH':
+                                continue
+
+                            currency = (item.get('country') or '').strip().upper()
+                            if not currency or len(currency) != 3:
+                                continue
+
+                            title    = (item.get('title') or '').strip()
+                            date_str = (item.get('date') or '').strip()
+                            time_str = (item.get('time') or '').strip()
+
+                            if not date_str or not title:
+                                continue
+
+                            # Parse datetime.
+                            # New FF format: "2026-02-27T08:30:00-05:00"
+                            # Old FF format: "01-27-2026" + "8:30am"
+                            try:
+                                if 'T' in date_str:
+                                    event_dt = datetime.fromisoformat(
+                                        date_str.replace('Z', '+00:00')
+                                    )
+                                elif time_str:
+                                    dt_str = f"{date_str} {time_str}".replace('\u202f', ' ')
+                                    try:
+                                        event_dt = datetime.strptime(
+                                            dt_str, '%m-%d-%Y %I:%M%p'
+                                        )
+                                    except ValueError:
+                                        event_dt = datetime.strptime(
+                                            dt_str, '%m-%d-%Y %H:%M'
+                                        )
+                                else:
+                                    event_dt = datetime.strptime(
+                                        date_str, '%m-%d-%Y'
+                                    )
+
+                                if event_dt.tzinfo is None:
+                                    # Older FF entries are US Eastern local time.
+                                    import pytz
+                                    eastern  = pytz.timezone('America/New_York')
+                                    event_dt = eastern.localize(event_dt)
+
+                                event_dt = event_dt.astimezone(timezone.utc)
+
+                            except Exception as parse_err:
+                                self.logger.debug(
+                                    "FF date parse error for '%s %s': %s",
+                                    date_str, time_str, parse_err)
+                                continue
+
+                            if now <= event_dt <= future:
+                                events.append(NewsEvent(
+                                    title=title,
+                                    currency=currency,
+                                    impact='HIGH',
+                                    timestamp=event_dt,
+                                    forecast=item.get('forecast', ''),
+                                    previous=item.get('previous', ''),
+                                    actual=item.get('actual', ''),
+                                    source='Forex Factory',
+                                ))
+
+                        except Exception as item_err:
+                            self.logger.debug(
+                                "FF item parse error: %s", item_err)
+                            continue
+
+                except requests.exceptions.RequestException as req_err:
+                    self.logger.warning(
+                        "FF JSON request failed for %s: %s", url, req_err)
                     continue
-            
-            self.logger.info(f"Fetched {len(events)} events from Forex Factory")
+
+            self.logger.info(
+                "Fetched %d HIGH impact events from Forex Factory JSON API.",
+                len(events))
             return events
-        
-        except ImportError:
-            self.logger.error("BeautifulSoup not installed. Install with: pip install beautifulsoup4")
-            return []
-        
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Forex Factory request error: {e}")
-            return []
-        
+
         except Exception as e:
-            self.logger.error(f"Error scraping Forex Factory: {e}")
+            self.logger.error("Error in _fetch_from_forex_factory: %s", e)
             return []
     
     def _fetch_from_investing_com(self, hours_ahead: int) -> list:
@@ -442,6 +451,8 @@ class NewsFetcher:
                 'X-Requested-With': 'XMLHttpRequest',
                 'Referer':          'https://www.investing.com/economic-calendar/',
             }
+            now = datetime.now(timezone.utc)
+            future = now + timedelta(hours=hours_ahead)
             payload = {
                 'country[]':    ['5', '4', '17', '39', '7', '14', '10'],
                 'importance[]': ['3'],
@@ -450,16 +461,18 @@ class NewsFetcher:
                 'currentTab':   'custom',
                 'submitFilters': '1',
                 'limit_from':   '0',
+                'dateFrom':     now.strftime('%Y-%m-%d'),
+                'dateTo':       future.strftime('%Y-%m-%d'),
             }
             import time as _time
             _time.sleep(1)
             resp = requests.post(url, headers=headers, data=payload, timeout=15)
             if resp.status_code != 200:
-                self.logger.error("Investing.com returned status %d", resp.status_code)
+                self.logger.warning("Investing.com returned status %d", resp.status_code)
                 return []
 
-            data = resp.json()
-            html_content = data.get('data', '')
+            data = resp.json() if resp.content else {}
+            html_content = data.get('data', '') if isinstance(data, dict) else ''
             if not html_content:
                 return []
 
@@ -468,37 +481,57 @@ class NewsFetcher:
             rows = soup.find_all('tr', class_='js-event-item')
 
             events = []
-            now    = datetime.now(timezone.utc)
-            future = now + timedelta(hours=hours_ahead)
 
             for row in rows:
                 try:
-                    time_cell     = row.find('td', class_='time')
                     currency_cell = row.find('td', class_='flagCur')
                     event_cell    = row.find('td', class_='event')
                     bull_icons    = row.find_all('i', class_='grayFullBullishIcon')
 
-                    if not time_cell or not currency_cell or not event_cell:
+                    if not currency_cell or not event_cell:
                         continue
                     if len(bull_icons) < 3:
                         continue
 
-                    time_str = time_cell.get_text(strip=True)
                     currency = currency_cell.get_text(strip=True).replace('\xa0', '').strip()[-3:]
                     title    = event_cell.get_text(strip=True)
 
-                    if not time_str or not currency or len(currency) != 3:
+                    if not title or not currency or len(currency) != 3:
                         continue
 
-                    try:
-                        evt_time = datetime.strptime(time_str, '%H:%M').replace(
-                            year=now.year, month=now.month, day=now.day,
-                            tzinfo=timezone.utc
-                        )
-                        if evt_time < now:
-                            evt_time = evt_time + timedelta(days=1)
-                    except Exception:
-                        continue
+                    evt_time = None
+                    ts_attr = row.get('data-event-datetime')
+                    if ts_attr:
+                        ts_raw = str(ts_attr).strip()
+                        # Investing can return either Unix epoch or formatted datetime.
+                        for parser in (
+                            lambda v: datetime.fromtimestamp(int(float(v)), tz=timezone.utc),
+                            lambda v: datetime.strptime(v, '%Y/%m/%d %H:%M:%S').replace(tzinfo=timezone.utc),
+                            lambda v: datetime.strptime(v, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc),
+                            lambda v: datetime.strptime(v, '%Y/%m/%d %H:%M').replace(tzinfo=timezone.utc),
+                        ):
+                            try:
+                                evt_time = parser(ts_raw)
+                                break
+                            except Exception:
+                                continue
+
+                    if evt_time is None:
+                        time_cell = row.find('td', class_='time')
+                        if not time_cell:
+                            continue
+                        time_str = time_cell.get_text(strip=True)
+                        try:
+                            evt_time = datetime.strptime(time_str, '%H:%M').replace(
+                                year=now.year,
+                                month=now.month,
+                                day=now.day,
+                                tzinfo=timezone.utc,
+                            )
+                            if evt_time < now - timedelta(hours=12):
+                                evt_time = evt_time + timedelta(days=1)
+                        except Exception:
+                            continue
 
                     if now <= evt_time <= future:
                         events.append(NewsEvent(
@@ -521,80 +554,6 @@ class NewsFetcher:
             return []
         except Exception as e:
             self.logger.error("Investing.com fetch error: %s", e)
-            return []
-    
-    def _fetch_from_static_calendar(self, hours_ahead: int) -> List[NewsEvent]:
-        """
-        Fetch news from static economic calendar.
-        Fallback when API unavailable.
-        
-        Args:
-            hours_ahead: Look ahead hours
-            
-        Returns:
-            list: NewsEvent objects
-        """
-        try:
-            # Static calendar of recurring high-impact events
-            # Times are approximate (UTC)
-            static_events = [
-                # US Events (usually 13:30 UTC or 15:00 UTC)
-                {'title': 'US Non-Farm Payrolls', 'currency': 'USD', 'hour': 13, 'minute': 30, 'day_of_month': 1, 'weekday': 4},  # First Friday
-                {'title': 'US CPI Report', 'currency': 'USD', 'hour': 13, 'minute': 30, 'day_of_month': 15},
-                {'title': 'US Retail Sales', 'currency': 'USD', 'hour': 13, 'minute': 30, 'day_of_month': 15},
-                {'title': 'FOMC Interest Rate Decision', 'currency': 'USD', 'hour': 19, 'minute': 0, 'day_of_month': 1},
-                
-                # EUR Events (usually 09:00 UTC)
-                {'title': 'ECB Interest Rate Decision', 'currency': 'EUR', 'hour': 12, 'minute': 45, 'day_of_month': 1},
-                {'title': 'Eurozone CPI', 'currency': 'EUR', 'hour': 10, 'minute': 0, 'day_of_month': 1},
-                {'title': 'German PMI', 'currency': 'EUR', 'hour': 8, 'minute': 30, 'day_of_month': 1},
-                
-                # GBP Events (usually 07:00 UTC)
-                {'title': 'BOE Interest Rate Decision', 'currency': 'GBP', 'hour': 12, 'minute': 0, 'day_of_month': 1},
-                {'title': 'UK CPI', 'currency': 'GBP', 'hour': 7, 'minute': 0, 'day_of_month': 15},
-                {'title': 'UK GDP', 'currency': 'GBP', 'hour': 7, 'minute': 0, 'day_of_month': 10},
-            ]
-            
-            now = datetime.now(timezone.utc)
-            future_time = now + timedelta(hours=hours_ahead)
-            events = []
-            
-            # Generate events for current and next month
-            for month_offset in [0, 1]:
-                check_date = now.replace(day=1) + timedelta(days=32 * month_offset)
-                check_date = check_date.replace(day=1)
-                
-                for event_template in static_events:
-                    # Calculate event datetime
-                    try:
-                        event_date = check_date.replace(
-                            day=event_template['day_of_month'],
-                            hour=event_template['hour'],
-                            minute=event_template['minute'],
-                            second=0,
-                            microsecond=0
-                        )
-                        
-                        # Check if event is in our time window
-                        if now <= event_date <= future_time:
-                            event = NewsEvent(
-                                title=event_template['title'],
-                                currency=event_template['currency'],
-                                impact='HIGH',
-                                timestamp=event_date,
-                                source='Static Calendar'
-                            )
-                            
-                            events.append(event)
-                    
-                    except ValueError:
-                        # Invalid day for month (e.g., Feb 30)
-                        continue
-            
-            return events
-        
-        except Exception as e:
-            self.logger.error(f"Error generating static calendar: {e}")
             return []
     
     # ==================== CLASSIFICATION & FILTERING ====================

@@ -400,10 +400,19 @@ def save_signal(
     Save a new signal to the database.
     Returns the signal's ID, or None on failure.
     """
+    setup_upper = str(setup_type).upper()
+    normalized_setup_type = (
+        'UNICORN'
+        if 'UNICORN' in setup_upper or 'PREMIUM' in setup_upper
+        else 'STANDARD'
+    )
+    next_signal_number = get_signal_count() + 1
+
     signal_data = {
+        'signal_number': next_signal_number,
         'symbol':        symbol,
         'direction':     direction,
-        'setup_type':    setup_type,
+        'setup_type':    normalized_setup_type,
         'entry_price':   entry_price,
         'stop_loss':     stop_loss,
         'take_profit_1': take_profit_1,
@@ -420,7 +429,6 @@ def save_signal(
         'order_type':    order_type,
         'timeframe':     timeframe,
         'expiry_hours':  expiry_hours,
-        'status':        'active',
         'created_at':    datetime.now(timezone.utc).isoformat(),
     }
 
@@ -428,8 +436,8 @@ def save_signal(
     if result.data:
         signal_id = result.data[0].get('id')
         logger.info(
-            "Signal saved: id=%s %s %s score=%d",
-            signal_id, symbol, direction, ml_score
+            "Signal saved: id=%s number=%s %s %s score=%d setup=%s",
+            signal_id, next_signal_number, symbol, direction, ml_score, normalized_setup_type
         )
         return signal_id
     return None
@@ -448,7 +456,7 @@ def get_signal_count() -> int:
 
 
 @_db_retry()
-def recent_signal_exists(
+def recent_signal_exists_by_direction(
     symbol: str,
     direction: str,
     hours: int = 2,
@@ -542,7 +550,9 @@ def update_trade(
     profit_pips: Optional[float] = None,
     rr_achieved: Optional[float] = None,
     close_price: Optional[float] = None,
-    status: str = 'closed',
+    realized_pnl: Optional[float] = None,
+    closed_at: Optional[str] = None,
+    status: str = 'CLOSED',
 ) -> bool:
     """
     Update a trade record when it is closed (by TP, SL, or manual close).
@@ -560,6 +570,10 @@ def update_trade(
         update_data['rr_achieved'] = rr_achieved
     if close_price is not None:
         update_data['close_price'] = close_price
+    if realized_pnl is not None:
+        update_data['realized_pnl'] = realized_pnl
+    if closed_at is not None:
+        update_data['closed_at'] = closed_at
 
     _client().table('trades').update(update_data).eq('mt5_ticket', ticket).execute()
     return True
@@ -723,7 +737,7 @@ def get_daily_loss_percent(
         .table('trades')
         .select('profit_pips, lot_size, symbol')
         .eq('telegram_id', telegram_id)
-        .eq('status', 'closed')
+        .eq('status', 'CLOSED')
         .gte('updated_at', since.isoformat())
         .execute()
     )

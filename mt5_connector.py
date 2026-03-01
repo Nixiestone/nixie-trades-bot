@@ -29,6 +29,10 @@ class MT5Connector:
         self.base_url = config.MT5_WORKER_URL.rstrip('/')
         self.api_key  = config.MT5_WORKER_API_KEY
         self.timeout  = config.MT5_TIMEOUT
+        if not self.api_key:
+            self.logger.warning(
+                "MT5_WORKER_API_KEY is not set. If the worker enforces API auth, requests will fail."
+            )
         self.logger.info("MT5 Connector initialised. Worker URL: %s", self.base_url)
 
     # ==================== INTERNAL HELPERS ====================

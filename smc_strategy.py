@@ -87,61 +87,74 @@ class SMCStrategy:
                 'reason': f'Analysis error: {str(e)}'
             }
     
-    def _identify_swings(self, data: pd.DataFrame) -> List[Dict]:
+    def _identify_swings(self, data: pd.DataFrame, lookback: int = 2) -> List[Dict]:
         """
         Identify swing highs and lows with trend classification.
-        
-        Args:
-            data: OHLCV DataFrame
-            
-        Returns:
-            list: Swing points with types (HH, LL, HL, LH)
+        lookback=2 for HTF trend detection (finds more swings on Daily data).
+        lookback=3 for entry-level structure (stricter, reduces noise on M15/H1).
+        Uses ATR-based minimum size to reject noise spikes without losing real swings.
         """
         swings = []
-        highs = data['high'].values
-        lows = data['low'].values
-        
-        # Find swing highs (local maxima)
-        for i in range(2, len(highs) - 2):
-            if highs[i] > highs[i-1] and highs[i] > highs[i-2] and \
-               highs[i] > highs[i+1] and highs[i] > highs[i+2]:
-                swings.append({
-                    'index': i,
-                    'price': highs[i],
-                    'direction': 'HIGH',
-                    'type': None  # Will classify later
-                })
-        
-        # Find swing lows (local minima)
-        for i in range(2, len(lows) - 2):
-            if lows[i] < lows[i-1] and lows[i] < lows[i-2] and \
-               lows[i] < lows[i+1] and lows[i] < lows[i+2]:
-                swings.append({
-                    'index': i,
-                    'price': lows[i],
-                    'direction': 'LOW',
-                    'type': None
-                })
-        
-        # Sort by index
+        highs  = data['high'].values
+        lows   = data['low'].values
+        n      = len(data)
+
+        close     = data['close'].values
+        tr_values = []
+        for k in range(1, n):
+            tr = max(highs[k] - lows[k],
+                     abs(highs[k] - close[k - 1]),
+                     abs(lows[k]  - close[k - 1]))
+            tr_values.append(tr)
+        atr_approx     = float(np.mean(tr_values[-20:])) if len(tr_values) >= 20 else 0.0
+        min_swing_size = atr_approx * 0.3
+
+        for i in range(lookback, n - lookback):
+            left_ok  = all(highs[i] > highs[i - j] for j in range(1, lookback + 1))
+            right_ok = all(highs[i] > highs[i + j] for j in range(1, lookback + 1))
+            if left_ok and right_ok:
+                swing_size = highs[i] - min(lows[max(0, i - lookback): i + lookback + 1])
+                if swing_size >= min_swing_size:
+                    swings.append({
+                        'index': i, 'price': highs[i],
+                        'direction': 'HIGH', 'type': None
+                    })
+
+        for i in range(lookback, n - lookback):
+            left_ok  = all(lows[i] < lows[i - j] for j in range(1, lookback + 1))
+            right_ok = all(lows[i] < lows[i + j] for j in range(1, lookback + 1))
+            if left_ok and right_ok:
+                swing_size = max(highs[max(0, i - lookback): i + lookback + 1]) - lows[i]
+                if swing_size >= min_swing_size:
+                    swings.append({
+                        'index': i, 'price': lows[i],
+                        'direction': 'LOW', 'type': None
+                    })
+
         swings.sort(key=lambda x: x['index'])
-        
-        # Classify swings
-        for i in range(1, len(swings)):
-            current = swings[i]
-            previous = swings[i-1]
-            
-            if current['direction'] == 'HIGH':
-                if current['price'] > previous['price']:
-                    current['type'] = 'HH'  # Higher High
+
+        # Compare like-to-like: HIGH vs previous HIGH, LOW vs previous LOW.
+        # The old code compared every swing against the immediately previous one
+        # regardless of type. A HIGH vs a LOW comparison is always True for HH
+        # and always True for LL, producing a permanent 50/50 split that resolved
+        # to RANGING for every symbol every time.
+        last_high_price: Optional[float] = None
+        last_low_price:  Optional[float] = None
+
+        for swing in swings:
+            if swing['direction'] == 'HIGH':
+                if last_high_price is not None:
+                    swing['type'] = 'HH' if swing['price'] > last_high_price else 'LH'
                 else:
-                    current['type'] = 'LH'  # Lower High
-            else:  # LOW
-                if current['price'] < previous['price']:
-                    current['type'] = 'LL'  # Lower Low
+                    swing['type'] = 'HH'
+                last_high_price = swing['price']
+            else:
+                if last_low_price is not None:
+                    swing['type'] = 'LL' if swing['price'] < last_low_price else 'HL'
                 else:
-                    current['type'] = 'HL'  # Higher Low
-        
+                    swing['type'] = 'LL'
+                last_low_price = swing['price']
+
         return [s for s in swings if s['type'] is not None]
     
     def detect_order_blocks(
@@ -201,6 +214,12 @@ class SMCStrategy:
                 
                 if impulse_volume < config.VOLUME_MULTIPLIER_IMPULSE:
                     continue  # Impulse must have 2x volume
+                
+                # Reject OB candles with tiny bodies - they are indecision, not institutional
+                candle_body_ratio = (abs(candle['close'] - candle['open'])
+                                     / max(candle['high'] - candle['low'], 1e-9))
+                if candle_body_ratio < 0.4:
+                    continue
                 
                 # Valid Order Block found
                 order_blocks.append({
@@ -381,7 +400,7 @@ class SMCStrategy:
         """
         try:
             # Look for displacement breaking internal structure
-            recent_swings = self._identify_swings(data.tail(50))
+            recent_swings = self._identify_swings(data.tail(50), lookback=3)
             
             if len(recent_swings) < 3:
                 return None
@@ -586,42 +605,52 @@ class SMCStrategy:
             dict: Entry price and configuration
         """
         try:
-            poi_low = poi['low']
-            poi_high = poi['high']
-            poi_body = poi_high - poi_low
-            
-            # REFINEMENT #1: Dynamic entry zones
-            if setup_type == 'UNICORN' and ml_score >= config.ML_AUTO_EXECUTE_THRESHOLD:
-                # Aggressive: Top 25% for high R:R
-                if poi['direction'] == 'BULLISH':
-                    entry = poi_low + (poi_body * 0.625)
-                else:
-                    entry = poi_high - (poi_body * 0.625)
-                
-                return {
-                    'entry_price': round(entry, 5),
-                    'entry_type': 'AGGRESSIVE',
-                    'zone_percentage': 62.5,
-                    'wait_for_confirmation': False,
-                    'expected_win_rate': 65,
-                    'expected_rr': 2.5
-                }
-            
+            poi_low   = float(poi['low'])
+            poi_high  = float(poi['high'])
+            poi_range = poi_high - poi_low
+            direction = str(poi.get('direction', 'BULLISH')).upper()
+            setup_u   = str(setup_type).upper()
+
+            if poi_range <= 0:
+                raise ValueError("Invalid POI range: high must be greater than low.")
+
+            # Sniper entry model:
+            # Lower zone for BUY (and upper zone for SELL) gives tighter risk and higher
+            # potential RR, while still allowing confirmation mode for lower-quality setups.
+            if setup_u == 'UNICORN' and ml_score >= 85:
+                zone = 0.18
+                entry_type = 'SNIPER'
+                wait_confirmation = False
+                expected_win_rate = 66
+            elif setup_u == 'UNICORN' and ml_score >= config.ML_AUTO_EXECUTE_THRESHOLD:
+                zone = 0.28
+                entry_type = 'PRECISION'
+                wait_confirmation = False
+                expected_win_rate = 63
+            elif ml_score >= 60:
+                zone = 0.35
+                entry_type = 'BALANCED'
+                wait_confirmation = True
+                expected_win_rate = 69
             else:
-                # Conservative: Bottom 25% for higher probability
-                if poi['direction'] == 'BULLISH':
-                    entry = poi_low + (poi_body * 0.125)
-                else:
-                    entry = poi_high - (poi_body * 0.125)
-                
-                return {
-                    'entry_price': round(entry, 5),
-                    'entry_type': 'CONSERVATIVE',
-                    'zone_percentage': 12.5,
-                    'wait_for_confirmation': True,
-                    'expected_win_rate': 75,
-                    'expected_rr': 2.0
-                }
+                zone = 0.42
+                entry_type = 'CONFIRMATION'
+                wait_confirmation = True
+                expected_win_rate = 73
+
+            if direction in ('BULLISH', 'BUY'):
+                entry = poi_low + (poi_range * zone)
+            else:
+                entry = poi_high - (poi_range * zone)
+
+            return {
+                'entry_price': round(entry, 5),
+                'entry_type': entry_type,
+                'zone_percentage': round(zone * 100, 1),
+                'wait_for_confirmation': wait_confirmation,
+                'expected_win_rate': expected_win_rate,
+                'expected_rr': round(1.0 / max(zone, 1e-6), 2),
+            }
         
         except Exception as e:
             self.logger.error(f"Error calculating entry price: {e}")
@@ -706,31 +735,35 @@ class SMCStrategy:
             dict: Stop loss configuration
         """
         try:
-            buffer_pips = 3  # Base buffer
-            
-            # REFINEMENT #3: ATR-based SL adjustment
-            atr_pips = atr / utils.get_pip_value(symbol)
-            
-            if atr_pips > 15:  # High volatility
-                buffer_pips = 5
-            elif atr_pips < 8:  # Low volatility
-                buffer_pips = 2
-            
-            if direction == 'BUY':
-                sl_price = poi['low'] - (buffer_pips * utils.get_pip_value(symbol))
-            else:  # SELL
-                sl_price = poi['high'] + (buffer_pips * utils.get_pip_value(symbol))
+            pip_size = utils.get_pip_value(symbol)
+            if pip_size <= 0:
+                raise ValueError("Invalid pip size for symbol.")
+
+            direction_u = str(direction).upper()
+            atr_pips    = (atr / pip_size) if atr and atr > 0 else 0.0
+
+            # Dynamic structural buffer:
+            # 20% of ATR, clamped to avoid both overly tight and overly wide stops.
+            if atr_pips > 0:
+                buffer_pips = min(8.0, max(2.0, atr_pips * 0.20))
+            else:
+                buffer_pips = 3.0
+
+            if direction_u in ('BUY', 'BULLISH'):
+                sl_price = float(poi['low']) - (buffer_pips * pip_size)
+            else:  # SELL / BEARISH
+                sl_price = float(poi['high']) + (buffer_pips * pip_size)
             
             return {
                 'stop_loss': round(sl_price, 5),
-                'buffer_pips': buffer_pips,
+                'buffer_pips': round(buffer_pips, 1),
                 'atr_adjusted': True
             }
         
         except Exception as e:
             self.logger.error(f"Error calculating stop loss: {e}")
             # Fallback
-            if direction == 'BUY':
+            if str(direction).upper() in ('BUY', 'BULLISH'):
                 return {'stop_loss': round(poi['low'] - (3 * utils.get_pip_value(symbol)), 5), 'buffer_pips': 3, 'atr_adjusted': False}
             else:
                 return {'stop_loss': round(poi['high'] + (3 * utils.get_pip_value(symbol)), 5), 'buffer_pips': 3, 'atr_adjusted': False}
@@ -757,17 +790,33 @@ class SMCStrategy:
             dict: TP1 and TP2 levels
         """
         try:
-            risk_pips = utils.calculate_pips(symbol, entry, stop_loss)
+            direction_u = str(direction).upper()
+            risk_price  = abs(entry - stop_loss)
+            risk_pips   = utils.calculate_pips(symbol, entry, stop_loss)
             if risk_pips <= 0:
                 raise ValueError("Risk pips is zero - entry equals stop loss.")
 
-            # TP1: Internal structural target.
-            # Place at the midpoint between entry and the full HTF swing level.
-            # This targets internal liquidity before the full range completes.
-            if direction in ('BULLISH', 'BUY'):
-                tp1 = entry + ((htf_swing - entry) * 0.5)
+            # If the structural swing target is not beyond entry in trade direction,
+            # synthesize a minimum valid structural target from risk multiples.
+            if direction_u in ('BULLISH', 'BUY'):
+                if htf_swing <= entry:
+                    htf_swing = entry + (risk_price * config.MIN_RR_TP2)
             else:
-                tp1 = entry - ((entry - htf_swing) * 0.5)
+                if htf_swing >= entry:
+                    htf_swing = entry - (risk_price * config.MIN_RR_TP2)
+
+            # TP1: Internal structural target.
+            # Use the greater of:
+            # - Midpoint to HTF swing
+            # - Minimum configured RR target
+            if direction_u in ('BULLISH', 'BUY'):
+                tp1_structural = entry + ((htf_swing - entry) * 0.5)
+                tp1_min_rr     = entry + (risk_price * config.MIN_RR_RATIO)
+                tp1            = max(tp1_structural, tp1_min_rr)
+            else:
+                tp1_structural = entry - ((entry - htf_swing) * 0.5)
+                tp1_min_rr     = entry - (risk_price * config.MIN_RR_RATIO)
+                tp1            = min(tp1_structural, tp1_min_rr)
 
             tp1_pips = utils.calculate_pips(symbol, entry, tp1)
             tp1_rr   = round(tp1_pips / risk_pips, 2) if risk_pips > 0 else 0.0
@@ -784,11 +833,14 @@ class SMCStrategy:
             tp2_pips = utils.calculate_pips(symbol, entry, tp2)
             tp2_rr   = round(tp2_pips / risk_pips, 2) if risk_pips > 0 else 0.0
 
-            # If TP2 does not clear the minimum, collapse it to TP1 (single-target trade).
+            # Sniper rule: do not force a reduced TP2.
+            # If structure cannot provide required RR at TP2, reject the setup.
             if tp2_rr < config.MIN_RR_TP2:
-                tp2      = tp1
-                tp2_pips = tp1_pips
-                tp2_rr   = tp1_rr
+                raise ValueError(
+                    "TP2 R:R %.2f is below minimum %.1f. "
+                    "No valid external target for sniper continuation." % (
+                        tp2_rr, config.MIN_RR_TP2)
+                )
 
             return {
                 'tp1':      round(tp1, 5),
@@ -827,6 +879,96 @@ class SMCStrategy:
             return False, f"High volatility regime ({volatility_ratio:.2f}x) - skip trade"
         
         return True, f"Normal volatility regime ({volatility_ratio:.2f}x)"
+    
+    def check_adx_filter(
+        self,
+        data: pd.DataFrame,
+        period: int = 14
+    ) -> Tuple[bool, float, str]:
+        """
+        ADX trend strength filter. ADX below 20 = ranging market = skip.
+
+        Args:
+            data:   OHLCV DataFrame (needs at least 2*period + 5 bars)
+            period: ADX lookback period (default 14)
+
+        Returns:
+            tuple: (pass_filter, adx_value, reason)
+        """
+        try:
+            n = len(data)
+            if n < period * 2 + 5:
+                return True, 0.0, "Insufficient data for ADX calculation"
+
+            high  = data['high'].values.astype(float)
+            low   = data['low'].values.astype(float)
+            close = data['close'].values.astype(float)
+
+            plus_dm  = np.zeros(n)
+            minus_dm = np.zeros(n)
+            tr_arr   = np.zeros(n)
+
+            for i in range(1, n):
+                h_diff        = high[i]    - high[i - 1]
+                l_diff        = low[i - 1] - low[i]
+                plus_dm[i]   = h_diff if (h_diff > l_diff and h_diff > 0) else 0.0
+                minus_dm[i]  = l_diff if (l_diff > h_diff and l_diff > 0) else 0.0
+                tr_arr[i]    = max(
+                    high[i] - low[i],
+                    abs(high[i]  - close[i - 1]),
+                    abs(low[i]   - close[i - 1])
+                )
+
+            atr_s = np.zeros(n)
+            pdm_s = np.zeros(n)
+            mdm_s = np.zeros(n)
+
+            atr_s[period] = tr_arr[1: period + 1].sum()
+            pdm_s[period] = plus_dm[1: period + 1].sum()
+            mdm_s[period] = minus_dm[1: period + 1].sum()
+
+            for i in range(period + 1, n):
+                atr_s[i] = atr_s[i - 1] - (atr_s[i - 1] / period) + tr_arr[i]
+                pdm_s[i] = pdm_s[i - 1] - (pdm_s[i - 1] / period) + plus_dm[i]
+                mdm_s[i] = mdm_s[i - 1] - (mdm_s[i - 1] / period) + minus_dm[i]
+
+            pdi = np.zeros(n, dtype=float)
+            mdi = np.zeros(n, dtype=float)
+            valid_atr = atr_s > 0
+            np.divide(100.0 * pdm_s, atr_s, out=pdi, where=valid_atr)
+            np.divide(100.0 * mdm_s, atr_s, out=mdi, where=valid_atr)
+
+            dx = np.zeros(n, dtype=float)
+            pdi_mdi_sum = pdi + mdi
+            valid_dx = pdi_mdi_sum > 0
+            np.divide(
+                100.0 * np.abs(pdi - mdi),
+                pdi_mdi_sum,
+                out=dx,
+                where=valid_dx
+            )
+
+            adx    = np.zeros(n)
+            start  = period * 2
+            if start >= n:
+                return True, 0.0, "Insufficient data for ADX smoothing"
+
+            adx[start] = dx[period + 1: start + 1].mean()
+            for i in range(start + 1, n):
+                adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+
+            adx_val = float(adx[-1]) if adx[-1] > 0 else float(dx[-1])
+
+            if adx_val >= 25:
+                return True,  adx_val, f"ADX {adx_val:.1f} - trending market"
+            elif adx_val >= 20:
+                return True,  adx_val, f"ADX {adx_val:.1f} - weak trend, proceed with caution"
+            else:
+                return False, adx_val, f"ADX {adx_val:.1f} - ranging market, skip"
+
+        except Exception as e:
+            self.logger.error("Error calculating ADX: %s", e)
+            return True, 0.0, f"ADX calculation error: {e}"
     
     def check_session_filter(self, timestamp: datetime) -> Tuple[bool, str]:
         """
@@ -973,6 +1115,135 @@ class SMCStrategy:
         score += 20
         
         return min(score, 100)
+    
+    def detect_premium_discount_zone(
+        self,
+        current_price: float,
+        swing_high: float,
+        swing_low: float,
+        direction: str
+    ) -> Tuple[bool, float, str]:
+        """
+        Validate price is in the correct zone before entry.
+        Institutions BUY from the discount half and SELL from the premium half.
+
+        Returns:
+            tuple: (is_in_correct_zone, zone_position_0_to_1, description)
+        """
+        try:
+            if swing_high <= swing_low or swing_high <= 0 or swing_low <= 0:
+                return True, 0.5, "Cannot determine zone - insufficient swing data"
+
+            total_range    = swing_high - swing_low
+            price_position = (current_price - swing_low) / total_range
+
+            if direction == 'BULLISH':
+                if price_position <= 0.35:
+                    return True,  price_position, f"Deep discount zone ({price_position:.1%})"
+                elif price_position <= 0.50:
+                    return True,  price_position, f"Discount zone ({price_position:.1%})"
+                elif price_position <= 0.65:
+                    return False, price_position, f"Mid zone ({price_position:.1%}) - marginal"
+                else:
+                    return False, price_position, f"Premium zone ({price_position:.1%}) - avoid BUY"
+            else:
+                if price_position >= 0.65:
+                    return True,  price_position, f"Deep premium zone ({price_position:.1%})"
+                elif price_position >= 0.50:
+                    return True,  price_position, f"Premium zone ({price_position:.1%})"
+                elif price_position >= 0.35:
+                    return False, price_position, f"Mid zone ({price_position:.1%}) - marginal"
+                else:
+                    return False, price_position, f"Discount zone ({price_position:.1%}) - avoid SELL"
+
+        except Exception as e:
+            self.logger.error("Error detecting premium/discount zone: %s", e)
+            return True, 0.5, f"Zone detection error: {e}"
+
+    def score_setup_quality(
+        self,
+        data: pd.DataFrame,
+        poi: Dict,
+        htf_trend: Dict,
+        bos_events: List[Dict],
+        direction: str,
+        symbol: str
+    ) -> int:
+        """
+        Composite 0-100 quality score for a setup.
+        Used by both the live scheduler and the ML training pipeline
+        as a pre-filter (only setups >= 50 enter training).
+
+        Breakdown:
+          HTF confidence  : 0-20 pts
+          BOS count       : 0-15 pts
+          POI volume      : 0-20 pts
+          POI type        : 0-15 pts
+          Zone correct    : 0-10 pts
+          ADX strength    : 0-10 pts
+          POI freshness   : 0-10 pts
+        """
+        score = 0
+        try:
+            # HTF confidence
+            htf_confidence = int(htf_trend.get('confidence', 0))
+            if htf_trend.get('trend') == direction:
+                if htf_confidence >= 80:   score += 20
+                elif htf_confidence >= 70: score += 16
+                elif htf_confidence >= 60: score += 12
+                else:                      score += 7
+
+            # BOS count
+            if len(bos_events) >= 3:   score += 15
+            elif len(bos_events) == 2: score += 12
+            elif len(bos_events) == 1: score += 6
+
+            # Volume at POI
+            vol_ratio = float(poi.get('volume_ratio', 0))
+            if vol_ratio >= 3.0:   score += 20
+            elif vol_ratio >= 2.5: score += 16
+            elif vol_ratio >= 2.0: score += 12
+            elif vol_ratio >= 1.5: score += 8
+            elif vol_ratio >= 1.0: score += 4
+
+            # POI type
+            poi_type = str(poi.get('type', 'OB')).upper()
+            if poi_type == 'UNICORN':             score += 15
+            elif poi_type in ('BB', 'BREAKER'):   score += 12
+            elif poi_type == 'OB':                score += 8
+            elif poi_type == 'FVG':               score += 5
+
+            # Premium/discount zone
+            swing_high    = float(htf_trend.get('swing_high', 0))
+            swing_low     = float(htf_trend.get('swing_low',  0))
+            current_price = float(data.iloc[-1]['close'])
+            if swing_high > swing_low > 0:
+                in_zone, _, _ = self.detect_premium_discount_zone(
+                    current_price, swing_high, swing_low, direction)
+                if in_zone:
+                    score += 10
+
+            # ADX
+            try:
+                adx_ok, adx_val, _ = self.check_adx_filter(data.tail(60))
+                if adx_val >= 35:    score += 10
+                elif adx_val >= 30:  score += 8
+                elif adx_val >= 25:  score += 6
+                elif adx_ok:         score += 3
+            except Exception:
+                score += 5
+
+            # Freshness
+            bars_ago = max(0, len(data) - int(poi.get('index', len(data) - 1)))
+            if bars_ago <= 5:    score += 10
+            elif bars_ago <= 15: score += 8
+            elif bars_ago <= 30: score += 5
+            elif bars_ago <= 50: score += 2
+
+        except Exception as e:
+            self.logger.error("Error scoring setup quality: %s", e)
+
+        return min(int(score), 100)
     
     def detect_unicorn_setup(
         self,

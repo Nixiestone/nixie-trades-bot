@@ -276,9 +276,9 @@ CREATE INDEX IF NOT EXISTS idx_trades_mt5_ticket_idx
     ON trades (mt5_ticket);
 
 
-# --------------------------------------------------------------------------
-# SQL: Add this table to your Supabase project (SQL Editor > New Query)
-# --------------------------------------------------------------------------
+-- --------------------------------------------------------------------------
+-- SQL: Add this table to your Supabase project (SQL Editor > New Query)
+-- --------------------------------------------------------------------------
    CREATE TABLE IF NOT EXISTS ml_training_data (
        id            BIGSERIAL PRIMARY KEY,
        mt5_ticket    BIGINT,

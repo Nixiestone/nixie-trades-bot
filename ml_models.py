@@ -18,8 +18,12 @@ _MODEL_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'
 _XGB_PATH    = os.path.join(_MODEL_DIR, 'xgboost_model.pkl')
 _LSTM_PATH   = os.path.join(_MODEL_DIR, 'lstm_model.pkl')
 _SCALER_PATH = os.path.join(_MODEL_DIR, 'scaler.pkl')
+_RF_PATH     = os.path.join(_MODEL_DIR, 'rf_model.pkl')
 _META_PATH   = os.path.join(_MODEL_DIR, 'training_metadata.pkl')
 _FEATURE_DIM = 22
+
+# Only train on setups scoring >= this value. Weak setups (~50% win rate) dilute training.
+TRAINING_MIN_QUALITY_SCORE = 50
 
 
 class MLEnsemble:
@@ -34,6 +38,7 @@ class MLEnsemble:
         self.mt5            = mt5_connector
         self.xgboost_model  = None
         self.lstm_model     = None
+        self.rf_model = None
         self.scaler         = StandardScaler()
         self.models_trained = False
         self.training_metadata: Dict = {}
@@ -75,13 +80,22 @@ class MLEnsemble:
             with open(_XGB_PATH,    'rb') as f: self.xgboost_model = pickle.load(f)
             with open(_LSTM_PATH,   'rb') as f: self.lstm_model    = pickle.load(f)
             with open(_SCALER_PATH, 'rb') as f: self.scaler        = pickle.load(f)
+            # RF model is optional for backward compatibility with older model bundles.
+            if os.path.exists(_RF_PATH):
+                with open(_RF_PATH, 'rb') as f:
+                    self.rf_model = pickle.load(f)
+            else:
+                self.rf_model = None
+                self.logger.info(
+                    "RF model file not found. Using 2-model ensemble (XGBoost + LSTM).")
             if os.path.exists(_META_PATH):
                 with open(_META_PATH, 'rb') as f: self.training_metadata = pickle.load(f)
             self.models_trained = True
             self.logger.info(
-                "Trained models loaded. Samples: %s. XGBoost accuracy: %s.",
+                "Trained models loaded. Samples: %s. XGBoost accuracy: %s. RF loaded: %s.",
                 self.training_metadata.get('samples', 'N/A'),
-                self.training_metadata.get('xgboost_accuracy', 'N/A'))
+                self.training_metadata.get('xgboost_accuracy', 'N/A'),
+                self.rf_model is not None)
             return True
         except Exception as e:
             self.logger.error("Failed to load models from disk: %s", e)
@@ -93,6 +107,11 @@ class MLEnsemble:
             with open(_XGB_PATH,    'wb') as f: pickle.dump(self.xgboost_model,    f)
             with open(_LSTM_PATH,   'wb') as f: pickle.dump(self.lstm_model,        f)
             with open(_SCALER_PATH, 'wb') as f: pickle.dump(self.scaler,            f)
+            if self.rf_model is not None:
+                with open(_RF_PATH, 'wb') as f: pickle.dump(self.rf_model, f)
+            elif os.path.exists(_RF_PATH):
+                # Avoid loading stale RF artifacts that no longer match current scaler/data.
+                os.remove(_RF_PATH)
             with open(_META_PATH,   'wb') as f: pickle.dump(self.training_metadata, f)
             self.logger.info("Models saved to disk at %s", _MODEL_DIR)
             return True
@@ -101,6 +120,52 @@ class MLEnsemble:
             return False
 
     # ==================== HISTORICAL TRAINING ====================
+
+    @staticmethod
+    def _candles_to_df(raw: List[dict]) -> pd.DataFrame:
+        """
+        Convert MT5 candle payload to a UTC-indexed DataFrame.
+        MT5 worker returns Unix timestamps in seconds.
+        """
+        df = pd.DataFrame(raw)
+        if 'time' not in df.columns:
+            raise ValueError("Candle payload missing 'time' field.")
+
+        ts_num = pd.to_numeric(df['time'], errors='coerce')
+        if ts_num.notna().sum() >= max(1, int(len(df) * 0.8)):
+            df['time'] = pd.to_datetime(ts_num, unit='s', utc=True, errors='coerce')
+        else:
+            df['time'] = pd.to_datetime(df['time'], utc=True, errors='coerce')
+
+        df.dropna(subset=['time'], inplace=True)
+        if df.empty:
+            raise ValueError("No valid candle timestamps after parsing.")
+
+        df.set_index('time', inplace=True)
+        df.sort_index(inplace=True)
+        return df
+
+    @staticmethod
+    def _estimate_fetch_bars(start_date: str, end_date: str) -> Tuple[int, int, int]:
+        """
+        Estimate bars needed per timeframe from a date range.
+        Adds warm-up/lookahead buffers and caps values to practical worker limits.
+        """
+        try:
+            start_ts = pd.to_datetime(start_date, utc=True, errors='raise')
+            end_ts = pd.to_datetime(end_date, utc=True, errors='raise')
+            if end_ts < start_ts:
+                start_ts, end_ts = end_ts, start_ts
+            total_days = max(int((end_ts - start_ts).total_seconds() // 86400) + 1, 1)
+        except Exception:
+            # Fallback to ~2 years if date parsing fails.
+            total_days = 730
+
+        # M15 needs larger buffers for rolling windows and forward labeling.
+        m15_bars = min(max(total_days * 96 + 500, 2000), 50000)
+        h1_bars = min(max(total_days * 24 + 300, 1000), 20000)
+        d1_bars = min(max(total_days + 60, 300), 5000)
+        return m15_bars, h1_bars, d1_bars
 
     def train_on_historical_data(
         self,
@@ -129,17 +194,22 @@ class MLEnsemble:
             "Starting historical training on %d symbols using SMC strategy. "
             "Period: %s to %s.", len(symbols), start_date, end_date)
 
+        m15_bars, h1_bars, d1_bars = self._estimate_fetch_bars(start_date, end_date)
+        self.logger.info(
+            "Historical fetch plan per symbol: M15=%d H1=%d D1=%d bars "
+            "(derived from requested period).",
+            m15_bars, h1_bars, d1_bars
+        )
+
         all_features: List[np.ndarray] = []
         all_labels:   List[float]      = []
 
         for symbol in symbols:
             self.logger.info("Fetching data for %s ...", symbol)
             try:
-                # Fetch within broker limits. Most brokers allow 10,000-50,000
-                # bars per request. 50,000 M15 bars = ~2 years of data.
-                m15_raw = self.mt5.get_historical_data(symbol, 'M15', bars=50000)
-                h1_raw  = self.mt5.get_historical_data(symbol, 'H1',  bars=10000)
-                d1_raw  = self.mt5.get_historical_data(symbol, 'D1',  bars=1500)
+                m15_raw = self.mt5.get_historical_data(symbol, 'M15', bars=m15_bars)
+                h1_raw  = self.mt5.get_historical_data(symbol, 'H1',  bars=h1_bars)
+                d1_raw  = self.mt5.get_historical_data(symbol, 'D1',  bars=d1_bars)
 
                 if not m15_raw or len(m15_raw) < 500:
                     self.logger.warning(
@@ -147,15 +217,12 @@ class MLEnsemble:
                         symbol, len(m15_raw) if m15_raw else 0)
                     continue
 
-                def to_df(raw):
-                    df = pd.DataFrame(raw)
-                    df['time'] = pd.to_datetime(df['time'])
-                    df.set_index('time', inplace=True)
-                    df.sort_index(inplace=True)
-                    return df
-
                 feats, labels = self._generate_training_samples(
-                    symbol, to_df(m15_raw), to_df(h1_raw), to_df(d1_raw))
+                    symbol,
+                    self._candles_to_df(m15_raw),
+                    self._candles_to_df(h1_raw),
+                    self._candles_to_df(d1_raw),
+                )
                 self.logger.info(
                     "%s: %d labeled samples from %d M15 bars.",
                     symbol, len(feats), len(m15_raw))
@@ -178,7 +245,7 @@ class MLEnsemble:
             "Total training samples: %d. Win rate in data: %.1f%%.",
             len(X), y.mean() * 100)
 
-        success = self._train_both_models(X, y)
+        success = self._train_all_models(X, y)
         if success:
             seed_n = min(len(all_features), self.max_history_size // 2)
             for f, l in zip(all_features[-seed_n:], all_labels[-seed_n:]):
@@ -206,13 +273,30 @@ class MLEnsemble:
         """
         feats:  List[np.ndarray] = []
         labels: List[float]      = []
-        window_size  = 100    # M15 bars of context per window
-        forward_bars = 40     # Bars to look ahead for labeling
-        step         = 15     # Step between windows (larger = faster training)
+        window_size  = 100
+        forward_bars = 80
+        step         = 40     # Reduced from 60 to generate more samples
+
+        # Diagnostic counters - logged at end so you know where samples are lost
+        _cnt_total       = 0
+        _cnt_asian       = 0
+        _cnt_no_ctx      = 0
+        _cnt_ranging     = 0
+        _cnt_no_poi      = 0
+        _cnt_bad_entry   = 0
+        _cnt_low_quality = 0
+        _cnt_no_label    = 0
+        _cnt_labeled     = 0
 
         try:
             for i in range(window_size, len(m15_df) - forward_bars, step):
                 cur_time = m15_df.index[i]
+                
+                # Skip Asian session windows - they produce low-quality training samples
+                utc_hour = cur_time.hour if hasattr(cur_time, 'hour') else 12
+                if utc_hour >= 22 or utc_hour < 7:
+                    _cnt_asian += 1
+                    continue
 
                 # Build time-bounded context slices
                 d1_ctx = d1_df[d1_df.index <= cur_time].tail(50)
@@ -220,15 +304,20 @@ class MLEnsemble:
                 m15_win = m15_df.iloc[i - window_size: i].copy()
 
                 if len(d1_ctx) < 20 or len(h1_ctx) < 50 or len(m15_win) < window_size:
+                    _cnt_no_ctx += 1
                     continue
+
+                _cnt_total += 1
 
                 # --- Phase 1: HTF trend (D1) via real SMC ---
                 try:
                     htf_trend = self.smc.determine_htf_trend(d1_ctx)
-                except Exception:
+                except Exception as _e:
+                    self.logger.debug("HTF trend error at window %d: %s", i, _e)
                     continue
 
                 if htf_trend.get('trend') == 'RANGING':
+                    _cnt_ranging += 1
                     continue
 
                 direction  = htf_trend['trend']  # 'BULLISH' or 'BEARISH'
@@ -237,6 +326,7 @@ class MLEnsemble:
                 # --- Phase 2: Structure detection (H1) via real SMC ---
                 setup_type = None
                 poi        = None
+                bos_events = []
 
                 try:
                     bos_events = self.smc.detect_break_of_structure(h1_ctx, smc_dir)
@@ -245,46 +335,81 @@ class MLEnsemble:
                     if len(bos_events) >= 2:
                         setup_type = 'BOS'
                         breakers   = self.smc.detect_breaker_blocks(
-                            h1_ctx, smc_dir,
-                            htf_trend.get('swing_high', 0),
-                            htf_trend.get('swing_low', 0))
+                            h1_ctx,
+                            smc_dir,
+                            float(htf_trend.get('swing_high', 0)),
+                            float(htf_trend.get('swing_low', 0)),
+                        )
                         if breakers:
                             poi = breakers[0]
                         else:
-                            # Fall back to Order Block if no breaker found
                             obs = self.smc.detect_order_blocks(h1_ctx, smc_dir)
                             if obs:
                                 poi = obs[0]
+
                     elif mss_event:
                         setup_type = 'MSS'
-                        obs = self.smc.detect_order_blocks(h1_ctx, smc_dir)
+                        obs        = self.smc.detect_order_blocks(
+                            h1_ctx, mss_event.get('direction', smc_dir))
                         if obs:
                             poi = obs[0]
-                except Exception:
+                except Exception as _e:
+                    self.logger.debug("Structure detection error at window %d: %s", i, _e)
                     continue
 
                 if poi is None or setup_type is None:
+                    _cnt_no_poi += 1
                     continue
-
+                
                 # --- Phase 3: Entry/SL via real SMC ---
                 try:
                     atr_val    = self.smc._calculate_atr(m15_win.tail(20))
-                    entry_cfg  = self.smc.calculate_entry_price(poi, 'STANDARD', 60)
+                    entry_cfg  = self.smc.calculate_entry_price(
+                        poi,
+                        'UNICORN' if str(poi.get('type', '')).upper() == 'UNICORN' else 'STANDARD',
+                        75,
+                    )
                     sl_cfg     = self.smc.calculate_stop_loss(
-                        poi, smc_dir, symbol, atr_val)
+                        poi,
+                        'BUY' if direction == 'BULLISH' else 'SELL',
+                        symbol,
+                        atr_val,
+                    )
                     entry      = float(entry_cfg['entry_price'])
                     sl         = float(sl_cfg['stop_loss'])
-                except Exception:
+
+                    if direction == 'BULLISH' and sl >= entry:
+                        _cnt_bad_entry += 1
+                        continue
+                    if direction == 'BEARISH' and sl <= entry:
+                        _cnt_bad_entry += 1
+                        continue
+                except Exception as _e:
+                    self.logger.debug("Entry/SL error at window %d: %s", i, _e)
                     continue
 
                 risk = abs(entry - sl)
                 if risk < 1e-9:
+                    _cnt_bad_entry += 1
+                    continue
+                
+                # Quality pre-filter: discard low-quality setups before labeling.
+                # These setups have ~50% win rate and add noise to training data.
+                try:
+                    quality_score = self.smc.score_setup_quality(
+                        m15_win, poi, htf_trend, bos_events, direction, symbol)
+                except Exception:
+                    quality_score = 0
+
+                if quality_score < TRAINING_MIN_QUALITY_SCORE:
+                    _cnt_low_quality += 1
                     continue
 
                 # --- Phase 4: Feature extraction (exact same fn as live) ---
                 try:
                     f = self.extract_features(m15_win, poi, htf_trend, setup_type)
-                except Exception:
+                except Exception as _e:
+                    self.logger.debug("Feature extraction error at window %d: %s", i, _e)
                     continue
 
                 # --- Phase 5: Label WIN/LOSS from future bars ---
@@ -292,7 +417,7 @@ class MLEnsemble:
                 if len(future) < forward_bars:
                     continue
 
-                target_reward = risk * 2.0   # 1:2 RR target
+                target_reward = risk * 2.5   # 1:2.5 RR target
                 is_buy = direction == 'BULLISH'
 
                 if is_buy:
@@ -307,29 +432,53 @@ class MLEnsemble:
                 elif knocked:
                     label = 0.0
                 else:
-                    continue   # Inconclusive - discard
+                    _cnt_no_label += 1
+                    continue
 
+                _cnt_labeled += 1
                 feats.append(f)
                 labels.append(label)
 
         except Exception as e:
             self.logger.error("Sample generation error for %s: %s", symbol, e)
 
+        self.logger.info(
+            "%s sample generation summary: "
+            "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
+            "bad_entry=%d  low_quality=%d  inconclusive=%d  labeled=%d",
+            symbol,
+            _cnt_total, _cnt_asian, _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
+            _cnt_bad_entry, _cnt_low_quality, _cnt_no_label, _cnt_labeled
+        )
+
         return feats, labels
 
     # ==================== MODEL TRAINING ====================
 
-    def _train_both_models(self, X: np.ndarray, y: np.ndarray) -> bool:
+    def _train_all_models(self, X: np.ndarray, y: np.ndarray) -> bool:
         try:
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y)
-            self.scaler  = StandardScaler()
+            # Chronological split: first 80% = train, last 20% = test.
+            # Random split causes look-ahead bias on time-series data.
+            split_idx    = int(len(X) * 0.8)
+            X_tr, X_te   = X[:split_idx], X[split_idx:]
+            y_tr, y_te   = y[:split_idx], y[split_idx:]
+
+            self.logger.info(
+                "Chronological split: Train=%d Test=%d. "
+                "Train win rate: %.1f%%. Test win rate: %.1f%%.",
+                len(X_tr), len(X_te), y_tr.mean() * 100, y_te.mean() * 100)
+
+            self.scaler = StandardScaler()
             X_tr_s = self.scaler.fit_transform(X_tr)
             X_te_s = self.scaler.transform(X_te)
-            ok1    = self._fit_xgboost(X_tr_s, y_tr, X_te_s, y_te)
-            ok2    = self._fit_lstm_sub(X_tr_s, y_tr, X_te_s, y_te)
+
+            ok1 = self._fit_xgboost(X_tr_s, y_tr, X_te_s, y_te)
+            ok2 = self._fit_lstm_sub(X_tr_s, y_tr, X_te_s, y_te)
+            ok3 = self._fit_random_forest(X_tr_s, y_tr, X_te_s, y_te)
+
             if not (ok1 and ok2):
                 return False
+
             self.models_trained = True
             return self._save_to_disk()
         except Exception as e:
@@ -398,6 +547,41 @@ class MLEnsemble:
         except Exception as e:
             self.logger.error("LSTM substitute training failed: %s", e)
             return False
+        
+        
+    def _fit_random_forest(self, X_tr, y_tr, X_te, y_te) -> bool:
+        """
+        RandomForestClassifier - third ensemble model.
+        Provides genuine diversity vs the two boosting models.
+        Non-fatal if it fails: ensemble falls back to XGB + GBC.
+        """
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            self.rf_model = RandomForestClassifier(
+                n_estimators=300,
+                max_depth=8,
+                min_samples_leaf=15,
+                min_samples_split=30,
+                max_features='sqrt',
+                class_weight='balanced',
+                n_jobs=-1,
+                random_state=77)
+            self.rf_model.fit(X_tr, y_tr)
+            y_prob = self.rf_model.predict_proba(X_te)[:, 1]
+            acc    = accuracy_score(y_te, (y_prob > 0.5).astype(int))
+            auc    = roc_auc_score(y_te, y_prob)
+            self.logger.info(
+                "RandomForest training complete. Accuracy: %.1f%%  AUC: %.3f",
+                acc * 100, auc)
+            self.training_metadata.update({
+                'rf_accuracy': f"{acc * 100:.1f}%",
+                'rf_auc':      f"{auc:.3f}",
+            })
+            return True
+        except Exception as e:
+            self.logger.error("RandomForest training failed (non-critical): %s", e)
+            self.rf_model = None
+            return True  # Non-fatal
 
     # ==================== LIVE AUTO-RETRAIN ====================
 
@@ -427,7 +611,7 @@ class MLEnsemble:
             X = np.array([h[0] for h in self.training_data_history], dtype=np.float32)
             y = np.array([h[1] for h in self.training_data_history], dtype=np.float32)
             if len(X) >= 200:
-                success = self._train_both_models(X, y)
+                success = self._train_all_models(X, y)
                 if success:
                     self.logger.info(
                         "Auto-retrain complete. Total samples: %d.", len(X))
@@ -568,6 +752,9 @@ class MLEnsemble:
                 is_ob, is_bb, is_fvg, is_bos, body_r, cpoi,
                 ema_ok, cnt / 10.0,
             ], dtype=np.float32)
+            assert len(f) == _FEATURE_DIM, (
+                f"Feature vector length {len(f)} does not match _FEATURE_DIM {_FEATURE_DIM}. "
+                "Update _FEATURE_DIM or fix extract_features.")
             return np.nan_to_num(f, nan=0.0, posinf=1.0, neginf=0.0)
 
         except Exception as e:
@@ -615,18 +802,39 @@ class MLEnsemble:
             features  = self.extract_features(data, poi, htf_trend, setup_type)
             lstm_s    = self.predict_lstm(data, poi, htf_trend, setup_type)
             xgb_s     = self.predict_xgboost(data, poi, htf_trend, setup_type)
-            consensus = int(lstm_s * 0.4 + xgb_s * 0.6)
+
+            # Include Random Forest if available. Weights: XGB 50%, LSTM 30%, RF 20%.
+            # Falls back to XGB 60% / LSTM 40% if RF model not trained.
+            rf_s = None
+            if self.models_trained and self.rf_model is not None:
+                try:
+                    f_s  = self.scaler.transform(features.reshape(1, -1))
+                    rf_s = int(self.rf_model.predict_proba(f_s)[0][1] * 100)
+                except Exception as rf_err:
+                    self.logger.debug("RF prediction skipped: %s", rf_err)
+
+            if rf_s is not None:
+                consensus = int(xgb_s * 0.50 + lstm_s * 0.30 + rf_s * 0.20)
+            else:
+                consensus = int(lstm_s * 0.40 + xgb_s * 0.60)
+
             diff      = abs(lstm_s - xgb_s)
             agreement = 'STRONG' if diff <= 10 else ('MODERATE' if diff <= 20 else 'WEAK')
             self.logger.info(
-                "Ensemble: LSTM=%d%%  XGBoost=%d%%  Consensus=%d%%  "
+                "Ensemble: LSTM=%d%%  XGBoost=%d%%  RF=%s%%  Consensus=%d%%  "
                 "Agreement=%s  Trained: %s",
-                lstm_s, xgb_s, consensus, agreement, self.models_trained)
+                lstm_s, xgb_s, rf_s if rf_s is not None else 'N/A',
+                consensus, agreement, self.models_trained)
             return {
-                'lstm_score': lstm_s, 'xgboost_score': xgb_s,
-                'consensus_score': consensus, 'agreement': agreement,
-                'direction': poi.get('direction', 'BULLISH'), 'features': features,
+                'lstm_score':    lstm_s,
+                'xgboost_score': xgb_s,
+                'rf_score':      rf_s,
+                'consensus_score': consensus,
+                'agreement':     agreement,
+                'direction':     poi.get('direction', 'BULLISH'),
+                'features':      features,
             }
+            
         except Exception as e:
             self.logger.error("Ensemble prediction error: %s", e)
             return {
@@ -658,7 +866,9 @@ class MLEnsemble:
             'status_text':      'Trained ML models active (trained on SMC strategy data).',
             'xgboost_accuracy': self.training_metadata.get('xgboost_accuracy', 'N/A'),
             'lstm_accuracy':    self.training_metadata.get('lstm_accuracy',    'N/A'),
+            'rf_accuracy':      self.training_metadata.get('rf_accuracy',      'N/A'),
             'xgboost_auc':      self.training_metadata.get('xgboost_auc',      'N/A'),
+            'rf_loaded':        self.rf_model is not None,
             'training_date':    self.training_metadata.get('trained_at',       'Unknown'),
             'samples':          self.training_metadata.get('samples',           0),
             'live_outcomes_since_last_retrain': self.setups_since_training,

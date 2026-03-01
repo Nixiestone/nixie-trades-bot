@@ -1,11 +1,12 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Bot
 from telegram.error import Forbidden, NetworkError
 
@@ -26,9 +27,11 @@ _TELEGRAM_SEND_DELAY = 0.04   # seconds between each bot.send_message call
 
 class NixTradesScheduler:
     """
-    Runs two recurring background tasks:
+    Runs recurring background tasks:
       - Daily 8 AM UTC market overview with news summary
-      - Market scan every 15 minutes for new SMC setups
+      - Market scan on configured interval for new SMC setups
+      - Per-user timed alerts in each user's local timezone
+      - Periodic news cache refresh
     """
 
     def __init__(
@@ -50,7 +53,48 @@ class NixTradesScheduler:
 
         self.scheduler = AsyncIOScheduler()
         self.running   = False
+
+        # Tracks which users already received each message today.
+        # Format: "YYYY-MM-DD" -> set of telegram_ids
+        self._briefing_sent: dict = {}
+        self._news_sent:     dict = {}
+        self._weekly_sent:   dict = {}
+
+        self.market_scan_interval_minutes = max(
+            1, int(getattr(config, 'MARKET_SCAN_INTERVAL_MINUTES', 15))
+        )
+        self.alert_check_interval_minutes = max(
+            1, int(getattr(config, 'ALERT_CHECK_INTERVAL_MINUTES', 5))
+        )
+        self.news_update_interval_minutes = max(
+            5, int(getattr(config, 'NEWS_UPDATE_INTERVAL_MINUTES', 120))
+        )
+
         self.logger.info("Scheduler initialised.")
+
+    @staticmethod
+    def _candles_to_df(raw: List[dict]) -> pd.DataFrame:
+        """
+        Convert MT5 candle payload to a UTC-indexed DataFrame.
+        MT5 worker returns Unix timestamps in seconds.
+        """
+        df = pd.DataFrame(raw)
+        if 'time' not in df.columns:
+            raise ValueError("Candle payload missing 'time' field.")
+
+        ts_num = pd.to_numeric(df['time'], errors='coerce')
+        if ts_num.notna().sum() >= max(1, int(len(df) * 0.8)):
+            df['time'] = pd.to_datetime(ts_num, unit='s', utc=True, errors='coerce')
+        else:
+            df['time'] = pd.to_datetime(df['time'], utc=True, errors='coerce')
+
+        df.dropna(subset=['time'], inplace=True)
+        if df.empty:
+            raise ValueError("No valid candle timestamps after parsing.")
+
+        df.set_index('time', inplace=True)
+        df.sort_index(inplace=True)
+        return df
 
     # ==================== LIFECYCLE ====================
 
@@ -63,19 +107,66 @@ class NixTradesScheduler:
                 id='daily_alert',
                 name='Daily 8 AM Market Overview',
                 replace_existing=True,
+                misfire_grace_time=3600,
+                coalesce=True,
+                max_instances=1,
             )
             self.scheduler.add_job(
                 self.scan_markets,
-                CronTrigger(minute='*/15', timezone='UTC'),
+                IntervalTrigger(
+                    minutes=self.market_scan_interval_minutes,
+                    timezone='UTC',
+                ),
                 id='market_scan',
-                name='Market Scan Every 15 Minutes',
+                name='Market Scan',
                 replace_existing=True,
+                misfire_grace_time=max(60, self.market_scan_interval_minutes * 120),
+                coalesce=True,
+                max_instances=1,
             )
+
+            # Per-user timezone dispatcher — checks every 5 minutes
+            # and sends the 06:30 briefing, 08:00 news, Sunday 09:00 weekly
+            # to each user at the right time in their own timezone.
+            self.scheduler.add_job(
+                self._timed_messages,
+                IntervalTrigger(
+                    minutes=self.alert_check_interval_minutes,
+                    timezone='UTC',
+                ),
+                id='timed_messages',
+                name='Per-User Timed Message Dispatcher',
+                replace_existing=True,
+                misfire_grace_time=max(60, self.alert_check_interval_minutes * 120),
+                coalesce=True,
+                max_instances=1,
+            )
+
+            self.scheduler.add_job(
+                self._refresh_news_cache,
+                IntervalTrigger(
+                    minutes=self.news_update_interval_minutes,
+                    timezone='UTC',
+                ),
+                id='news_refresh',
+                name='News Cache Refresh',
+                replace_existing=True,
+                misfire_grace_time=max(120, self.news_update_interval_minutes * 120),
+                coalesce=True,
+                max_instances=1,
+            )
+
             self.scheduler.start()
             self.running = True
             self.logger.info(
-                "Scheduler started. Daily alert: 08:00 UTC. "
-                "Market scan: every 15 minutes.")
+                "Scheduler started.\n"
+                "  Per-user alerts (6:30 AM briefing, 8:00 AM news, Sunday analysis): checked every %d minutes.\n"
+                "  Market scan: every %d minutes.\n"
+                "  News cache refresh: every %d minutes.",
+                self.alert_check_interval_minutes,
+                self.market_scan_interval_minutes,
+                self.news_update_interval_minutes,
+            )
         except Exception as e:
             self.logger.error("Failed to start scheduler: %s", e)
 
@@ -112,7 +203,7 @@ class NixTradesScheduler:
                 f"{market_overview}\n\n"
                 f"HIGH-IMPACT NEWS TODAY:\n"
                 f"{news_summary}\n\n"
-                f"The system scans all pairs every 15 minutes. "
+                f"The system scans all pairs every {self.market_scan_interval_minutes} minutes. "
                 f"Qualifying setups will be sent automatically when detected.\n\n"
                 f"{config.FOOTER}"
             )
@@ -143,10 +234,30 @@ class NixTradesScheduler:
         except Exception as e:
             self.logger.error("Fatal error in daily_alert: %s", e, exc_info=True)
 
+    async def _refresh_news_cache(self):
+        """Periodically prefetch news windows used by scans and alerts."""
+        try:
+            loop = asyncio.get_running_loop()
+            windows = (2, 24, 168)
+            counts = {}
+            for hours in windows:
+                events = await loop.run_in_executor(
+                    None, self.news.get_red_folder_events, hours
+                )
+                counts[hours] = len(events) if events else 0
+            self.logger.info(
+                "News cache refreshed: 2h=%d 24h=%d 168h=%d",
+                counts.get(2, 0),
+                counts.get(24, 0),
+                counts.get(168, 0),
+            )
+        except Exception as e:
+            self.logger.error("News cache refresh failed: %s", e)
+
     # ==================== MARKET SCAN ====================
 
     async def scan_markets(self):
-        """Scan all monitored symbols every 15 minutes for qualifying setups."""
+        """Scan all monitored symbols on the configured scheduler interval."""
         try:
             self.logger.info("Starting market scan.")
             if not self.mt5.is_worker_reachable():
@@ -175,6 +286,14 @@ class NixTradesScheduler:
         Phase 4: Entry/SL/TP calculation and broadcast
         """
         try:
+            # Bail immediately if the MT5 worker is offline.
+            # Without this, the scan blocks for 10+ minutes per symbol
+            # retrying 4 times per timeframe with no worker available.
+            if not self.mt5.is_worker_reachable():
+                self.logger.debug(
+                    "MT5 worker not reachable. Skipping %s.", symbol)
+                return
+
             # Check news blackout window before doing any analysis
             is_blackout, news_event = self.news.check_news_blackout(symbol)
             if is_blackout:
@@ -185,10 +304,13 @@ class NixTradesScheduler:
                     getattr(news_event, 'title', ''))
                 return
 
-            # Avoid duplicate setups within the last 15 minutes
-            if db.recent_signal_exists(symbol, minutes=15):
+            # Avoid duplicate setups within one market-scan interval.
+            if db.recent_signal_exists(symbol, minutes=self.market_scan_interval_minutes):
                 self.logger.debug(
-                    "Skipping %s: setup already generated in last 15 minutes.", symbol)
+                    "Skipping %s: setup already generated in the last %d minutes.",
+                    symbol,
+                    self.market_scan_interval_minutes,
+                )
                 return
 
             # Fetch multi-timeframe data
@@ -211,18 +333,11 @@ class NixTradesScheduler:
                 self.logger.debug("Insufficient M15 data for %s. Skipping.", symbol)
                 return
 
-            def to_df(raw):
-                df = pd.DataFrame(raw)
-                df['time'] = pd.to_datetime(df['time'])
-                df.set_index('time', inplace=True)
-                df.sort_index(inplace=True)
-                return df
-
-            d1_df  = to_df(d1_raw)
-            h4_df  = to_df(h4_raw)  if h4_raw  else None
-            h1_df  = to_df(h1_raw)
-            m15_df = to_df(m15_raw)
-            m5_df  = to_df(m5_raw)  if m5_raw  else None
+            d1_df  = self._candles_to_df(d1_raw)
+            h4_df  = self._candles_to_df(h4_raw) if h4_raw else None
+            h1_df  = self._candles_to_df(h1_raw)
+            m15_df = self._candles_to_df(m15_raw)
+            m5_df  = self._candles_to_df(m5_raw) if m5_raw else None
 
             # Phase 1: HTF trend context (D1)
             htf_trend = self.smc.determine_htf_trend(d1_df)
@@ -300,6 +415,7 @@ class NixTradesScheduler:
                     if m5_obs:
                         poi_high = float(poi.get('high', entry_cfg['entry_price']))
                         poi_low  = float(poi.get('low',  entry_cfg['entry_price']))
+                        candidates = []
                         for m5_ob in m5_obs[:3]:
                             m5_entry_candidate = (
                                 m5_ob.get('low', entry_cfg['entry_price'])
@@ -307,13 +423,19 @@ class NixTradesScheduler:
                                 else m5_ob.get('high', entry_cfg['entry_price'])
                             )
                             if poi_low <= m5_entry_candidate <= poi_high:
-                                self.logger.info(
-                                    "M5 refinement for %s: entry %s -> %s",
-                                    symbol,
-                                    entry_cfg['entry_price'],
-                                    round(m5_entry_candidate, 5))
-                                entry_cfg['entry_price'] = round(m5_entry_candidate, 5)
-                                break
+                                candidates.append(float(m5_entry_candidate))
+                        if candidates:
+                            best_candidate = (
+                                min(candidates)
+                                if poi['direction'] == 'BULLISH'
+                                else max(candidates)
+                            )
+                            self.logger.info(
+                                "M5 refinement for %s: entry %s -> %s",
+                                symbol,
+                                entry_cfg['entry_price'],
+                                round(best_candidate, 5))
+                            entry_cfg['entry_price'] = round(best_candidate, 5)
                 except Exception as m5_err:
                     self.logger.debug(
                         "M5 refinement skipped for %s: %s", symbol, m5_err)
@@ -337,16 +459,23 @@ class NixTradesScheduler:
             next_news = self.news.get_next_high_impact(symbol)
             news_warn = ''
             if next_news:
-                mins = int((next_news.timestamp - datetime.utcnow()).total_seconds() / 60)
+                event_ts = next_news.timestamp
+                if event_ts.tzinfo is None:
+                    event_ts = event_ts.replace(tzinfo=timezone.utc)
+                mins = int((event_ts - datetime.now(timezone.utc)).total_seconds() / 60)
                 if 0 < mins <= 240:
                     news_warn = (
                         f"Note: {next_news.currency} {next_news.title} "
                         f"scheduled in {mins} minutes. Exercise caution.")
 
+            setup_tier  = 'UNICORN' if tier == 'PREMIUM' else 'STANDARD'
+            setup_label = f"{setup_tier} {setup_type}"
+
             setup_data = {
                 'symbol':        symbol,
                 'direction':     'BUY' if poi['direction'] == 'BULLISH' else 'SELL',
-                'setup_type':    f"{'Unicorn' if tier == 'PREMIUM' else 'Standard'} {setup_type}",
+                'setup_type':    setup_tier,
+                'setup_label':   setup_label,
                 'entry_price':   entry_cfg['entry_price'],
                 'stop_loss':     sl_cfg['stop_loss'],
                 'take_profit_1': tp_cfg['tp1'],
@@ -407,21 +536,78 @@ class NixTradesScheduler:
     def _check_filters(
         self, symbol: str, data: pd.DataFrame, htf_trend: dict, poi: dict
     ) -> bool:
-        """Run ATR volatility and session filters before broadcasting."""
+        """
+        Run all 5 filters before broadcasting a setup.
+        Filter 1: ATR volatility
+        Filter 2: Session
+        Filter 3: ADX trend strength (was coded in smc_strategy but never called here)
+        Filter 4: Premium/discount zone (was coded in smc_strategy but never called here)
+        Filter 5: Composite setup quality score
+        """
         try:
-            atr = self.smc._calculate_atr(data.tail(20))
+            direction = poi.get('direction', 'BULLISH')
+
+            # Filter 1: ATR volatility
+            atr     = self.smc._calculate_atr(data.tail(20))
             atr_avg = float(data.tail(40)['close'].diff().abs().mean())
             pass_atr, reason = self.smc.check_atr_filter(atr, atr_avg)
             if not pass_atr:
                 self.logger.debug("%s failed ATR filter: %s", symbol, reason)
                 return False
 
+            # Filter 2: Session
             pass_session, reason = self.smc.check_session_filter(datetime.utcnow())
             if not pass_session:
                 self.logger.debug("%s failed session filter: %s", symbol, reason)
                 return False
 
+            # Filter 3: ADX - reject ranging markets at entry timeframe
+            adx_data = data.tail(60)
+            if len(adx_data) >= 33:
+                pass_adx, adx_val, reason_adx = self.smc.check_adx_filter(adx_data)
+                if not pass_adx:
+                    self.logger.debug(
+                        "%s failed ADX filter: %s (ADX=%.1f)", symbol, reason_adx, adx_val)
+                    return False
+
+            # Filter 4: Premium/discount zone
+            swing_high    = float(htf_trend.get('swing_high', 0))
+            swing_low     = float(htf_trend.get('swing_low',  0))
+            current_price = float(data.iloc[-1]['close'])
+            if swing_high > swing_low > 0:
+                in_zone, zone_pos, zone_desc = self.smc.detect_premium_discount_zone(
+                    current_price, swing_high, swing_low, direction)
+                if not in_zone:
+                    self.logger.debug(
+                        "%s failed zone filter: %s", symbol, zone_desc)
+                    return False
+                if direction == 'BULLISH' and zone_pos > 0.45:
+                    self.logger.debug(
+                        "%s failed sniper depth filter: bullish zone %.2f > 0.45",
+                        symbol, zone_pos)
+                    return False
+                if direction == 'BEARISH' and zone_pos < 0.55:
+                    self.logger.debug(
+                        "%s failed sniper depth filter: bearish zone %.2f < 0.55",
+                        symbol, zone_pos)
+                    return False
+
+            # Filter 5: Composite setup quality score
+            try:
+                bos_events = self.smc.detect_break_of_structure(
+                    data.tail(50), htf_trend.get('trend', 'BULLISH'))
+                quality = self.smc.score_setup_quality(
+                    data, poi, htf_trend, bos_events, direction, symbol)
+                if quality < 60:
+                    self.logger.debug(
+                        "%s failed quality filter: score %d < 60", symbol, quality)
+                    return False
+            except Exception as qe:
+                self.logger.warning(
+                    "Quality score failed for %s (%s). Continuing without it.", symbol, qe)
+
             return True
+
         except Exception as e:
             self.logger.error("Filter check error for %s: %s", symbol, e)
             return False
@@ -490,7 +676,7 @@ class NixTradesScheduler:
                         signal_number=signal_num,
                         symbol=setup_data['symbol'],
                         direction=setup_data['direction'],
-                        setup_type=setup_data['setup_type'],
+                        setup_type=setup_data.get('setup_label', setup_data['setup_type']),
                         entry_price=setup_data['entry_price'],
                         stop_loss=setup_data['stop_loss'],
                         take_profit_1=setup_data['take_profit_1'],
@@ -594,7 +780,10 @@ class NixTradesScheduler:
             direction = setup_data['direction']
 
             # Check daily loss limit before executing
-            daily_loss = db.get_daily_loss_percent(tid)
+            day_start_utc = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            daily_loss = db.get_daily_loss_percent(tid, since=day_start_utc)
             if daily_loss is not None and daily_loss >= config.MAX_DAILY_LOSS_PERCENT:
                 self.logger.warning(
                     "User %d has reached daily loss limit (%.1f%%). "
@@ -622,7 +811,6 @@ class NixTradesScheduler:
                 take_profit=setup_data['take_profit_1'],   # Initial TP is TP1
                 order_type=order_type,
                 comment='Nix Trades Auto',
-                magic_number=config.MAGIC_NUMBER,
             )
 
             if success and ticket:
@@ -651,15 +839,16 @@ class NixTradesScheduler:
                 db.save_trade(
                     telegram_id=tid,
                     signal_id=setup_data.get('signal_number'),
-                    mt5_ticket=ticket,
                     symbol=symbol,
                     direction=direction,
                     lot_size=lot_size,
                     entry_price=entry,
+                    fill_price=entry,
                     stop_loss=setup_data['stop_loss'],
                     take_profit_1=setup_data['take_profit_1'],
                     take_profit_2=setup_data['take_profit_2'],
                     order_type=order_type,
+                    ticket=ticket,
                 )
             else:
                 self.logger.error(
@@ -689,10 +878,7 @@ class NixTradesScheduler:
                     raw = self.mt5.get_historical_data(symbol, 'D1', bars=50)
                     if not raw:
                         continue
-                    df = pd.DataFrame(raw)
-                    df['time'] = pd.to_datetime(df['time'])
-                    df.set_index('time', inplace=True)
-                    df.sort_index(inplace=True)
+                    df = self._candles_to_df(raw)
 
                     htf = self.smc.determine_htf_trend(df)
                     trend = htf.get('trend', 'UNKNOWN')
@@ -707,3 +893,362 @@ class NixTradesScheduler:
         except Exception as e:
             self.logger.error("Error generating market overview: %s", e)
             return "Market overview unavailable."
+        
+    # ==================== PER-USER TIMED MESSAGE DISPATCHER ====================
+
+    async def _timed_messages(self):
+        """
+        Runs on the configured alert-check interval. Checks each subscribed user's local time
+        and sends the appropriate scheduled message if it is due.
+
+        Delivery schedule (in each user's own timezone):
+          06:30  Daily Market Briefing
+          08:00  Red Folder News Alert
+          Sunday 09:00  Weekly Market Analysis
+        """
+        try:
+            import pytz
+            users = db.get_subscribed_users()
+            if not users:
+                return
+
+            utc_now  = datetime.now(timezone.utc)
+            date_key = utc_now.strftime('%Y-%m-%d')
+
+            # Reset tracking sets each new UTC day
+            if date_key not in self._briefing_sent:
+                self._briefing_sent = {date_key: set()}
+                self._news_sent     = {date_key: set()}
+                self._weekly_sent   = {date_key: set()}
+
+            for user in users:
+                tid    = user['telegram_id']
+                tz_str = user.get('user_timezone') or user.get('timezone') or 'UTC'
+
+                try:
+                    user_tz = pytz.timezone(tz_str)
+                except Exception:
+                    user_tz = pytz.UTC
+
+                user_now  = utc_now.astimezone(user_tz)
+                weekday   = user_now.weekday()   # 0=Monday, 6=Sunday
+
+                def _is_due(target_hour: int, target_minute: int) -> bool:
+                    due_at = user_now.replace(
+                        hour=target_hour,
+                        minute=target_minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                    minutes_since = (user_now - due_at).total_seconds() / 60.0
+                    return 0 <= minutes_since < self.alert_check_interval_minutes
+
+                # 06:30 Daily Market Briefing
+                if _is_due(6, 30):
+                    if tid not in self._briefing_sent[date_key]:
+                        self._briefing_sent[date_key].add(tid)
+                        asyncio.create_task(
+                            self._send_daily_briefing(tid, user_now)
+                        )
+
+                # 08:00 Red Folder News Alert
+                if _is_due(8, 0):
+                    if tid not in self._news_sent[date_key]:
+                        self._news_sent[date_key].add(tid)
+                        asyncio.create_task(
+                            self._send_news_alert(tid, user_now)
+                        )
+
+                # Sunday 09:00 Weekly Analysis
+                if weekday == 6 and _is_due(9, 0):
+                    if tid not in self._weekly_sent[date_key]:
+                        self._weekly_sent[date_key].add(tid)
+                        asyncio.create_task(
+                            self._send_weekly_analysis(tid, user_now)
+                        )
+
+        except Exception as e:
+            self.logger.error("Error in _timed_messages: %s", e, exc_info=True)
+
+    # ==================== 06:30 DAILY MARKET BRIEFING ====================
+
+    async def _send_daily_briefing(self, telegram_id: int, user_now: datetime):
+        """
+        06:30 AM per-user timezone: market structure summary for the day ahead.
+        Shows HTF trend and confidence for all major pairs.
+        """
+        try:
+            date_str = user_now.strftime('%A, %B %d, %Y')
+            session  = utils.get_session()
+
+            lines = [
+                "DAILY MARKET BRIEFING",
+                date_str,
+                "",
+                "Good morning. Here is your pre-session market structure summary.",
+                "",
+                "MARKET STRUCTURE (Daily Timeframe):",
+                "",
+            ]
+
+            try:
+                mt5_ok = self.mt5.is_worker_reachable()
+            except Exception:
+                mt5_ok = False
+
+            if mt5_ok:
+                for symbol in ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'GBPJPY', 'AUDUSD']:
+                    try:
+                        raw = self.mt5.get_historical_data(symbol, 'D1', bars=100)
+                        if not raw:
+                            continue
+                        df = self._candles_to_df(raw)
+                        htf        = self.smc.determine_htf_trend(df)
+                        trend      = htf.get('trend', 'UNKNOWN')
+                        confidence = htf.get('confidence', 0)
+                        lines.append(f"  {symbol:<10} {trend:<8}  ({confidence}% confidence)")
+                    except Exception:
+                        lines.append(f"  {symbol:<10} Data unavailable")
+            else:
+                lines.append("  Market data unavailable. MT5 worker is offline.")
+
+            # Convert session windows from UTC to user's local time
+            try:
+                import pytz
+                user_tz   = user_now.tzinfo
+                ref_date  = user_now.date()
+
+                def _utc_to_local(h: int, m: int = 0) -> str:
+                    utc_dt = datetime(ref_date.year, ref_date.month, ref_date.day,
+                                      h, m, tzinfo=pytz.utc)
+                    local  = utc_dt.astimezone(user_tz)
+                    return local.strftime('%I:%M %p').lstrip('0')
+
+                london_open  = _utc_to_local(7)
+                london_close = _utc_to_local(16)
+                ny_open      = _utc_to_local(13)
+                ny_close     = _utc_to_local(22)
+                ov_open      = _utc_to_local(13)
+                ov_close     = _utc_to_local(16)
+            except Exception:
+                london_open  = '07:00 AM UTC'
+                london_close = '04:00 PM UTC'
+                ny_open      = '01:00 PM UTC'
+                ny_close     = '10:00 PM UTC'
+                ov_open      = '01:00 PM UTC'
+                ov_close     = '04:00 PM UTC'
+
+            lines += [
+                "",
+                f"Current Session: {session}",
+                "",
+                "Active trading sessions (your local time):",
+                f"  London:   {london_open} - {london_close}",
+                f"  New York: {ny_open} - {ny_close}",
+                f"  Overlap:  {ov_open} - {ov_close} (highest volume)",
+                "",
+                f"The system scans all pairs every {self.market_scan_interval_minutes} minutes.",
+                "Qualifying setups will be sent automatically when detected.",
+                "",
+                config.FOOTER,
+            ]
+
+            message = utils.validate_user_message("\n".join(lines))
+            await self._safe_send(telegram_id, message)
+
+        except Exception as e:
+            self.logger.error("Error in _send_daily_briefing for user %d: %s", telegram_id, e)
+
+    # ==================== 08:00 RED FOLDER NEWS ALERT ====================
+
+    async def _send_news_alert(self, telegram_id: int, user_now: datetime):
+        """
+        08:00 AM per-user timezone: high-impact news events for today.
+        Falls back gracefully if live news fetch fails.
+        """
+        try:
+            date_str = user_now.strftime('%A, %B %d, %Y')
+
+            try:
+                events = self.news.get_red_folder_events(hours_ahead=24)
+                if events:
+                    event_lines = []
+                    user_tz = user_now.tzinfo
+                    for ev in events:
+                        try:
+                            # Convert UTC event time to user's local timezone
+                            ev_utc  = ev.timestamp
+                            if ev_utc.tzinfo is None:
+                                import pytz
+                                ev_utc = pytz.utc.localize(ev_utc)
+                            ev_local   = ev_utc.astimezone(user_tz)
+                            day_str    = ev_local.strftime('%a')
+                            time_str   = ev_local.strftime('%I:%M %p').lstrip('0')
+                            local_str  = f"{day_str} {time_str} (your time)"
+                        except Exception:
+                            local_str = 'Unknown time'
+                        currency = getattr(ev, 'currency', 'N/A')
+                        title    = getattr(ev, 'title', str(ev))
+                        event_lines.append(f"  {local_str}  {currency:<4}  {title}")
+                    news_body = "\n".join(event_lines)
+                else:
+                    news_body = "  No high-impact events found for today."
+            except Exception:
+                news_body = (
+                    "  Live news feed unavailable.\n"
+                    "  Check Forex Factory for today's events:\n"
+                    "  https://www.forexfactory.com/calendar"
+                )
+
+            lines = [
+                "HIGH-IMPACT NEWS ALERT",
+                date_str,
+                "",
+                "Red folder events scheduled today.",
+                "Trading is paused automatically 30 minutes before",
+                "and 15 minutes after each high-impact event.",
+                "",
+                "RED FOLDER EVENTS:",
+                "",
+                news_body,
+                "",
+                "Plan your trades around these windows.",
+                "",
+                config.FOOTER,
+            ]
+
+            message = utils.validate_user_message("\n".join(lines))
+            await self._safe_send(telegram_id, message)
+
+        except Exception as e:
+            self.logger.error("Error in _send_news_alert for user %d: %s", telegram_id, e)
+
+    # ==================== SUNDAY 09:00 WEEKLY ANALYSIS ====================
+
+    async def _send_weekly_analysis(self, telegram_id: int, user_now: datetime):
+        """
+        Sunday 09:00 AM per-user timezone: weekly bias for all pairs
+        plus key news events for the coming week.
+        """
+        try:
+            date_str = user_now.strftime('%A, %B %d, %Y')
+
+            lines = [
+                "WEEKLY MARKET ANALYSIS",
+                date_str,
+                "",
+                "Good morning. Here is your weekly outlook for the week ahead.",
+                "",
+            ]
+
+            try:
+                mt5_ok = self.mt5.is_worker_reachable()
+            except Exception:
+                mt5_ok = False
+
+            if mt5_ok:
+                lines += ["WEEKLY BIAS (Daily Structure):", ""]
+                for symbol in ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
+                               'USDCAD', 'NZDUSD', 'XAUUSD', 'GBPJPY', 'EURJPY']:
+                    try:
+                        raw_d1 = self.mt5.get_historical_data(symbol, 'D1', bars=50)
+                        if not raw_d1:
+                            continue
+                        df = self._candles_to_df(raw_d1)
+                        htf        = self.smc.determine_htf_trend(df)
+                        trend      = htf.get('trend', 'UNKNOWN')
+                        confidence = htf.get('confidence', 0)
+                        lines.append(f"  {symbol:<10} {trend:<8}  ({confidence}% confidence)")
+                    except Exception:
+                        lines.append(f"  {symbol:<10} Data unavailable")
+            else:
+                lines.append("  Weekly bias unavailable. MT5 worker is offline.")
+
+            # Upcoming week news
+            try:
+                events = self.news.get_red_folder_events(hours_ahead=168)
+                if events:
+                    news_lines = []
+                    user_tz = user_now.tzinfo
+                    for ev in events[:8]:
+                        try:
+                            import pytz
+                            ev_utc = ev.timestamp
+                            if ev_utc.tzinfo is None:
+                                ev_utc = pytz.utc.localize(ev_utc)
+                            ev_local  = ev_utc.astimezone(user_tz)
+                            day_str   = ev_local.strftime('%a')
+                            time_str  = ev_local.strftime('%I:%M %p').lstrip('0')
+                            local_str = f"{day_str} {time_str} (your time)"
+                        except Exception:
+                            local_str = 'Unknown'
+                        currency = getattr(ev, 'currency', 'N/A')
+                        title    = getattr(ev, 'title', str(ev))
+                        news_lines.append(f"  {local_str}  {currency:<4}  {title}")
+                    news_body = "\n".join(news_lines)
+                else:
+                    news_body = "  Check Forex Factory for the week ahead."
+            except Exception:
+                news_body = "  News data unavailable."
+
+            lines += [
+                "",
+                "KEY NEWS EVENTS THIS WEEK:",
+                "",
+                news_body,
+                "",
+                "TRADING GUIDELINES:",
+                "",
+                "  - Only trade in the direction of the weekly bias",
+                "  - Avoid entries 30 min before and 15 min after red events",
+                "  - Best sessions: London Open and New York Open are highest volume",
+                "",
+                config.FOOTER,
+            ]
+
+            message = utils.validate_user_message("\n".join(lines))
+            await self._safe_send(telegram_id, message)
+
+        except Exception as e:
+            self.logger.error("Error in _send_weekly_analysis for user %d: %s", telegram_id, e)
+
+    # ==================== SAFE SEND ====================
+
+    async def _safe_send(self, telegram_id: int, text: str) -> bool:
+        """
+        Send a message. If user is unreachable, queue it for later delivery.
+        """
+        try:
+            await self.bot.send_message(chat_id=telegram_id, text=text)
+            return True
+        except Forbidden:
+            self.logger.info("User %d blocked the bot. Message not sent.", telegram_id)
+            return False
+        except NetworkError as e:
+            self.logger.warning("Network error sending to user %d: %s. Queuing.", telegram_id, e)
+            try:
+                db.queue_message(telegram_id, text, 'SCHEDULED_ALERT')
+            except Exception:
+                pass
+            return False
+        except Exception as e:
+            self.logger.warning("Send error for user %d: %s", telegram_id, e)
+            return False
+
+    # ==================== TEST TRIGGER METHODS ====================
+
+    async def trigger_daily_briefing_now(self, telegram_id: int):
+        """Force-send the 06:30 daily briefing immediately. Admin testing only."""
+        await self._send_daily_briefing(telegram_id, datetime.now(timezone.utc))
+
+    async def trigger_news_alert_now(self, telegram_id: int):
+        """Force-send the 08:00 news alert immediately. Admin testing only."""
+        await self._send_news_alert(telegram_id, datetime.now(timezone.utc))
+
+    async def trigger_weekly_analysis_now(self, telegram_id: int):
+        """Force-send the Sunday weekly analysis immediately. Admin testing only."""
+        await self._send_weekly_analysis(telegram_id, datetime.now(timezone.utc))
+
+    async def trigger_market_scan_now(self):
+        """Force-run a full market scan immediately. Admin testing only."""
+        await self.scan_markets()

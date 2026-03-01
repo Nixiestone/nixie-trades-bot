@@ -61,7 +61,9 @@ MAX_RISK_PERCENT      = 5.0
 MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios
-MIN_RR_RATIO   = 1.5    # Minimum acceptable risk-reward ratio for any setup
+MIN_RR_RATIO   = 2.5   # Minimum acceptable risk-reward ratio for any setup
+MIN_RR_TP2     = 3.0   # Minimum R:R for TP2. If structure cannot offer this, TP2 collapses to TP1
+MIN_SETUP_QUALITY_SCORE = 55   # Setups scoring below this are rejected by _check_filters
 
 
 # Fibonacci extension level for TP2 (1.618 = golden ratio)
@@ -156,7 +158,6 @@ CONFIRMATION_BODY_RATIO = 0.6   # Body must be at least 60% of candle range
 
 # ==================== NEWS FILTER ====================
 
-NEWS_PROXIMITY_MINUTES = 30
 
 # News blackout window (minutes)
 NEWS_PROXIMITY_MINUTES       = 30
@@ -200,8 +201,8 @@ USE_FIBONACCI_TP2 = True
 
 TRADING_SESSIONS = {
     'asian':       {'start': 0,  'end': 7,  'unicorn_only': True},
-    'london_open': {'start': 7,  'end': 8,  'trading_disabled': True},
-    'london':      {'start': 8,  'end': 16, 'all_setups': True},
+    'london_open': {'start': 7,  'end': 8,  'trading_disabled': False},
+    'london':      {'start': 7,  'end': 16, 'all_setups': True},
     'overlap':     {'start': 13, 'end': 16, 'all_setups': True},
     'newyork':     {'start': 13, 'end': 21, 'all_setups': True},
     'offhours':    {'start': 21, 'end': 24, 'trading_disabled': True}
@@ -285,8 +286,8 @@ DB_TIMEOUT_SECONDS = 30
 POSITION_MONITOR_INTERVAL_SECONDS = 10    # How often position monitor checks MT5
 POSITION_CHECK_INTERVAL_SECONDS   = 10    # Alias used by position_monitor.py
 MARKET_SCAN_INTERVAL_MINUTES      = 15
-NEWS_UPDATE_INTERVAL_MINUTES      = 15
-ALERT_CHECK_INTERVAL_MINUTES      = 60
+NEWS_UPDATE_INTERVAL_MINUTES      = 120   # Refresh economic-news cache every 2 hours
+ALERT_CHECK_INTERVAL_MINUTES      = 5     # Check per-user timed alerts every 5 minutes
 
 # ==================== HTTP REQUEST CONFIGURATION ====================
 
@@ -370,7 +371,7 @@ SUBSCRIBE_SUCCESS = (
     "Subscription activated successfully.\n\n"
     "You will receive automated setup alerts when market conditions align "
     "with Smart Money Concepts criteria.\n\n"
-    "Daily market briefings will arrive at 8:00 AM UTC.\n"
+    "Daily briefing: 6:30 AM your time. News alert: 8:00 AM your time.\n"
     "Use /settings to set your timezone and risk.\n\n"
     "Want automatic trade execution?\n"
     "Use /connect_mt5 to link your MT5 broker account.\n\n"
