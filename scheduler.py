@@ -101,16 +101,7 @@ class NixTradesScheduler:
     def start(self):
         """Start the APScheduler. Must be called from inside the running event loop."""
         try:
-            self.scheduler.add_job(
-                self.daily_alert,
-                CronTrigger(hour=8, minute=0, timezone='UTC'),
-                id='daily_alert',
-                name='Daily 8 AM Market Overview',
-                replace_existing=True,
-                misfire_grace_time=3600,
-                coalesce=True,
-                max_instances=1,
-            )
+            
             self.scheduler.add_job(
                 self.scan_markets,
                 IntervalTrigger(
@@ -501,7 +492,7 @@ class NixTradesScheduler:
                 'news_warning':  news_warn,
             }
 
-            signal_id = db.save_signal(
+            signal_row = db.save_signal(
                 symbol=setup_data['symbol'],
                 direction=setup_data['direction'],
                 setup_type=setup_data['setup_type'],
@@ -521,14 +512,17 @@ class NixTradesScheduler:
                 order_type='LIMIT',
             )
 
-            if signal_id:
-                setup_data['signal_number'] = signal_id
-                auto_execute = self.ml.should_auto_execute(consensus)
+            if signal_row:
+                setup_data['signal_number'] = signal_row.get('signal_number', 0)
+                setup_data['signal_id']     = signal_row.get('id')
+                auto_execute = self.ml.should_auto_execute(
+                    consensus, ml_result['agreement'])
                 await self._broadcast_setup(setup_data, auto_execute)
                 self.logger.info(
                     "Setup generated and broadcast: %s %s | Score: %d%% | "
-                    "Tier: %s | Signal ID: %s",
-                    symbol, setup_data['direction'], consensus, tier, signal_id)
+                    "Agreement: %s | Tier: %s | Signal #%s",
+                    symbol, setup_data['direction'], consensus,
+                    ml_result['agreement'], tier, setup_data['signal_number'])
 
         except Exception as e:
             self.logger.error("Error scanning %s: %s", symbol, e, exc_info=True)
@@ -838,7 +832,7 @@ class NixTradesScheduler:
                 # Save trade record to database
                 db.save_trade(
                     telegram_id=tid,
-                    signal_id=setup_data.get('signal_number'),
+                    signal_id=setup_data.get('signal_id'),
                     symbol=symbol,
                     direction=direction,
                     lot_size=lot_size,
@@ -1239,15 +1233,45 @@ class NixTradesScheduler:
 
     async def trigger_daily_briefing_now(self, telegram_id: int):
         """Force-send the 06:30 daily briefing immediately. Admin testing only."""
-        await self._send_daily_briefing(telegram_id, datetime.now(timezone.utc))
+        import pytz
+        user = db.get_user(telegram_id)
+        tz_str = (
+            user.get('timezone') or user.get('user_timezone') or 'UTC'
+        ) if user else 'UTC'
+        try:
+            user_tz = pytz.timezone(tz_str)
+        except Exception:
+            user_tz = pytz.utc
+        user_now = datetime.now(timezone.utc).astimezone(user_tz)
+        await self._send_daily_briefing(telegram_id, user_now)
 
     async def trigger_news_alert_now(self, telegram_id: int):
         """Force-send the 08:00 news alert immediately. Admin testing only."""
-        await self._send_news_alert(telegram_id, datetime.now(timezone.utc))
+        import pytz
+        user = db.get_user(telegram_id)
+        tz_str = (
+            user.get('timezone') or user.get('user_timezone') or 'UTC'
+        ) if user else 'UTC'
+        try:
+            user_tz = pytz.timezone(tz_str)
+        except Exception:
+            user_tz = pytz.utc
+        user_now = datetime.now(timezone.utc).astimezone(user_tz)
+        await self._send_news_alert(telegram_id, user_now)
 
     async def trigger_weekly_analysis_now(self, telegram_id: int):
         """Force-send the Sunday weekly analysis immediately. Admin testing only."""
-        await self._send_weekly_analysis(telegram_id, datetime.now(timezone.utc))
+        import pytz
+        user = db.get_user(telegram_id)
+        tz_str = (
+            user.get('timezone') or user.get('user_timezone') or 'UTC'
+        ) if user else 'UTC'
+        try:
+            user_tz = pytz.timezone(tz_str)
+        except Exception:
+            user_tz = pytz.utc
+        user_now = datetime.now(timezone.utc).astimezone(user_tz)
+        await self._send_weekly_analysis(telegram_id, user_now)
 
     async def trigger_market_scan_now(self):
         """Force-run a full market scan immediately. Admin testing only."""

@@ -278,11 +278,7 @@ class NixTradesBot:
                 CallbackQueryHandler(
                     self.callback_settings_tz_prompt, pattern='^settings_tz_prompt$'),
             ],
-            states={
-                SETTINGS_WAITING_TZ: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_settings_tz),
-                ],
-            },
+            states={},
             fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
             per_user=True,
             per_chat=True,
@@ -314,6 +310,9 @@ class NixTradesBot:
         ))
         app.add_handler(CallbackQueryHandler(
             self.callback_settings_done, pattern='^settings_done$'
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_settings_tz_select, pattern=r'^tz_sel_'
         ))
         app.add_handler(CallbackQueryHandler(
             self.callback_partial_close,
@@ -983,7 +982,9 @@ class NixTradesBot:
                 user.get('risk_percent', config.DEFAULT_RISK_PERCENT)
                 if user else config.DEFAULT_RISK_PERCENT
             )
-            tz = user.get('user_timezone', 'UTC') if user else 'UTC'
+            tz = (
+                user.get('timezone') or user.get('user_timezone') or 'UTC'
+            ) if user else 'UTC'
 
             keyboard = InlineKeyboardMarkup([
                 [
@@ -1076,25 +1077,86 @@ class NixTradesBot:
     ) -> int:
         """
         Handle 'Set Timezone' button press.
-        This is a ConversationHandler entry point - it opens the TZ input state.
+        Shows an inline keyboard of common timezones.
+        Each button press is handled by callback_settings_tz_select.
         """
         query = update.callback_query
         await query.answer()
+
+        _TIMEZONES = [
+            ('America/New_York',     'US Eastern'),
+            ('America/Chicago',      'US Central'),
+            ('America/Los_Angeles',  'US Pacific'),
+            ('Europe/London',        'UK'),
+            ('Europe/Paris',         'Central Europe'),
+            ('Europe/Moscow',        'Moscow'),
+            ('Africa/Lagos',         'West Africa'),
+            ('Africa/Johannesburg',  'South Africa'),
+            ('Asia/Dubai',           'Dubai'),
+            ('Asia/Kolkata',         'India'),
+            ('Asia/Singapore',       'Singapore'),
+            ('Asia/Tokyo',           'Japan'),
+            ('Asia/Shanghai',        'China'),
+            ('Australia/Sydney',     'Australia East'),
+            ('Pacific/Auckland',     'New Zealand'),
+        ]
+
+        buttons = []
+        for i in range(0, len(_TIMEZONES), 3):
+            row = []
+            for tz_iana, tz_label in _TIMEZONES[i:i + 3]:
+                safe = tz_iana.replace('/', '~')
+                row.append(InlineKeyboardButton(
+                    tz_label,
+                    callback_data=f'tz_sel_{safe}',
+                ))
+            buttons.append(row)
+
+        keyboard = InlineKeyboardMarkup(buttons)
+
         await query.edit_message_text(
             utils.validate_user_message(
-                "CHANGE TIMEZONE\n\n"
-                "Please type your timezone name and send it.\n\n"
-                "Examples:\n"
-                "  Africa/Lagos\n"
-                "  Europe/London\n"
-                "  America/New_York\n"
-                "  Asia/Tokyo\n\n"
-                "Full list: en.wikipedia.org/wiki/List_of_tz_database_time_zones\n\n"
-                "Send /cancel to go back without changing.\n\n"
+                "SELECT YOUR TIMEZONE\n\n"
+                "Choose your region from the buttons below.\n"
+                "Daily briefings and news alerts will arrive at the correct local time.\n\n"
                 f"{config.FOOTER}"
-            )
+            ),
+            reply_markup=keyboard,
         )
-        return SETTINGS_WAITING_TZ
+        return ConversationHandler.END
+    
+    
+    async def callback_settings_tz_select(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle timezone selection from the inline keyboard shown by callback_settings_tz_prompt."""
+        query = update.callback_query
+        await query.answer()
+        telegram_id = query.from_user.id
+
+        raw_safe = query.data.replace('tz_sel_', '')
+        tz_str   = raw_safe.replace('~', '/')
+
+        try:
+            import pytz
+            pytz.timezone(tz_str)
+            db.update_timezone(telegram_id, tz_str)
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    f"Timezone updated to {tz_str}.\n\n"
+                    "Daily briefings and news alerts will now arrive at the correct time.\n\n"
+                    f"{config.FOOTER}"
+                )
+            )
+        except Exception as e:
+            self.logger.error("Timezone selection error for user %d: %s", telegram_id, e)
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "That timezone could not be saved. "
+                    "Please use /settings and try again.\n\n"
+                    f"{config.FOOTER}"
+                )
+            )
 
     async def handle_settings_risk(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

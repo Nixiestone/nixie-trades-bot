@@ -395,10 +395,10 @@ def save_signal(
     order_type: str = 'LIMIT',
     timeframe: str = 'M15',
     expiry_hours: int = 2,
-) -> Optional[int]:
+) -> Optional[dict]:
     """
     Save a new signal to the database.
-    Returns the signal's ID, or None on failure.
+    Returns the full inserted row dict, or None on failure.
     """
     setup_upper = str(setup_type).upper()
     normalized_setup_type = (
@@ -434,12 +434,13 @@ def save_signal(
 
     result = _client().table('signals').insert(signal_data).execute()
     if result.data:
-        signal_id = result.data[0].get('id')
+        row = result.data[0]
         logger.info(
             "Signal saved: id=%s number=%s %s %s score=%d setup=%s",
-            signal_id, next_signal_number, symbol, direction, ml_score, normalized_setup_type
+            row.get('id'), row.get('signal_number'),
+            symbol, direction, ml_score, normalized_setup_type
         )
-        return signal_id
+        return row
     return None
 
 

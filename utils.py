@@ -45,15 +45,7 @@ def add_footer(text: str) -> str:
 
 # ==================== SESSION ====================
 
-def get_session() -> str:
-    """
-    Return the current trading session name based on UTC time.
-    Called by scheduler.py when building setup_data.
 
-    Returns:
-        str: One of 'Asian', 'London Open', 'London', 'Overlap', 'New York', 'Off Hours'
-    """
-    return get_session_name(datetime.now(timezone.utc).hour)
 
 
 def get_session_name(utc_hour: int) -> str:

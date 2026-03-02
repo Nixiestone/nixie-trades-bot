@@ -818,8 +818,15 @@ class MLEnsemble:
             else:
                 consensus = int(lstm_s * 0.40 + xgb_s * 0.60)
 
-            diff      = abs(lstm_s - xgb_s)
-            agreement = 'STRONG' if diff <= 10 else ('MODERATE' if diff <= 20 else 'WEAK')
+            _agreement_scores = [lstm_s, xgb_s]
+            if rf_s is not None:
+                _agreement_scores.append(rf_s)
+            _score_range = max(_agreement_scores) - min(_agreement_scores)
+            agreement = (
+                'STRONG' if _score_range <= 10 else
+                ('MODERATE' if _score_range <= 20 else 'WEAK')
+            )
+            
             self.logger.info(
                 "Ensemble: LSTM=%d%%  XGBoost=%d%%  RF=%s%%  Consensus=%d%%  "
                 "Agreement=%s  Trained: %s",
@@ -850,7 +857,9 @@ class MLEnsemble:
         elif consensus_score >= config.ML_TIER_DISCRETIONARY: return True, 'DISCRETIONARY'
         return False, 'REJECTED'
 
-    def should_auto_execute(self, consensus_score: int) -> bool:
+    def should_auto_execute(self, consensus_score: int, agreement: str = 'MODERATE') -> bool:
+        if agreement == 'WEAK':
+            return False
         return consensus_score >= config.ML_AUTO_EXECUTE_THRESHOLD
 
     def get_model_status(self) -> dict:
