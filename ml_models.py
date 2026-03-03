@@ -818,13 +818,13 @@ class MLEnsemble:
             else:
                 consensus = int(lstm_s * 0.40 + xgb_s * 0.60)
 
-            _agreement_scores = [lstm_s, xgb_s]
-            if rf_s is not None:
-                _agreement_scores.append(rf_s)
-            _score_range = max(_agreement_scores) - min(_agreement_scores)
+            # Agreement reflects signal strength (consensus score), not model spread.
+            # 75%+ = STRONG  -> auto-execute eligible
+            # 60-74% = MODERATE -> auto-execute eligible
+            # Below 60% = WEAK -> notify only, never auto-execute
             agreement = (
-                'STRONG' if _score_range <= 10 else
-                ('MODERATE' if _score_range <= 20 else 'WEAK')
+                'STRONG'    if consensus >= 75 else
+                ('MODERATE' if consensus >= 60 else 'WEAK')
             )
             
             self.logger.info(
@@ -858,6 +858,9 @@ class MLEnsemble:
         return False, 'REJECTED'
 
     def should_auto_execute(self, consensus_score: int, agreement: str = 'MODERATE') -> bool:
+        # WEAK means consensus is below 60%. Notify user but never place a trade.
+        # MODERATE (60-74%) and STRONG (75%+) are both auto-execute eligible
+        # provided MT5 is connected and consensus meets ML_AUTO_EXECUTE_THRESHOLD.
         if agreement == 'WEAK':
             return False
         return consensus_score >= config.ML_AUTO_EXECUTE_THRESHOLD

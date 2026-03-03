@@ -281,26 +281,29 @@ class NixTradesScheduler:
             # Without this, the scan blocks for 10+ minutes per symbol
             # retrying 4 times per timeframe with no worker available.
             if not self.mt5.is_worker_reachable():
-                self.logger.debug(
+                self.logger.info(
                     "MT5 worker not reachable. Skipping %s.", symbol)
                 return
 
             # Check news blackout window before doing any analysis
             is_blackout, news_event = self.news.check_news_blackout(symbol)
             if is_blackout:
-                self.logger.debug(
+                self.logger.info(
                     "Skipping %s: news blackout for %s %s.",
                     symbol,
                     getattr(news_event, 'currency', ''),
                     getattr(news_event, 'title', ''))
                 return
 
-            # Avoid duplicate setups within one market-scan interval.
-            if db.recent_signal_exists(symbol, minutes=self.market_scan_interval_minutes):
-                self.logger.debug(
-                    "Skipping %s: setup already generated in the last %d minutes.",
-                    symbol,
-                    self.market_scan_interval_minutes,
+            # Avoid duplicate setups within the signal expiry window.
+            # H1 signals expire in 8 hours (480 minutes). Checking only the
+            # scan interval (15 min) caused the same setup to fire on every
+            # scan cycle for hours while the structure remained valid.
+            _signal_cooldown_minutes = 480   # matches expiry_hours=8 set in setup_data
+            if db.recent_signal_exists(symbol, minutes=_signal_cooldown_minutes):
+                self.logger.info(
+                    "Skipping %s: signal already generated within %d minute cooldown.",
+                    symbol, _signal_cooldown_minutes,
                 )
                 return
 
@@ -333,7 +336,7 @@ class NixTradesScheduler:
             # Phase 1: HTF trend context (D1)
             htf_trend = self.smc.determine_htf_trend(d1_df)
             if htf_trend.get('trend') == 'RANGING':
-                self.logger.debug("%s D1 trend is RANGING. Skipping.", symbol)
+                self.logger.info("%s D1 trend is RANGING. Skipping.", symbol)
                 return
 
             # H4 intermediate confirmation - must agree with D1 direction.
@@ -343,7 +346,7 @@ class NixTradesScheduler:
                 h4_trend = self.smc.determine_htf_trend(h4_df)
                 h4_aligned = h4_trend.get('trend') == htf_trend.get('trend')
                 if not h4_aligned and h4_trend.get('trend') != 'RANGING':
-                    self.logger.debug(
+                    self.logger.info(
                         "%s H4 trend (%s) opposes D1 trend (%s). Skipping.",
                         symbol, h4_trend.get('trend'), htf_trend.get('trend'))
                     return
@@ -367,7 +370,7 @@ class NixTradesScheduler:
                     obs = self.smc.detect_order_blocks(h1_df, htf_trend['trend'])
                     if obs:
                         poi = obs[0]
-                        self.logger.debug(
+                        self.logger.info(
                             "%s: BOS confirmed. No Breaker Block found. "
                             "Using Order Block as fallback POI.", symbol)
             elif mss_event:
@@ -377,9 +380,34 @@ class NixTradesScheduler:
                     poi = obs[0]
 
             if poi is None or setup_type is None:
-                self.logger.debug(
+                self.logger.info(
                     "%s: no valid structure or POI found.", symbol)
                 return
+
+            # Phase 2b: Inducement gate
+            # Confirms the M15 liquidity sweep happened AFTER BOS/MSS.
+            # Without this the bot enters before the institutional stop hunt,
+            # getting filled at exactly the moment retail stops are being hit.
+            inducement = self.smc.detect_inducement_post_structure(
+                m15_df.tail(60),
+                poi,
+                poi['direction'],
+            )
+            if inducement is None:
+                self.logger.info(
+                    "AWAITING INDUCEMENT | %s | %s %s | "
+                    "POI [%.5f - %.5f] valid but no M15 sweep yet. "
+                    "Will re-check next scan.",
+                    symbol, setup_type, poi['direction'],
+                    float(poi.get('low', 0)), float(poi.get('high', 0)),
+                )
+                return
+            self.logger.info(
+                "INDUCEMENT CONFIRMED | %s | %.1f pip sweep | Quality: %s",
+                symbol,
+                inducement.get('sweep_pips', 0),
+                inducement.get('quality', 'N/A'),
+            )
 
             # Phase 3: ML validation
             ml_result     = self.ml.get_ensemble_prediction(
@@ -388,7 +416,7 @@ class NixTradesScheduler:
             should_send, tier = self.ml.should_send_setup(consensus)
 
             if not should_send:
-                self.logger.debug(
+                self.logger.info(
                     "%s: ML consensus %d%% below threshold. Rejected.", symbol, consensus)
                 return
 
@@ -681,10 +709,34 @@ class NixTradesScheduler:
             for user in subscribed:
                 tid = user['telegram_id']
                 try:
-                    # Calculate lot size per user's risk setting if MT5 connected
+                    # Calculate lot size per user's risk setting if MT5 connected.
+                    # mt5_connected flag checked first, then credentials as fallback
+                    # so a user who connected but whose flag was not set still executes.
                     lot_size = None
-                    if user.get('mt5_connected') and auto_execute:
+                    mt5_flag = bool(user.get('mt5_connected'))
+                    has_creds = bool(db.get_mt5_credentials(tid))
+                    can_execute = mt5_flag or has_creds
+
+                    if not auto_execute:
+                        self.logger.info(
+                            "AUTO-EXECUTE SKIP | user %d | reason: auto_execute=False "
+                            "(consensus below threshold or agreement=WEAK)", tid)
+                    elif not can_execute:
+                        self.logger.info(
+                            "AUTO-EXECUTE SKIP | user %d | reason: mt5_connected=%s "
+                            "has_creds=%s. User has not linked MT5 account.",
+                            tid, mt5_flag, has_creds)
+                    else:
                         lot_size = await self._calculate_user_lot_size(user, setup_data)
+                        if lot_size is None:
+                            self.logger.info(
+                                "AUTO-EXECUTE SKIP | user %d | reason: lot_size "
+                                "calculation returned None (check account balance "
+                                "and MT5 worker connection).", tid)
+                        else:
+                            self.logger.info(
+                                "AUTO-EXECUTE READY | user %d | lot_size=%.2f",
+                                tid, lot_size)
 
                     message = utils.format_setup_message(
                         signal_number=signal_num,
@@ -725,7 +777,7 @@ class NixTradesScheduler:
                         db.queue_message(tid, message, 'SETUP_ALERT')
 
                     # Auto-execute trade for connected users
-                    if auto_execute and user.get('mt5_connected') and lot_size:
+                    if auto_execute and can_execute and lot_size:
                         await self._auto_execute_trade(user, setup_data, lot_size)
 
                 except Exception as e:

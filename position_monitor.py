@@ -578,7 +578,7 @@ class PositionMonitor:
             else:
                 # Event loop not available - queue for next user interaction
                 db.queue_message(telegram_id, clean, 'TRADE_NOTIFICATION')
-                self.logger.debug(
+                self.logger.info(
                     "No event loop. Notification to user %d queued in database.",
                     telegram_id,
                 )

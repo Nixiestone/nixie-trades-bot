@@ -1287,6 +1287,150 @@ class SMCStrategy:
         
         return None
     
+    def detect_inducement_post_structure(
+        self,
+        data: pd.DataFrame,
+        poi: Dict,
+        direction: str,
+        lookback_bars: int = 40,
+    ) -> Optional[Dict]:
+        """
+        Verify a liquidity sweep (inducement) has occurred on M15 AFTER
+        the BOS/MSS and BEFORE price enters the POI.
+
+        BUY: a candle must have wicked below an internal swing low and
+             closed back above it (stop hunt complete).
+        SELL: a candle must have wicked above an internal swing high and
+              closed back below it.
+
+        Returns dict if confirmed, None if sweep not yet happened.
+        Caller should skip broadcast and retry on next scan cycle.
+        """
+        try:
+            df = data.tail(lookback_bars).copy()
+
+            if len(df) < 10:
+                self.logger.debug(
+                    "Insufficient M15 bars (%d) for inducement check. "
+                    "Passing through as UNVERIFIED.", len(df))
+                return {
+                    'type': 'INDUCEMENT', 'direction': direction,
+                    'sweep_level': 0.0, 'sweep_pips': 0.0,
+                    'quality': 'UNVERIFIED', 'timestamp': None,
+                    'sweep_candle': None,
+                }
+
+            is_buy   = direction == 'BULLISH'
+            poi_high = float(poi.get('high', 0))
+            poi_low  = float(poi.get('low',  0))
+
+            if poi_high <= poi_low:
+                self.logger.info(
+                    "Malformed POI [%.5f - %.5f]. Passing inducement check.",
+                    poi_low, poi_high)
+                return None
+
+            internal_swings = self._identify_swings(df, lookback=2)
+
+            if not internal_swings:
+                self.logger.info(
+                    "No internal swings found in %d M15 bars.", len(df))
+                return None
+
+            if is_buy:
+                candidates = [
+                    s for s in internal_swings
+                    if s['direction'] == 'LOW' and s['price'] > poi_high
+                ]
+            else:
+                candidates = [
+                    s for s in internal_swings
+                    if s['direction'] == 'HIGH' and s['price'] < poi_low
+                ]
+
+            if not candidates:
+                self.logger.info(
+                    "No inducement candidates outside POI [%.5f - %.5f] "
+                    "for %s.", poi_low, poi_high, direction)
+                return None
+
+            target_swing = candidates[-1]
+            sweep_level  = target_swing['price']
+            swing_idx    = target_swing['index']
+
+            sweep_candle = None
+            for j in range(swing_idx + 1, len(df)):
+                candle = df.iloc[j]
+                if is_buy:
+                    if (float(candle['low']) < sweep_level
+                            and float(candle['close']) > sweep_level):
+                        sweep_pips = (sweep_level - float(candle['low'])) / 0.0001
+                        if sweep_pips >= 3.0:
+                            sweep_candle = {
+                                'index': j, 'timestamp': df.index[j],
+                                'sweep_level': round(sweep_level, 5),
+                                'sweep_low': round(float(candle['low']), 5),
+                                'close': round(float(candle['close']), 5),
+                                'sweep_pips': round(sweep_pips, 1),
+                            }
+                            break
+                else:
+                    if (float(candle['high']) > sweep_level
+                            and float(candle['close']) < sweep_level):
+                        sweep_pips = (float(candle['high']) - sweep_level) / 0.0001
+                        if sweep_pips >= 3.0:
+                            sweep_candle = {
+                                'index': j, 'timestamp': df.index[j],
+                                'sweep_level': round(sweep_level, 5),
+                                'sweep_high': round(float(candle['high']), 5),
+                                'close': round(float(candle['close']), 5),
+                                'sweep_pips': round(sweep_pips, 1),
+                            }
+                            break
+
+            if sweep_candle is None:
+                self.logger.info(
+                    "Sweep NOT YET confirmed. Internal %s at %.5f not yet "
+                    "swept on M15. Awaiting inducement.",
+                    'LOW' if is_buy else 'HIGH', sweep_level)
+                return None
+
+            current_price = float(df.iloc[-1]['close'])
+            if is_buy and current_price < poi_low:
+                self.logger.info(
+                    "Inducement found but price %.5f already below POI low "
+                    "%.5f. Setup invalidated.", current_price, poi_low)
+                return None
+            if not is_buy and current_price > poi_high:
+                self.logger.info(
+                    "Inducement found but price %.5f already above POI high "
+                    "%.5f. Setup invalidated.", current_price, poi_high)
+                return None
+
+            quality = 'STRONG' if sweep_candle['sweep_pips'] >= 10.0 else 'MODERATE'
+
+            self.logger.info(
+                "Inducement CONFIRMED [%s]: %.1f pip sweep %s internal %s "
+                "at %.5f. Price %.5f approaching POI [%.5f - %.5f]. "
+                "Quality: %s.",
+                direction, sweep_candle['sweep_pips'],
+                'below' if is_buy else 'above',
+                'LOW' if is_buy else 'HIGH', sweep_level,
+                current_price, poi_low, poi_high, quality,
+            )
+
+            return {
+                'type': 'INDUCEMENT', 'direction': direction,
+                'sweep_level': sweep_level, 'sweep_candle': sweep_candle,
+                'sweep_pips': sweep_candle['sweep_pips'],
+                'quality': quality, 'timestamp': sweep_candle['timestamp'],
+            }
+
+        except Exception as e:
+            self.logger.error(
+                "Error in detect_inducement_post_structure: %s", e)
+            return None
+    
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
         """
         Calculate Average True Range.
