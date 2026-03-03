@@ -363,6 +363,13 @@ class NixTradesScheduler:
                     htf_trend.get('swing_low', 0))
                 if breakers:
                     poi = breakers[0]
+                else:
+                    obs = self.smc.detect_order_blocks(h1_df, htf_trend['trend'])
+                    if obs:
+                        poi = obs[0]
+                        self.logger.debug(
+                            "%s: BOS confirmed. No Breaker Block found. "
+                            "Using Order Block as fallback POI.", symbol)
             elif mss_event:
                 setup_type = 'MSS'
                 obs = self.smc.detect_order_blocks(h1_df, mss_event['direction'])
@@ -386,7 +393,7 @@ class NixTradesScheduler:
                 return
 
             # ATR and session filters
-            if not self._check_filters(symbol, m15_df, htf_trend, poi):
+            if not self._check_filters(symbol, m15_df, htf_trend, poi, tier):
                 return
 
             # Phase 4: Entry / SL / TP calculation
@@ -509,7 +516,9 @@ class NixTradesScheduler:
                 lstm_score=ml_result['lstm_score'],
                 xgboost_score=ml_result['xgboost_score'],
                 session=setup_data['session'],
-                order_type='LIMIT',
+                order_type=setup_data.get('order_type', 'LIMIT'),
+                timeframe=setup_data.get('timeframe', 'H1'),
+                expiry_hours=setup_data.get('expiry_hours', 8),
             )
 
             if signal_row:
@@ -528,7 +537,8 @@ class NixTradesScheduler:
             self.logger.error("Error scanning %s: %s", symbol, e, exc_info=True)
 
     def _check_filters(
-        self, symbol: str, data: pd.DataFrame, htf_trend: dict, poi: dict
+        self, symbol: str, data: pd.DataFrame, htf_trend: dict, poi: dict,
+        tier: str = 'STANDARD'
     ) -> bool:
         """
         Run all 5 filters before broadcasting a setup.
@@ -541,19 +551,27 @@ class NixTradesScheduler:
         try:
             direction = poi.get('direction', 'BULLISH')
 
-            # Filter 1: ATR volatility
+            # Filter 1: ATR volatility - disabled, news blackout handles spike protection
             atr     = self.smc._calculate_atr(data.tail(20))
             atr_avg = float(data.tail(40)['close'].diff().abs().mean())
-            pass_atr, reason = self.smc.check_atr_filter(atr, atr_avg)
-            if not pass_atr:
-                self.logger.debug("%s failed ATR filter: %s", symbol, reason)
-                return False
+            atr_pass, _ = self.smc.check_atr_filter(atr, atr_avg)
+            atr_ratio = round(atr / atr_avg, 2) if atr_avg > 0 else 0
+            self.logger.debug(
+                "%s ATR (informational only, not blocking): ratio=%.2fx - "
+                "setup continues regardless.", symbol, atr_ratio)
 
-            # Filter 2: Session
-            pass_session, reason = self.smc.check_session_filter(datetime.utcnow())
-            if not pass_session:
-                self.logger.debug("%s failed session filter: %s", symbol, reason)
-                return False
+            # Filter 2: Session - Asian is Unicorn-only, all other sessions trade
+            utc_hour     = datetime.utcnow().hour
+            session_name = utils.get_session_name(utc_hour)
+            if session_name == 'Asian':
+                if tier != 'PREMIUM':
+                    self.logger.debug(
+                        "%s: Asian session (%d UTC) - only UNICORN setups allowed. "
+                        "Current tier: %s. Skipping.", symbol, utc_hour, tier)
+                    return False
+                self.logger.debug(
+                    "%s: Asian session (%d UTC) - UNICORN tier confirmed. Proceeding.",
+                    symbol, utc_hour)
 
             # Filter 3: ADX - reject ranging markets at entry timeframe
             adx_data = data.tail(60)
@@ -564,27 +582,30 @@ class NixTradesScheduler:
                         "%s failed ADX filter: %s (ADX=%.1f)", symbol, reason_adx, adx_val)
                     return False
 
-            # Filter 4: Premium/discount zone
+            # Filter 4: Premium/discount zone - informational and priority tagging only.
+            # Zone position does not block a setup. When price is in the correct zone
+            # (discount for BUY, premium for SELL) it is flagged as HIGH PRIORITY.
             swing_high    = float(htf_trend.get('swing_high', 0))
             swing_low     = float(htf_trend.get('swing_low',  0))
             current_price = float(data.iloc[-1]['close'])
             if swing_high > swing_low > 0:
                 in_zone, zone_pos, zone_desc = self.smc.detect_premium_discount_zone(
                     current_price, swing_high, swing_low, direction)
-                if not in_zone:
-                    self.logger.debug(
-                        "%s failed zone filter: %s", symbol, zone_desc)
-                    return False
-                if direction == 'BULLISH' and zone_pos > 0.45:
-                    self.logger.debug(
-                        "%s failed sniper depth filter: bullish zone %.2f > 0.45",
-                        symbol, zone_pos)
-                    return False
-                if direction == 'BEARISH' and zone_pos < 0.55:
-                    self.logger.debug(
-                        "%s failed sniper depth filter: bearish zone %.2f < 0.55",
-                        symbol, zone_pos)
-                    return False
+                correct_zone = (
+                    (direction == 'BULLISH' and zone_pos <= 0.45) or
+                    (direction == 'BEARISH' and zone_pos >= 0.55)
+                )
+                if correct_zone:
+                    self.logger.info(
+                        "%s ZONE - HIGH PRIORITY: %s (zone_pos=%.2f). "
+                        "Price is in optimal %s zone.",
+                        symbol, zone_desc, zone_pos,
+                        'discount' if direction == 'BULLISH' else 'premium')
+                else:
+                    self.logger.info(
+                        "%s ZONE - STANDARD: %s (zone_pos=%.2f). "
+                        "Not in optimal zone but setup proceeds on other merits.",
+                        symbol, zone_desc, zone_pos)
 
             # Filter 5: Composite setup quality score
             try:
@@ -592,10 +613,9 @@ class NixTradesScheduler:
                     data.tail(50), htf_trend.get('trend', 'BULLISH'))
                 quality = self.smc.score_setup_quality(
                     data, poi, htf_trend, bos_events, direction, symbol)
-                if quality < 60:
-                    self.logger.debug(
-                        "%s failed quality filter: score %d < 60", symbol, quality)
-                    return False
+                self.logger.debug(
+                    "%s quality score: %d (informational only, not blocking).",
+                    symbol, quality)
             except Exception as qe:
                 self.logger.warning(
                     "Quality score failed for %s (%s). Continuing without it.", symbol, qe)
