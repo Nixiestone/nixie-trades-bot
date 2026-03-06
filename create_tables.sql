@@ -429,3 +429,53 @@ BEGIN
     END IF;
 END
 $$;
+
+
+-- NIXIE TRADES — SIGNAL NUMBER SEQUENCE FIX
+-- Run this ONCE in the Supabase SQL Editor.
+-- Safe to run even if you have zero signals so far.
+-- This fixes the race condition where two simultaneous signals
+-- could try to save with the same signal_number and one gets lost.
+--
+-- PLAIN ENGLISH:
+-- Before this fix, the Python code calculated the next signal number
+-- by counting existing rows and adding 1. If two scans ran at the exact
+-- same moment, both would count the same number and try to insert the
+-- same number, causing one to crash.
+-- After this fix, the database itself hands out signal numbers one at
+-- a time using a counter (called a sequence) that can never give the
+-- same number twice, even to simultaneous requests.
+
+-- Step 1: Create the sequence
+CREATE SEQUENCE IF NOT EXISTS signals_signal_number_seq;
+
+-- Step 2: Set it to start from wherever your current data is
+-- (if you have 10 signals already, the next one will be 11)
+SELECT setval(
+    'signals_signal_number_seq',
+    (SELECT COALESCE(MAX(signal_number), 0) FROM signals)
+);
+
+-- Step 3: Make the signal_number column use this sequence automatically
+ALTER TABLE signals
+    ALTER COLUMN signal_number
+    SET DEFAULT nextval('signals_signal_number_seq');
+
+-- Verify it worked
+DO $$
+DECLARE
+    _default_val TEXT;
+BEGIN
+    SELECT column_default INTO _default_val
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name   = 'signals'
+      AND column_name  = 'signal_number';
+
+    IF _default_val LIKE '%nextval%' THEN
+        RAISE NOTICE 'SUCCESS: signal_number sequence is active. Race condition fixed.';
+    ELSE
+        RAISE WARNING 'Something went wrong. column_default = %', _default_val;
+    END IF;
+END
+$$;
