@@ -1,291 +1,431 @@
--- ==================== DROP OLD TABLES ====================
+-- ============================================================
+-- NIXIE TRADES — MASTER DATABASE SETUP
+-- Version: 3.0 FINAL
+-- Author: Blessing Omoregie (Nixie Trades)
+-- Role: Data Engineer + Infrastructure Engineer + Security Engineer
+--
+-- HOW TO USE:
+--   1. Open your Supabase project
+--   2. Click "SQL Editor" in the left sidebar
+--   3. Click "New query"
+--   4. Copy this ENTIRE file and paste it in
+--   5. Click the green "Run" button
+--   6. You should see: "All tables, views, and policies created successfully!"
+--
+-- SAFE TO RE-RUN: All statements use IF NOT EXISTS or DROP IF EXISTS,
+-- so you can run this again without breaking anything.
+-- ============================================================
 
-DROP TABLE IF EXISTS model_metrics CASCADE;
-DROP TABLE IF EXISTS news_events CASCADE;
-DROP TABLE IF EXISTS trades CASCADE;
-DROP TABLE IF EXISTS signals CASCADE;
-DROP TABLE IF EXISTS telegram_users CASCADE;
 
--- ==================== EXTENSION ====================
+-- ==================== STEP 1: EXTENSIONS ====================
+-- uuid-ossp lets us generate unique IDs automatically.
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- ==================== TELEGRAM USERS ====================
+
+-- ==================== STEP 2: DROP OLD TABLES ====================
+-- This clears out any old version of the schema so we start clean.
+-- CASCADE means any views or dependencies are dropped too.
+
+DROP TABLE IF EXISTS model_metrics        CASCADE;
+DROP TABLE IF EXISTS ml_training_data     CASCADE;
+DROP TABLE IF EXISTS news_events          CASCADE;
+DROP TABLE IF EXISTS message_queue        CASCADE;
+DROP TABLE IF EXISTS trades               CASCADE;
+DROP TABLE IF EXISTS signals              CASCADE;
+DROP TABLE IF EXISTS telegram_users       CASCADE;
+DROP VIEW  IF EXISTS queued_messages      CASCADE;
+
+
+-- ==================== STEP 3: TELEGRAM USERS ====================
+-- This table stores every person who uses the bot.
+-- Their broker password is stored encrypted (never plain text).
 
 CREATE TABLE telegram_users (
-    id                      BIGSERIAL PRIMARY KEY,
-    telegram_id             BIGINT      NOT NULL UNIQUE,
-    username                TEXT,
-    first_name              TEXT,
-    timezone                TEXT        NOT NULL DEFAULT 'UTC',
-    subscription_status     TEXT        NOT NULL DEFAULT 'inactive'
-                                        CHECK (subscription_status IN ('inactive', 'active', 'suspended')),
-    risk_percent            NUMERIC(4,2) NOT NULL DEFAULT 1.0
-                                        CHECK (risk_percent >= 0.1 AND risk_percent <= 5.0),
+    id                          BIGSERIAL       PRIMARY KEY,
+    telegram_id                 BIGINT          NOT NULL UNIQUE,
+    username                    TEXT,
+    first_name                  TEXT,
+    timezone                    TEXT            NOT NULL DEFAULT 'UTC',
 
-    -- MT5 Connection Fields
-    mt5_login               BIGINT,
-    mt5_password_encrypted  TEXT,
-    mt5_server              TEXT,
-    mt5_broker_name         TEXT,
-    mt5_account_balance     NUMERIC(18,2),
-    mt5_account_currency    TEXT,
-    mt5_connected           BOOLEAN     NOT NULL DEFAULT FALSE,
-    symbol_mappings         JSONB,
-    
-    -- Subscription tracking
-    trial_started_at        TIMESTAMPTZ,
-    
+    -- Subscription
+    subscription_status         TEXT            NOT NULL DEFAULT 'inactive'
+                                                CHECK (subscription_status IN ('inactive', 'active', 'suspended')),
+    trial_started_at            TIMESTAMPTZ,
+    disclaimer_accepted         BOOLEAN         NOT NULL DEFAULT FALSE,
+    disclaimer_accepted_at      TIMESTAMPTZ,
+
+    -- Risk management
+    risk_percent                NUMERIC(4,2)    NOT NULL DEFAULT 1.0
+                                                CHECK (risk_percent >= 0.1 AND risk_percent <= 5.0),
+
+    -- MT5 broker connection
+    mt5_login                   BIGINT,
+    mt5_password_encrypted      TEXT,
+    mt5_server                  TEXT,
+    mt5_broker_name             TEXT,
+    mt5_account_balance         NUMERIC(18,2),
+    mt5_account_currency        TEXT,
+    mt5_connected               BOOLEAN         NOT NULL DEFAULT FALSE,
+    symbol_mappings             JSONB,
+
     -- Timestamps
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at                  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at                  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_telegram_users_telegram_id ON telegram_users (telegram_id);
-CREATE INDEX idx_telegram_users_subscription_status ON telegram_users (subscription_status);
-CREATE INDEX idx_telegram_users_mt5_connected ON telegram_users (mt5_connected);
+CREATE INDEX idx_telegram_users_telegram_id
+    ON telegram_users (telegram_id);
 
-COMMENT ON TABLE telegram_users IS 'Telegram bot user accounts with encrypted MT5 credentials.';
-COMMENT ON COLUMN telegram_users.mt5_password_encrypted IS 'Fernet-encrypted MT5 password.';
+CREATE INDEX idx_telegram_users_subscription_status
+    ON telegram_users (subscription_status);
 
--- ==================== SIGNALS ====================
+CREATE INDEX idx_telegram_users_mt5_connected
+    ON telegram_users (mt5_connected);
+
+COMMENT ON TABLE telegram_users IS
+    'Telegram bot user accounts with encrypted MT5 credentials.';
+
+COMMENT ON COLUMN telegram_users.mt5_password_encrypted IS
+    'Fernet-encrypted MT5 broker password. Never stored in plain text.';
+
+
+-- ==================== STEP 4: SIGNALS ====================
+-- Every trade setup the bot detects is saved here.
+-- All users share this table (one setup fired to everyone subscribed).
 
 CREATE TABLE signals (
-    id              BIGSERIAL   PRIMARY KEY,
-    signal_number   INT         NOT NULL UNIQUE,
-    symbol          TEXT        NOT NULL,
-    direction       TEXT        NOT NULL CHECK (direction IN ('BUY', 'SELL')),
-    setup_type      TEXT        NOT NULL CHECK (setup_type IN ('UNICORN', 'STANDARD')),
-    entry_price     NUMERIC(18,5) NOT NULL,
-    stop_loss       NUMERIC(18,5) NOT NULL,
-    take_profit_1   NUMERIC(18,5) NOT NULL,
-    take_profit_2   NUMERIC(18,5) NOT NULL,
+    id              BIGSERIAL       PRIMARY KEY,
+    signal_number   INT             NOT NULL UNIQUE,
+    symbol          TEXT            NOT NULL,
+    direction       TEXT            NOT NULL    CHECK (direction IN ('BUY', 'SELL')),
+    setup_type      TEXT            NOT NULL    CHECK (setup_type IN ('UNICORN', 'STANDARD')),
+    timeframe       TEXT            NOT NULL    DEFAULT 'M15',
+    expiry_hours    INTEGER         NOT NULL    DEFAULT 2,
+    entry_price     NUMERIC(18,5)   NOT NULL,
+    stop_loss       NUMERIC(18,5)   NOT NULL,
+    take_profit_1   NUMERIC(18,5)   NOT NULL,
+    take_profit_2   NUMERIC(18,5)   NOT NULL,
     sl_pips         NUMERIC(10,2),
     tp1_pips        NUMERIC(10,2),
     tp2_pips        NUMERIC(10,2),
     rr_tp1          NUMERIC(6,2),
     rr_tp2          NUMERIC(6,2),
-    ml_score        INT         CHECK (ml_score >= 0 AND ml_score <= 100),
-    lstm_score      INT         CHECK (lstm_score >= 0 AND lstm_score <= 100),
-    xgboost_score   INT         CHECK (xgboost_score >= 0 AND xgboost_score <= 100),
+    ml_score        INT             CHECK (ml_score     BETWEEN 0 AND 100),
+    lstm_score      INT             CHECK (lstm_score   BETWEEN 0 AND 100),
+    xgboost_score   INT             CHECK (xgboost_score BETWEEN 0 AND 100),
     session         TEXT,
-    order_type      TEXT        CHECK (order_type IN ('MARKET', 'LIMIT', 'STOP')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    order_type      TEXT            CHECK (order_type IN ('MARKET', 'LIMIT', 'STOP')),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_signals_created_at ON signals (created_at DESC);
-CREATE INDEX idx_signals_symbol ON signals (symbol);
+CREATE INDEX idx_signals_created_at
+    ON signals (created_at DESC);
 
-COMMENT ON TABLE signals IS 'Automated SMC trading setup history. Shared across all users.';
+CREATE INDEX idx_signals_symbol
+    ON signals (symbol);
 
--- ==================== TRADES ====================
+CREATE INDEX idx_signals_symbol_direction_created
+    ON signals (symbol, direction, created_at DESC);
+
+COMMENT ON TABLE signals IS
+    'Automated SMC trading setup history. One record per setup, shared across all users.';
+
+
+-- ==================== STEP 5: TRADES ====================
+-- When a user executes a setup (manually or via auto-trade),
+-- one row is created here per user per trade.
 
 CREATE TABLE trades (
-    id              BIGSERIAL   PRIMARY KEY,
-    telegram_id     BIGINT      NOT NULL REFERENCES telegram_users(telegram_id) ON DELETE CASCADE,
-    signal_id       BIGINT      REFERENCES signals(id) ON DELETE SET NULL,
+    id              BIGSERIAL       PRIMARY KEY,
+    telegram_id     BIGINT          NOT NULL
+                                    REFERENCES telegram_users(telegram_id)
+                                    ON DELETE CASCADE,
+    signal_id       BIGINT          REFERENCES signals(id) ON DELETE SET NULL,
     mt5_ticket      BIGINT,
-    symbol          TEXT        NOT NULL,
-    direction       TEXT        NOT NULL CHECK (direction IN ('BUY', 'SELL')),
-    lot_size        NUMERIC(10,2) NOT NULL,
+    symbol          TEXT            NOT NULL,
+    direction       TEXT            NOT NULL    CHECK (direction IN ('BUY', 'SELL')),
+    lot_size        NUMERIC(10,2)   NOT NULL,
     entry_price     NUMERIC(18,5),
+    fill_price      NUMERIC(18,5),
     stop_loss       NUMERIC(18,5),
     take_profit_1   NUMERIC(18,5),
     take_profit_2   NUMERIC(18,5),
-    order_type      TEXT        CHECK (order_type IN ('MARKET', 'LIMIT', 'STOP')),
-    status          TEXT        NOT NULL DEFAULT 'OPEN'
-                                CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED', 'EXPIRED')),
-    tp1_hit         BOOLEAN     NOT NULL DEFAULT FALSE,
-    breakeven_set   BOOLEAN     NOT NULL DEFAULT FALSE,
-    realized_pnl    NUMERIC(18,2),
-    rr_achieved     NUMERIC(6,2),
     close_price     NUMERIC(18,5),
+    order_type      TEXT            CHECK (order_type IN ('MARKET', 'LIMIT', 'STOP')),
+    status          TEXT            NOT NULL DEFAULT 'OPEN'
+                                    CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED', 'EXPIRED')),
+    outcome         TEXT            CHECK (outcome IN ('WIN', 'LOSS', 'BREAKEVEN')),
+    tp1_hit         BOOLEAN         NOT NULL DEFAULT FALSE,
+    breakeven_set   BOOLEAN         NOT NULL DEFAULT FALSE,
+    realized_pnl    NUMERIC(18,2),
+    profit_pips     NUMERIC(10,2),
+    rr_achieved     NUMERIC(6,2),
     opened_at       TIMESTAMPTZ,
     closed_at       TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_trades_telegram_id ON trades (telegram_id);
-CREATE INDEX idx_trades_status ON trades (status);
-CREATE INDEX idx_trades_mt5_ticket ON trades (mt5_ticket);
-CREATE INDEX idx_trades_telegram_status ON trades (telegram_id, status);
+CREATE INDEX idx_trades_telegram_id
+    ON trades (telegram_id);
 
-COMMENT ON TABLE trades IS 'Individual trade executions per user.';
+CREATE INDEX idx_trades_status
+    ON trades (status);
 
--- ==================== NEWS EVENTS ====================
+CREATE INDEX idx_trades_mt5_ticket
+    ON trades (mt5_ticket);
+
+CREATE INDEX idx_trades_telegram_status
+    ON trades (telegram_id, status);
+
+COMMENT ON TABLE trades IS
+    'Individual trade executions per user. One row per user per trade.';
+
+
+-- ==================== STEP 6: NEWS EVENTS ====================
+-- The bot caches upcoming economic news here so it can skip
+-- trading during high-impact events.
 
 CREATE TABLE news_events (
-    id              BIGSERIAL   PRIMARY KEY,
-    event_time_utc  TIMESTAMPTZ NOT NULL,
-    currency        TEXT        NOT NULL,
-    event_name      TEXT        NOT NULL,
-    impact          TEXT        NOT NULL CHECK (impact IN ('HIGH', 'MEDIUM', 'LOW')),
+    id              BIGSERIAL       PRIMARY KEY,
+    event_time_utc  TIMESTAMPTZ     NOT NULL,
+    currency        TEXT            NOT NULL,
+    event_name      TEXT            NOT NULL,
+    impact          TEXT            NOT NULL    CHECK (impact IN ('HIGH', 'MEDIUM', 'LOW')),
     forecast        TEXT,
     previous        TEXT,
     actual          TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_news_events_time ON news_events (event_time_utc);
-CREATE INDEX idx_news_events_currency ON news_events (currency);
-CREATE INDEX idx_news_events_impact_time ON news_events (impact, event_time_utc);
+CREATE INDEX idx_news_events_time
+    ON news_events (event_time_utc);
 
-COMMENT ON TABLE news_events IS 'Cached high-impact economic calendar events.';
+CREATE INDEX idx_news_events_currency
+    ON news_events (currency);
 
--- ==================== MODEL METRICS ====================
+CREATE INDEX idx_news_events_impact_time
+    ON news_events (impact, event_time_utc);
 
-CREATE TABLE model_metrics (
-    id              BIGSERIAL   PRIMARY KEY,
-    model_name      TEXT        NOT NULL,
-    metric_type     TEXT        NOT NULL,
-    metric_value    NUMERIC(10,6) NOT NULL,
-    dataset_size    INT,
-    timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+COMMENT ON TABLE news_events IS
+    'Cached high-impact economic calendar events used for news blackout filtering.';
 
-CREATE INDEX idx_model_metrics_model_timestamp ON model_metrics (model_name, timestamp DESC);
 
-COMMENT ON TABLE model_metrics IS 'ML model performance metrics.';
-
--- ==================== ROW LEVEL SECURITY ====================
-
-ALTER TABLE telegram_users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY telegram_users_service_only ON telegram_users
-    USING (auth.role() = 'service_role');
-
-CREATE POLICY trades_service_only ON trades
-    USING (auth.role() = 'service_role');
-
--- ==================== MESSAGE QUEUE FOR OFFLINE USERS ====================
+-- ==================== STEP 7: MESSAGE QUEUE ====================
+-- When the bot needs to send a Telegram message to a user but
+-- they were offline or the send failed, the message is saved here
+-- and retried on the next scan.
 
 CREATE TABLE message_queue (
-    id              BIGSERIAL   PRIMARY KEY,
-    telegram_id     BIGINT      NOT NULL REFERENCES telegram_users(telegram_id) ON DELETE CASCADE,
-    message_text    TEXT        NOT NULL,
-    message_type    TEXT        NOT NULL CHECK (message_type IN ('SETUP_ALERT', 'TRADE_NOTIFICATION', 'SYSTEM_MESSAGE')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    sent_at         TIMESTAMPTZ,
-    status          TEXT        NOT NULL DEFAULT 'PENDING'
-                                CHECK (status IN ('PENDING', 'SENT', 'FAILED'))
+    id              BIGSERIAL       PRIMARY KEY,
+    telegram_id     BIGINT          NOT NULL
+                                    REFERENCES telegram_users(telegram_id)
+                                    ON DELETE CASCADE,
+    message_text    TEXT            NOT NULL,
+    message_type    TEXT            NOT NULL
+                                    CHECK (message_type IN (
+                                        'SETUP_ALERT',
+                                        'TRADE_NOTIFICATION',
+                                        'SYSTEM_MESSAGE'
+                                    )),
+    status          TEXT            NOT NULL DEFAULT 'PENDING'
+                                    CHECK (status IN ('PENDING', 'SENT', 'FAILED')),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    sent_at         TIMESTAMPTZ
 );
 
-CREATE INDEX idx_message_queue_telegram_id ON message_queue (telegram_id);
-CREATE INDEX idx_message_queue_status ON message_queue (status);
-CREATE INDEX idx_message_queue_created_at ON message_queue (created_at);
+CREATE INDEX idx_message_queue_telegram_id
+    ON message_queue (telegram_id);
 
-COMMENT ON TABLE message_queue IS 'Queued messages for offline users with timestamps.';
+CREATE INDEX idx_message_queue_status
+    ON message_queue (status);
 
--- Success message
+CREATE INDEX idx_message_queue_created_at
+    ON message_queue (created_at);
+
+COMMENT ON TABLE message_queue IS
+    'Queued Telegram messages for offline users. Retried on next scheduler cycle.';
+
+
+-- ==================== STEP 8: ML TRAINING DATA ====================
+-- Every completed trade feeds back into this table so the machine
+-- learning models can retrain on real outcomes over time.
+
+CREATE TABLE ml_training_data (
+    id              BIGSERIAL       PRIMARY KEY,
+    mt5_ticket      BIGINT,
+    features_json   TEXT            NOT NULL,
+    outcome         NUMERIC(3,1)    NOT NULL,   -- 1.0 = WIN,  0.0 = LOSS
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_ml_training_created
+    ON ml_training_data (created_at DESC);
+
+COMMENT ON TABLE ml_training_data IS
+    'Feature vectors and outcomes used to retrain ML models on live trade results.';
+
+
+-- ==================== STEP 9: MODEL METRICS ====================
+-- Every time the ML models are evaluated, their accuracy scores
+-- are saved here so we can track improvement over time.
+
+CREATE TABLE model_metrics (
+    id              BIGSERIAL       PRIMARY KEY,
+    model_name      TEXT            NOT NULL,
+    metric_type     TEXT            NOT NULL,
+    metric_value    NUMERIC(10,6)   NOT NULL,
+    dataset_size    INT,
+    timestamp       TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_model_metrics_model_timestamp
+    ON model_metrics (model_name, timestamp DESC);
+
+COMMENT ON TABLE model_metrics IS
+    'ML model performance metrics tracked over time.';
+
+
+-- ==================== STEP 10: QUEUED_MESSAGES VIEW ====================
+-- The bot code references "queued_messages" (with an s).
+-- This view sits on top of the message_queue table and translates
+-- the column names the code expects.
+-- security_invoker = true means the view respects RLS — it does NOT
+-- bypass row-level security the way a SECURITY DEFINER view would.
+
+CREATE VIEW public.queued_messages
+WITH (security_invoker = true)
+AS
+SELECT
+    id,
+    telegram_id,
+    message_text,
+    message_type,
+    (status = 'SENT')   AS delivered,
+    created_at,
+    sent_at             AS delivered_at
+FROM public.message_queue;
+
+COMMENT ON VIEW public.queued_messages IS
+    'Read-only view over message_queue. security_invoker=true enforces RLS of the calling role.';
+
+
+-- ==================== STEP 11: ROW LEVEL SECURITY ====================
+-- RLS means the database enforces access control at the row level.
+-- We lock every table so ONLY the bot server (service_role) can
+-- read or write. No direct public access is possible even if someone
+-- gets hold of the anon key.
+
+ALTER TABLE telegram_users      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE signals             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trades              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE news_events         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE message_queue       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ml_training_data    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE model_metrics       ENABLE ROW LEVEL SECURITY;
+
+-- Drop old policies before recreating (safe to re-run)
+DROP POLICY IF EXISTS telegram_users_service_only   ON telegram_users;
+DROP POLICY IF EXISTS signals_service_only          ON signals;
+DROP POLICY IF EXISTS trades_service_only           ON trades;
+DROP POLICY IF EXISTS news_events_service_only      ON news_events;
+DROP POLICY IF EXISTS message_queue_service_only    ON message_queue;
+DROP POLICY IF EXISTS ml_training_data_service_only ON ml_training_data;
+DROP POLICY IF EXISTS model_metrics_service_only    ON model_metrics;
+
+CREATE POLICY telegram_users_service_only   ON telegram_users
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY signals_service_only          ON signals
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY trades_service_only           ON trades
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY news_events_service_only      ON news_events
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY message_queue_service_only    ON message_queue
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY ml_training_data_service_only ON ml_training_data
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+CREATE POLICY model_metrics_service_only    ON model_metrics
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');
+
+
+-- ==================== STEP 12: FUNCTION SEARCH PATH HARDENING ====================
+-- This patches any existing PostgreSQL functions so they cannot be
+-- tricked into using the wrong schema via a search_path injection attack.
+-- Skips gracefully if a function does not exist yet.
+
 DO $$
+DECLARE
+    _fn TEXT;
 BEGIN
-    RAISE NOTICE 'All tables created successfully!';
-END $$;
-
-
-
-
-
-
-
-
--- NIX TRADES - Database Migration v2
--- Run this in the Supabase SQL Editor.
--- This version matches the actual column names in create_tables.sql.
--- Safe to run multiple times (all statements use IF NOT EXISTS or DO blocks).
-
--- ==================== telegram_users: disclaimer columns ====================
-
-ALTER TABLE telegram_users
-    ADD COLUMN IF NOT EXISTS disclaimer_accepted    BOOLEAN     NOT NULL DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS disclaimer_accepted_at TIMESTAMPTZ;
-
--- ==================== signals: timeframe and expiry columns ====================
-
-ALTER TABLE signals
-    ADD COLUMN IF NOT EXISTS timeframe    TEXT    NOT NULL DEFAULT 'M15',
-    ADD COLUMN IF NOT EXISTS expiry_hours INTEGER NOT NULL DEFAULT 2;
-
--- ==================== trades: outcome and performance columns ====================
--- The trades table uses mt5_ticket (not ticket) per create_tables.sql.
-
-ALTER TABLE trades
-    ADD COLUMN IF NOT EXISTS fill_price   NUMERIC(18, 5),
-    ADD COLUMN IF NOT EXISTS outcome      TEXT
-                                          CHECK (outcome IN ('WIN', 'LOSS', 'BREAKEVEN')),
-    ADD COLUMN IF NOT EXISTS profit_pips  NUMERIC(10, 2);
-
--- close_price, rr_achieved, and status already exist in create_tables.sql.
-
--- ==================== queued_messages ====================
--- The original create_tables.sql creates message_queue.
--- This block creates a queued_messages view over it so database.py works,
--- OR creates the table from scratch if message_queue does not exist.
-
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_name = 'message_queue'
-    ) THEN
-        DROP VIEW IF EXISTS queued_messages;
-        EXECUTE $q$
-            CREATE VIEW queued_messages AS
-            SELECT
-                id,
-                telegram_id,
-                message_text,
-                message_type,
-                (status = 'SENT')  AS delivered,
-                created_at,
-                sent_at            AS delivered_at
-            FROM message_queue
-        $q$;
-        RAISE NOTICE 'queued_messages view created over message_queue.';
-    ELSE
-        CREATE TABLE IF NOT EXISTS queued_messages (
-            id           BIGSERIAL   PRIMARY KEY,
-            telegram_id  BIGINT      NOT NULL
-                                     REFERENCES telegram_users(telegram_id)
-                                     ON DELETE CASCADE,
-            message_text TEXT        NOT NULL,
-            message_type TEXT        NOT NULL DEFAULT 'GENERAL',
-            delivered    BOOLEAN     NOT NULL DEFAULT FALSE,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            delivered_at TIMESTAMPTZ
-        );
-        CREATE INDEX IF NOT EXISTS idx_queued_messages_telegram_id
-            ON queued_messages (telegram_id)
-            WHERE delivered = FALSE;
-        RAISE NOTICE 'queued_messages table created.';
-    END IF;
+    FOREACH _fn IN ARRAY ARRAY[
+        'expire_old_signals',
+        'cleanup_account_snapshots',
+        'update_updated_at_column'
+    ]
+    LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM   pg_proc p
+            JOIN   pg_namespace n ON n.oid = p.pronamespace
+            WHERE  n.nspname = 'public'
+            AND    p.proname = _fn
+        ) THEN
+            EXECUTE format(
+                'ALTER FUNCTION public.%I() SET search_path = public, pg_catalog',
+                _fn
+            );
+            RAISE NOTICE 'Patched search_path on function: %', _fn;
+        ELSE
+            RAISE NOTICE 'Function % not found as a Postgres function - skipped (normal).', _fn;
+        END IF;
+    END LOOP;
 END
 $$;
 
--- ==================== Performance indexes ====================
 
-CREATE INDEX IF NOT EXISTS idx_signals_symbol_direction_created
-    ON signals (symbol, direction, created_at DESC);
+-- ==================== STEP 13: VERIFY ====================
+-- This final block prints a confirmation that everything was created.
 
-CREATE INDEX IF NOT EXISTS idx_trades_telegram_status
-    ON trades (telegram_id, status);
+DO $$
+DECLARE
+    _table_count INT;
+BEGIN
+    SELECT COUNT(*) INTO _table_count
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_type   = 'BASE TABLE'
+      AND table_name IN (
+          'telegram_users',
+          'signals',
+          'trades',
+          'news_events',
+          'message_queue',
+          'ml_training_data',
+          'model_metrics'
+      );
 
-CREATE INDEX IF NOT EXISTS idx_trades_mt5_ticket_idx
-    ON trades (mt5_ticket);
-
-
--- --------------------------------------------------------------------------
--- SQL: Add this table to your Supabase project (SQL Editor > New Query)
--- --------------------------------------------------------------------------
-   CREATE TABLE IF NOT EXISTS ml_training_data (
-       id            BIGSERIAL PRIMARY KEY,
-       mt5_ticket    BIGINT,
-       features_json TEXT NOT NULL,
-       outcome       NUMERIC(3,1) NOT NULL,  -- 1.0 = WIN, 0.0 = LOSS
-       created_at    TIMESTAMPTZ DEFAULT NOW()
-   );
-
-   CREATE INDEX IF NOT EXISTS idx_ml_training_created
-       ON ml_training_data (created_at DESC);
+    IF _table_count = 7 THEN
+        RAISE NOTICE '====================================================';
+        RAISE NOTICE 'All tables, views, and policies created successfully!';
+        RAISE NOTICE 'Tables confirmed: %/7', _table_count;
+        RAISE NOTICE '====================================================';
+    ELSE
+        RAISE WARNING 'Only %/7 tables found. Re-check for errors above.', _table_count;
+    END IF;
+END
+$$;

@@ -272,7 +272,9 @@ class PositionMonitor:
                 if not position.tp1_closed and self._check_tp1_hit(position):
                     self._handle_tp1_hit(position)
 
-                if position.tp1_closed and not position.be_activated:
+                if (position.tp1_closed
+                        and not position.be_activated
+                        and not position.awaiting_partial_confirm):
                     self._handle_be_activation(position)
 
                 if position.tp1_closed and self._check_tp2_hit(position):

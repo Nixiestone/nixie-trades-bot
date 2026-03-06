@@ -147,6 +147,17 @@ class NixTradesScheduler:
                 max_instances=1,
             )
 
+            self.scheduler.add_job(
+                self._run_reconciliation,
+                IntervalTrigger(minutes=30, timezone='UTC'),
+                id='trade_reconciliation',
+                name='Open Trade Reconciliation',
+                replace_existing=True,
+                misfire_grace_time=300,
+                coalesce=True,
+                max_instances=1,
+            )
+
             self.scheduler.start()
             self.running = True
             self.logger.info(
@@ -170,6 +181,89 @@ class NixTradesScheduler:
             self.logger.info("Scheduler stopped.")
         except Exception as e:
             self.logger.error("Error stopping scheduler: %s", e)
+            
+    # ==================== TRADE RECONCILIATION ====================
+
+    async def _reconcile_open_trades(self):
+        """
+        Cross-check every OPEN database trade against MT5.
+
+        Three outcomes per trade:
+          - Ticket still open in MT5:  leave it alone.
+          - Ticket closed in MT5:      mark CLOSED with outcome + pips.
+          - Ticket not found in MT5:   mark EXPIRED (pending order lapsed).
+
+        Runs every 30 minutes so the database never stays out of sync for long.
+        This handles the case where:
+          a) The pending order expiry window passed and MT5 cancelled it.
+          b) The bot was restarted mid-trade and missed the close event.
+        """
+        try:
+            open_trades = db.get_open_trades_all_users()
+            if not open_trades:
+                self.logger.debug("Reconciliation: no open trades to check.")
+                return
+
+            self.logger.info(
+                "Reconciliation: checking %d open trade(s) against MT5.",
+                len(open_trades),
+            )
+
+            for trade in open_trades:
+                ticket      = trade.get('mt5_ticket')
+                trade_id    = trade.get('id')
+                telegram_id = trade.get('telegram_id')
+
+                if not ticket or not telegram_id:
+                    continue
+
+                try:
+                    status_info = self.mt5.check_ticket_status(telegram_id, ticket)
+                    status      = status_info.get('status', 'UNKNOWN')
+
+                    if status == 'POSITION':
+                        # Still open — nothing to do
+                        pass
+
+                    elif status == 'PENDING':
+                        # Pending order still waiting — nothing to do
+                        pass
+
+                    elif status == 'CLOSED':
+                        profit_pips = float(status_info.get('profit_pips', 0) or 0)
+                        close_price = float(status_info.get('close_price', 0) or 0)
+                        closed_at   = status_info.get('closed_at', '')
+                        outcome     = 'WIN' if profit_pips > 0 else ('LOSS' if profit_pips < 0 else 'BREAKEVEN')
+                        db.mark_trade_reconciled(ticket, outcome, profit_pips, close_price, closed_at)
+                        self.logger.info(
+                            "Reconciliation: ticket %d CLOSED offline — "
+                            "outcome=%s pips=%.1f.",
+                            ticket, outcome, profit_pips,
+                        )
+
+                    elif status in ('NOT_FOUND', 'UNKNOWN'):
+                        db.mark_trade_expired(trade_id)
+                        self.logger.info(
+                            "Reconciliation: ticket %d not found in MT5 — "
+                            "marked EXPIRED.", ticket,
+                        )
+
+                except Exception as trade_err:
+                    self.logger.warning(
+                        "Reconciliation: error checking ticket %d: %s",
+                        ticket, trade_err,
+                    )
+
+        except Exception as e:
+            self.logger.error("Reconciliation job failed: %s", e, exc_info=True)
+
+    async def _run_reconciliation(self):
+        """APScheduler entry point for the reconciliation job."""
+        if not self.mt5.is_worker_reachable():
+            self.logger.debug(
+                "Reconciliation skipped: MT5 worker not reachable.")
+            return
+        await self._reconcile_open_trades()
 
     # ==================== DAILY 8 AM ALERT ====================
 
@@ -355,8 +449,9 @@ class NixTradesScheduler:
             bos_events = self.smc.detect_break_of_structure(h1_df, htf_trend['trend'])
             mss_event  = self.smc.detect_market_structure_shift(h1_df, htf_trend['trend'])
 
-            setup_type = None
-            poi        = None
+            setup_type      = None
+            poi             = None
+            all_candidates: list = []
 
             if len(bos_events) >= 2:
                 setup_type = 'BOS'
@@ -364,50 +459,89 @@ class NixTradesScheduler:
                     h1_df, htf_trend['trend'],
                     htf_trend.get('swing_high', 0),
                     htf_trend.get('swing_low', 0))
-                if breakers:
-                    poi = breakers[0]
-                else:
-                    obs = self.smc.detect_order_blocks(h1_df, htf_trend['trend'])
-                    if obs:
-                        poi = obs[0]
-                        self.logger.info(
-                            "%s: BOS confirmed. No Breaker Block found. "
-                            "Using Order Block as fallback POI.", symbol)
+                obs = self.smc.detect_order_blocks(h1_df, htf_trend['trend'])
+                all_candidates = breakers + obs
             elif mss_event:
                 setup_type = 'MSS'
                 obs = self.smc.detect_order_blocks(h1_df, mss_event['direction'])
-                if obs:
-                    poi = obs[0]
+                all_candidates = obs
 
-            if poi is None or setup_type is None:
+            if not all_candidates or setup_type is None:
                 self.logger.info(
-                    "%s: no valid structure or POI found.", symbol)
+                    "%s: no valid structure or POI candidates found.", symbol)
                 return
 
-            # Phase 2b: Inducement gate
-            # Confirms the M15 liquidity sweep happened AFTER BOS/MSS.
-            # Without this the bot enters before the institutional stop hunt,
-            # getting filled at exactly the moment retail stops are being hit.
+            # Filter out any POI that has already been mitigated by price action.
+            # A mitigated zone means institutions already filled their orders there;
+            # there is no point targeting an empty well.
+            unmitigated = [
+                p for p in all_candidates
+                if not self.smc.is_poi_mitigated(p, h1_df)
+            ]
+
+            if not unmitigated:
+                self.logger.info(
+                    "%s: all %d detected POI(s) are mitigated. "
+                    "No valid entry zone remaining. Skipping.",
+                    symbol, len(all_candidates))
+                return
+
+            # Use the highest-confidence unmitigated POI as the anchor for
+            # inducement detection. We need one reference zone to define the
+            # direction and price area of the expected sweep.
+            anchor_poi      = max(unmitigated, key=lambda x: x.get('confidence', 0))
+            trade_direction = anchor_poi['direction']
+
+            # Phase 2b: Inducement gate — validated on H1 to match setup timeframe.
+            # H1 identifies the trade idea (BOS/MSS and POI zones).
+            # M15 confirms the liquidity sweep (inducement) has actually occurred.
+            # M5 is used later for precise entry price refinement only.
+            # This 3-layer zoom is the correct Smart Money workflow.
             inducement = self.smc.detect_inducement_post_structure(
                 m15_df.tail(60),
-                poi,
-                poi['direction'],
+                anchor_poi,
+                trade_direction,
+                symbol=symbol,
             )
             if inducement is None:
                 self.logger.info(
                     "AWAITING INDUCEMENT | %s | %s %s | "
-                    "POI [%.5f - %.5f] valid but no M15 sweep yet. "
+                    "Anchor POI [%.5f - %.5f] valid but no M15 sweep yet. "
                     "Will re-check next scan.",
-                    symbol, setup_type, poi['direction'],
-                    float(poi.get('low', 0)), float(poi.get('high', 0)),
+                    symbol, setup_type, trade_direction,
+                    float(anchor_poi.get('low', 0)), float(anchor_poi.get('high', 0)),
                 )
                 return
-            self.logger.info(
-                "INDUCEMENT CONFIRMED | %s | %.1f pip sweep | Quality: %s",
-                symbol,
-                inducement.get('sweep_pips', 0),
-                inducement.get('quality', 'N/A'),
+
+            sweep_level = float(inducement.get('sweep_level', 0))
+
+            # Now that the sweep is confirmed, pick the CLOSEST unmitigated POI
+            # to the sweep level. This is the real entry zone — the nearest
+            # institutional block to where the stop hunt just occurred.
+            poi = self.smc.get_closest_unmitigated_poi(
+                unmitigated, sweep_level, trade_direction, h1_df
             )
+            if poi is None:
+                # Fallback: no POI is optimally positioned relative to the sweep,
+                # so use the anchor that we already validated above.
+                poi = anchor_poi
+                self.logger.info(
+                    "%s: No POI closer to sweep %.5f found. "
+                    "Falling back to anchor POI [%.5f - %.5f].",
+                    symbol, sweep_level,
+                    float(anchor_poi.get('low', 0)), float(anchor_poi.get('high', 0)),
+                )
+            else:
+                poi_mid = (float(poi.get('low', 0)) + float(poi.get('high', 0))) / 2
+                self.logger.info(
+                    "INDUCEMENT CONFIRMED | %s | %.1f pip sweep | Quality: %s | "
+                    "Entry POI [%.5f - %.5f] (%.5f from sweep).",
+                    symbol,
+                    inducement.get('sweep_pips', 0),
+                    inducement.get('quality', 'N/A'),
+                    float(poi.get('low', 0)), float(poi.get('high', 0)),
+                    abs(poi_mid - sweep_level),
+                )
 
             # Phase 3: ML validation
             ml_result     = self.ml.get_ensemble_prediction(
@@ -490,9 +624,16 @@ class NixTradesScheduler:
                     event_ts = event_ts.replace(tzinfo=timezone.utc)
                 mins = int((event_ts - datetime.now(timezone.utc)).total_seconds() / 60)
                 if 0 < mins <= 240:
+                    if mins >= 60:
+                        _hours     = mins // 60
+                        _remaining = mins % 60
+                        _time_str  = f"{_hours}h {_remaining}m" if _remaining else f"{_hours}h"
+                    else:
+                        _time_str = f"{mins}m"
                     news_warn = (
                         f"Note: {next_news.currency} {next_news.title} "
-                        f"scheduled in {mins} minutes. Exercise caution.")
+                        f"scheduled in {_time_str}. Exercise caution."
+                    )
 
             setup_tier  = 'UNICORN' if tier == 'PREMIUM' else 'STANDARD'
             setup_label = f"{setup_tier} {setup_type}"
@@ -874,9 +1015,12 @@ class NixTradesScheduler:
                 lot_size=lot_size,
                 entry_price=entry,
                 stop_loss=setup_data['stop_loss'],
-                take_profit=setup_data['take_profit_1'],   # Initial TP is TP1
+                take_profit=setup_data['take_profit_1'],
+                take_profit_2=setup_data['take_profit_2'],
                 order_type=order_type,
                 comment='Nix Trades Auto',
+                sl_pips=float(setup_data.get('sl_pips', 20.0)),
+                risk_percent=float(user.get('risk_percent', config.DEFAULT_RISK_PERCENT)),
             )
 
             if success and ticket:

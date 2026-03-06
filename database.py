@@ -236,7 +236,8 @@ def get_subscribed_users() -> List[dict]:
         .table('telegram_users')
         .select(
             'telegram_id, username, first_name, timezone, risk_percent, '
-            'mt5_login, mt5_connected, disclaimer_accepted'
+            'mt5_login, mt5_server, mt5_broker_name, mt5_account_balance, '
+            'mt5_account_currency, mt5_connected, disclaimer_accepted'
         )
         .eq('subscription_status', 'active')
         .execute()
@@ -249,29 +250,35 @@ def get_user_statistics(telegram_id: int) -> dict:
     """
     Return trading statistics summary for a user.
     Used by the /status command.
+    Win rate is calculated from CLOSED trades only.
+    Open trades are counted separately so the scoreboard is always accurate.
     """
-    trades_result = (
+    all_result = (
         _client()
         .table('trades')
-        .select('profit_pips, outcome, created_at')
+        .select('status, profit_pips, outcome')
         .eq('telegram_id', telegram_id)
-        .order('created_at', desc=True)
-        .limit(100)
         .execute()
     )
 
-    trades = trades_result.data or []
-    total  = len(trades)
-    wins   = sum(1 for t in trades if t.get('outcome') == 'WIN')
-    losses = sum(1 for t in trades if t.get('outcome') == 'LOSS')
-    pips   = sum(float(t.get('profit_pips', 0)) for t in trades)
+    all_trades    = all_result.data or []
+    total         = len(all_trades)
+    open_count    = sum(1 for t in all_trades if t.get('status') == 'OPEN')
+    closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
+    closed_count  = len(closed_trades)
+
+    wins   = sum(1 for t in closed_trades if t.get('outcome') == 'WIN')
+    losses = sum(1 for t in closed_trades if t.get('outcome') == 'LOSS')
+    pips   = sum(float(t.get('profit_pips') or 0) for t in closed_trades)
 
     return {
-        'total_trades': total,
-        'wins':         wins,
-        'losses':       losses,
-        'win_rate':     round((wins / total * 100) if total > 0 else 0.0, 1),
-        'total_pips':   round(pips, 1),
+        'total_trades':  total,
+        'open_trades':   open_count,
+        'closed_trades': closed_count,
+        'wins':          wins,
+        'losses':        losses,
+        'win_rate':      round((wins / closed_count * 100) if closed_count > 0 else 0.0, 1),
+        'total_pips':    round(pips, 1),
     }
 
 
@@ -579,6 +586,65 @@ def update_trade(
     _client().table('trades').update(update_data).eq('mt5_ticket', ticket).execute()
     return True
 
+@_db_retry()
+def get_open_trades_all_users() -> List[dict]:
+    """
+    Return all trades with status OPEN across every user.
+    Used by the reconciliation job to cross-check against MT5.
+    """
+    result = (
+        _client()
+        .table('trades')
+        .select('id, telegram_id, mt5_ticket, symbol, direction, opened_at')
+        .eq('status', 'OPEN')
+        .execute()
+    )
+    return result.data or []
+
+
+@_db_retry()
+def mark_trade_expired(trade_id: int) -> bool:
+    """
+    Set a trade status to EXPIRED.
+    Called when MT5 confirms the pending order no longer exists
+    because the time expiry window passed without the order filling.
+    """
+    _client().table('trades').update({
+        'status':     'EXPIRED',
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }).eq('id', trade_id).execute()
+    logger.info("Trade id=%d marked EXPIRED (order never filled).", trade_id)
+    return True
+
+
+@_db_retry()
+def mark_trade_reconciled(
+    ticket: int,
+    outcome: str,
+    profit_pips: float,
+    close_price: float,
+    closed_at: str,
+) -> bool:
+    """
+    Update a trade that closed while the bot was offline.
+    Called by the scheduler reconciliation job when MT5 deal history
+    shows a position that our database still has as OPEN.
+    """
+    _client().table('trades').update({
+        'status':      'CLOSED',
+        'outcome':     outcome,
+        'profit_pips': profit_pips,
+        'close_price': close_price,
+        'closed_at':   closed_at,
+        'updated_at':  datetime.now(timezone.utc).isoformat(),
+    }).eq('mt5_ticket', ticket).execute()
+    logger.info(
+        "Trade ticket=%d reconciled: outcome=%s pips=%.1f.",
+        ticket, outcome, profit_pips,
+    )
+    return True
+
+@_db_retry()
 def recent_signal_exists(symbol: str, minutes: int = 15) -> bool:
     """
     Return True if a setup for this symbol was saved within the last N minutes.
@@ -747,13 +813,9 @@ def get_daily_loss_percent(
     if not trades:
         return 0.0
 
-    # Sum negative profit_pips weighted by lot size as a proxy for % loss.
-    # A more accurate calculation requires the account balance at trade open,
-    # which is stored in the user record. We use pip-weighted loss as an
-    # approximation that is safe (may over-estimate loss, which is conservative).
     total_loss_pips = sum(
-        float(t.get('profit_pips', 0)) for t in trades
-        if float(t.get('profit_pips', 0)) < 0
+        float(t.get('profit_pips') or 0) for t in trades
+        if float(t.get('profit_pips') or 0) < 0
     )
 
     # Fetch user's stored balance for percent calculation

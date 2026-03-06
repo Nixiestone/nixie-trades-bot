@@ -893,16 +893,21 @@ class NixTradesBot:
                     f"Broker:              {user.get('mt5_broker_name', 'N/A')}",
                     f"Account:             ****{str(user.get('mt5_login', ''))[-4:]}",
                 ]
+            closed  = stats.get('closed_trades', 0)
+            open_ct = stats.get('open_trades', 0)
             lines += [
                 "",
                 "TRADING STATISTICS",
                 "",
-                f"Total Setups Sent:   {stats.get('total_trades', 0)}",
-                f"Winning Trades:      {stats.get('wins', 0)}",
-                f"Losing Trades:       {stats.get('losses', 0)}",
-                f"Historical Win Rate: {stats.get('win_rate', 0.0):.1f}%",
-                "  (Past performance does not guarantee future results)",
-                f"Total Pips:          {stats.get('total_pips', 0.0):+.1f}",
+                f"Total Setups Executed: {stats.get('total_trades', 0)}",
+                f"Currently Open:        {open_ct}",
+                f"Closed Trades:         {closed}",
+                f"Winning Trades:        {stats.get('wins', 0)}",
+                f"Losing Trades:         {stats.get('losses', 0)}",
+                f"Win Rate:              {stats.get('win_rate', 0.0):.1f}%"
+                f"  (based on {closed} closed trade(s))",
+                "  Past performance does not guarantee future results.",
+                f"Total Pips (Closed):   {stats.get('total_pips', 0.0):+.1f}",
                 "",
                 "Use /settings to adjust your risk percentage.",
                 f"\n{config.FOOTER}",
@@ -1393,7 +1398,10 @@ class NixTradesBot:
                 ticket=position.ticket,
                 new_sl=be_price,
             )
-            if not success:
+            if success:
+                position.be_activated = True
+                position.stop_loss    = be_price
+            else:
                 self.logger.warning(
                     "Could not move SL to breakeven for ticket %d: %s",
                     position.ticket, msg)

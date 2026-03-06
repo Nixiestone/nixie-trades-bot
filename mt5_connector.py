@@ -276,6 +276,7 @@ class MT5Connector:
         lot_size: float,
         stop_loss: float,
         take_profit: float,
+        take_profit_2: Optional[float] = None,
         order_type: str = 'MARKET',
         entry_price: Optional[float] = None,
         comment: str = 'Nix Trades',
@@ -312,16 +313,18 @@ class MT5Connector:
 
         expiry_hours = max(1, expiry_minutes // 60)
 
+        tp2_value = take_profit_2 if take_profit_2 is not None else take_profit
+
         payload = {
             'login':        creds['login'],
-            'password':     creds['password'],   # scrubbed in worker logs
+            'password':     creds['password'],
             'server':       creds['server'],
             'symbol':       symbol,
             'direction':    direction,
             'entry':        entry_price if entry_price is not None else 0.0,
             'sl':           stop_loss,
             'tp1':          take_profit,
-            'tp2':          take_profit,          # bot sets tp2 same as tp1; position monitor updates
+            'tp2':          tp2_value,
             'sl_pips':      sl_pips,
             'risk_percent': risk_percent,
             'lot_size':     lot_size,
@@ -448,3 +451,37 @@ class MT5Connector:
         if success and isinstance(result, dict):
             return True, result
         return False, {}
+    
+    def check_ticket_status(self, telegram_id: int, ticket: int) -> dict:
+        """
+        Ask the MT5 worker what happened to a specific order or position.
+
+        Used by the scheduler reconciliation job every 30 minutes to keep
+        the database in sync with actual MT5 state.
+
+        Args:
+            telegram_id: Telegram user ID (used only for logging context).
+            ticket:      MT5 ticket number to look up.
+
+        Returns:
+            dict with keys:
+              status:      'POSITION' | 'PENDING' | 'CLOSED' | 'NOT_FOUND' | 'UNKNOWN'
+              close_price: float (present when CLOSED)
+              profit_pips: float (present when CLOSED, positive = profit)
+              closed_at:   ISO datetime string (present when CLOSED)
+        """
+        try:
+            success, result = self._get(f'/ticket_status/{ticket}')
+            if success and isinstance(result, dict):
+                return {
+                    'status':      result.get('status', 'UNKNOWN'),
+                    'close_price': result.get('close_price'),
+                    'profit_pips': result.get('profit_pips'),
+                    'closed_at':   result.get('closed_at'),
+                }
+        except Exception as e:
+            self.logger.error(
+                "check_ticket_status failed for ticket %d (user %d): %s",
+                ticket, telegram_id, e,
+            )
+        return {'status': 'UNKNOWN'}

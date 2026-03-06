@@ -1293,6 +1293,7 @@ class SMCStrategy:
         poi: Dict,
         direction: str,
         lookback_bars: int = 40,
+        symbol: str = 'EURUSD',
     ) -> Optional[Dict]:
         """
         Verify a liquidity sweep (inducement) has occurred on M15 AFTER
@@ -1359,12 +1360,16 @@ class SMCStrategy:
             swing_idx    = target_swing['index']
 
             sweep_candle = None
+            _pip_size = utils.get_pip_value(symbol)
+            if _pip_size <= 0:
+                _pip_size = 0.0001
+
             for j in range(swing_idx + 1, len(df)):
                 candle = df.iloc[j]
                 if is_buy:
                     if (float(candle['low']) < sweep_level
                             and float(candle['close']) > sweep_level):
-                        sweep_pips = (sweep_level - float(candle['low'])) / 0.0001
+                        sweep_pips = (sweep_level - float(candle['low'])) / _pip_size
                         if sweep_pips >= 3.0:
                             sweep_candle = {
                                 'index': j, 'timestamp': df.index[j],
@@ -1374,19 +1379,20 @@ class SMCStrategy:
                                 'sweep_pips': round(sweep_pips, 1),
                             }
                             break
-                else:
-                    if (float(candle['high']) > sweep_level
-                            and float(candle['close']) < sweep_level):
-                        sweep_pips = (float(candle['high']) - sweep_level) / 0.0001
-                        if sweep_pips >= 3.0:
-                            sweep_candle = {
-                                'index': j, 'timestamp': df.index[j],
-                                'sweep_level': round(sweep_level, 5),
-                                'sweep_high': round(float(candle['high']), 5),
-                                'close': round(float(candle['close']), 5),
-                                'sweep_pips': round(sweep_pips, 1),
-                            }
-                            break
+                        else:
+                            
+                            if (float(candle['high']) > sweep_level
+                                and float(candle['close']) < sweep_level):
+                                sweep_pips = (float(candle['high']) - sweep_level) / _pip_size
+                                if sweep_pips >= 3.0:
+                                    sweep_candle = {
+                                        'index': j, 'timestamp': df.index[j],
+                                        'sweep_level': round(sweep_level, 5),
+                                        'sweep_high': round(float(candle['high']), 5),
+                                        'close': round(float(candle['close']), 5),
+                                        'sweep_pips': round(sweep_pips, 1),
+                                    }   
+                                    break
 
             if sweep_candle is None:
                 self.logger.info(
@@ -1429,6 +1435,122 @@ class SMCStrategy:
         except Exception as e:
             self.logger.error(
                 "Error in detect_inducement_post_structure: %s", e)
+            return None
+        
+    def is_poi_mitigated(self, poi: Dict, data: pd.DataFrame) -> bool:
+        """
+        Check whether a Point of Interest has been invalidated by price action.
+
+        A bullish POI (demand zone) is mitigated when any candle CLOSES
+        below the POI low after the zone was formed. Price returning to the
+        zone and closing inside it means the buyers there were defeated.
+
+        A bearish POI (supply zone) is mitigated when any candle CLOSES
+        above the POI high after the zone was formed.
+
+        Args:
+            poi:  The POI dict (must have 'index', 'high', 'low', 'direction').
+            data: The same OHLCV DataFrame used when detecting the POI.
+
+        Returns:
+            True  — POI is mitigated (do NOT trade it).
+            False — POI is still fresh and valid.
+        """
+        try:
+            poi_index = int(poi.get('index', 0))
+            poi_high  = float(poi.get('high', 0))
+            poi_low   = float(poi.get('low',  0))
+            direction = str(poi.get('direction', 'BULLISH')).upper()
+
+            # Only look at candles that formed AFTER the POI
+            post_poi = data.iloc[poi_index + 1:]
+
+            if post_poi.empty:
+                return False   # No candles after POI yet — still fresh
+
+            if direction in ('BULLISH', 'BUY'):
+                # Mitigated if any close is below the demand zone low
+                return bool((post_poi['close'] < poi_low).any())
+            else:
+                # Mitigated if any close is above the supply zone high
+                return bool((post_poi['close'] > poi_high).any())
+
+        except Exception as e:
+            self.logger.error("Error in is_poi_mitigated: %s", e)
+            return False   # On error, assume valid (conservative)
+
+    def get_closest_unmitigated_poi(
+        self,
+        pois: List[Dict],
+        sweep_level: float,
+        direction: str,
+        data: pd.DataFrame,
+    ) -> Optional[Dict]:
+        """
+        From a list of POIs, return the CLOSEST unmitigated zone to the
+        inducement sweep level.
+
+        Why closest? Smart money sets entries at the nearest available
+        institutional zone to where liquidity was swept. A distant zone
+        is less likely to be the real order origin.
+
+        For BUY setups: find the unmitigated bullish POI whose MID is
+        nearest to (and at or above) the sweep_level.
+
+        For SELL setups: find the unmitigated bearish POI whose MID is
+        nearest to (and at or below) the sweep_level.
+
+        Args:
+            pois:        All POI candidates (already filtered for direction).
+            sweep_level: Price level where the inducement sweep occurred.
+            direction:   'BULLISH' or 'BEARISH'.
+            data:        OHLCV DataFrame for mitigation checks.
+
+        Returns:
+            The closest valid POI dict, or None if nothing qualifies.
+        """
+        try:
+            is_buy = direction.upper() in ('BULLISH', 'BUY')
+            scored = []
+
+            for p in pois:
+                if self.is_poi_mitigated(p, data):
+                    continue   # Already dug — skip
+
+                p_mid  = (float(p.get('high', 0)) + float(p.get('low', 0))) / 2
+                p_high = float(p.get('high', 0))
+                p_low  = float(p.get('low',  0))
+
+                if is_buy:
+                    # Demand zone must sit at or above the sweep so price
+                    # can return UP into it after the stop hunt.
+                    if p_mid < sweep_level:
+                        continue
+                else:
+                    # Supply zone must sit at or below the sweep so price
+                    # can return DOWN into it after the stop hunt.
+                    if p_mid > sweep_level:
+                        continue
+
+                distance = abs(p_mid - sweep_level)
+                scored.append((distance, p))
+
+            if not scored:
+                return None
+
+            # Sort ascending by distance — smallest distance first
+            scored.sort(key=lambda x: x[0])
+            best_distance, best_poi = scored[0]
+
+            self.logger.info(
+                "Closest unmitigated POI: [%.5f - %.5f] distance=%.5f from sweep %.5f.",
+                float(best_poi.get('low', 0)), float(best_poi.get('high', 0)),
+                best_distance, sweep_level,
+            )
+            return best_poi
+
+        except Exception as e:
+            self.logger.error("Error in get_closest_unmitigated_poi: %s", e)
             return None
     
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:

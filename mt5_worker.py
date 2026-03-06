@@ -717,6 +717,41 @@ def get_tick():
         _mt5_lock.release()
 
 
+@app.route('/exchange_rates', methods=['GET'])
+@require_api_key
+def get_exchange_rates():
+    """
+    Return mid-market exchange rates for major pairs.
+    Used by the connector's lot-size calculation when the account currency
+    is not USD. Returns the mid-price (bid + ask) / 2 for each pair.
+    """
+    acquired = _mt5_lock.acquire(timeout=_MT5_LOCK_TIMEOUT)
+    if not acquired:
+        return jsonify({'success': False, 'error': 'Service busy. Please retry in 30 seconds.'}), 503
+    try:
+        if not mt5.initialize():
+            return jsonify({'success': False, 'error': 'MT5 initialise failed.'})
+
+        rate_symbols = ['USDJPY', 'EURUSD', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF']
+        rates = {}
+        for sym in rate_symbols:
+            broker_sym = _normalise_symbol(sym)
+            if broker_sym:
+                tick = mt5.symbol_info_tick(broker_sym)
+                if tick and tick.bid > 0 and tick.ask > 0:
+                    rates[sym] = round((tick.bid + tick.ask) / 2.0, 5)
+
+        return jsonify({'success': True, 'rates': rates})
+
+    except Exception as exc:
+        logger.error("Error in /exchange_rates: %s", exc)
+        return jsonify({'success': False, 'error': str(exc)})
+
+    finally:
+        _shutdown_safe()
+        _mt5_lock.release()
+
+
 @app.route('/connect', methods=['POST'])
 @require_api_key
 def connect():
@@ -825,10 +860,13 @@ def execute():
     if order_type not in ('MARKET', 'LIMIT', 'STOP'):
         return jsonify({'success': False, 'error': "order_type must be MARKET, LIMIT, or STOP"}), 400
 
-    # Pre-broker price validation
-    price_valid, price_error = _validate_trade_prices(direction, entry, sl, tp1, tp2)
-    if not price_valid:
-        return jsonify({'success': False, 'error': price_error}), 400
+    # Pre-broker price validation applies to pending orders only.
+    # For MARKET orders the fill price is the live ask or bid taken from the tick
+    # inside _place_order, so the entry field is irrelevant and must not be validated.
+    if order_type != 'MARKET':
+        price_valid, price_error = _validate_trade_prices(direction, entry, sl, tp1, tp2)
+        if not price_valid:
+            return jsonify({'success': False, 'error': price_error}), 400
 
     acquired = _mt5_lock.acquire(timeout=_MT5_LOCK_TIMEOUT)
     if not acquired:
@@ -1258,6 +1296,87 @@ def modify_sl():
 
         logger.info("SL modified: ticket=%d new_sl=%.5f", ticket, new_sl)
         return jsonify({'success': True, 'ticket': ticket, 'new_sl': new_sl})
+
+    finally:
+        _shutdown_safe()
+        _mt5_lock.release()
+        
+@app.route('/ticket_status/<int:ticket>', methods=['GET'])
+@require_api_key
+def ticket_status(ticket: int):
+    """
+    Check the current status of a specific MT5 ticket number.
+
+    Used by the scheduler reconciliation job to detect:
+      - Orders that expired (pending, never filled)
+      - Positions that closed while the bot was offline
+
+    Returns JSON with:
+      status: 'POSITION' | 'PENDING' | 'CLOSED' | 'NOT_FOUND'
+      close_price:  float (only when CLOSED)
+      profit_pips:  float (only when CLOSED, positive = win)
+      closed_at:    ISO string (only when CLOSED)
+    """
+    acquired = _mt5_lock.acquire(timeout=_MT5_LOCK_TIMEOUT)
+    if not acquired:
+        return jsonify({
+            'success': False,
+            'error':   'Service busy. Please retry in 30 seconds.',
+        }), 503
+
+    try:
+        if not mt5.initialize():
+            return jsonify({'success': False, 'error': 'MT5 initialise failed.'})
+
+        # 1. Check open positions
+        positions = mt5.positions_get(ticket=ticket)
+        if positions:
+            return jsonify({'success': True, 'status': 'POSITION', 'ticket': ticket})
+
+        # 2. Check pending orders
+        orders = mt5.orders_get(ticket=ticket)
+        if orders:
+            return jsonify({'success': True, 'status': 'PENDING', 'ticket': ticket})
+
+        # 3. Search deal history for the last 90 days
+        from_date = datetime.now(timezone.utc) - timedelta(days=90)
+        history   = mt5.history_deals_get(from_date, datetime.now(timezone.utc))
+
+        if history:
+            for deal in history:
+                if deal.order == ticket or deal.position_id == ticket:
+                    # Calculate pip size from symbol info
+                    symbol_info = mt5.symbol_info(deal.symbol)
+                    pip_size    = 0.0001
+                    if symbol_info:
+                        point    = symbol_info.point
+                        pip_size = point * 10 if point > 0 else 0.0001
+
+                    # Profit in pips: deal.profit is in account currency,
+                    # so convert using deal volume and symbol info.
+                    # Simpler and more reliable: use price difference.
+                    profit_pips = round(deal.profit / max(deal.volume, 0.01) / 10, 1) \
+                        if deal.volume > 0 else 0.0
+
+                    closed_at = datetime.fromtimestamp(
+                        deal.time, tz=timezone.utc
+                    ).isoformat()
+
+                    return jsonify({
+                        'success':     True,
+                        'status':      'CLOSED',
+                        'ticket':      ticket,
+                        'close_price': round(deal.price, 5),
+                        'profit_pips': profit_pips,
+                        'closed_at':   closed_at,
+                    })
+
+        # 4. Not found anywhere
+        return jsonify({'success': True, 'status': 'NOT_FOUND', 'ticket': ticket})
+
+    except Exception as e:
+        logger.error("Error in /ticket_status/%d: %s", ticket, e)
+        return jsonify({'success': False, 'error': str(e)})
 
     finally:
         _shutdown_safe()
