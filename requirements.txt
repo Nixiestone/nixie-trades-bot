@@ -1,5 +1,5 @@
 # ==================== CORE SYSTEM PACKAGES (install first) ====================
-typing-extensions==4.9.0
+typing-extensions==4.14.0
 urllib3==2.1.0
 
 # ==================== CRYPTOGRAPHY & SECURITY ====================
@@ -21,7 +21,7 @@ aiohttp==3.9.1
 beautifulsoup4==4.12.3
 
 # ==================== DATABASE ====================
-supabase==2.3.0
+supabase==2.28.0
 
 # ==================== SCHEDULING ====================
 APScheduler==3.10.4
@@ -40,13 +40,14 @@ mplfinance==0.12.10b0
 # ==================== LOGGING ====================
 colorlog==6.8.2
 
+aiohttp
+waitress
 # ==================== TELEGRAM BOT (install last - has many dependencies) ====================
-python-telegram-bot==20.7
+python-telegram-bot==21.0
 
 # ==================== MT5 WORKER SERVICE (Windows VPS only) ====================
 # DO NOT install these on your Linux bot server
 # Only install on Windows VPS where mt5_worker.py runs:
 #   pip install MetaTrader5 flask flask-limiter pywin32
 
-aiohttp
-waitress
+
