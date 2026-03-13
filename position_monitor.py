@@ -4,7 +4,7 @@ import threading
 import time as time_module
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import config
 import database as db
@@ -30,12 +30,13 @@ class MonitoredPosition:
     magic_number:  int          = 234567
     opened_at:     datetime     = field(default_factory=datetime.now)
     last_check:    datetime     = field(default_factory=datetime.now)
-    tp1_closed:    bool         = False
-    be_activated:  bool         = False
-    profit:        float        = 0.0
-    ml_features:              Optional[object] = None
-    awaiting_partial_confirm: bool  = False
+    tp1_closed:              bool  = False
+    be_activated:            bool  = False
+    profit:                  float = 0.0
+    ml_features:             Optional[object] = None
+    awaiting_partial_confirm: bool = False
     partial_confirm_sent_at:  float = 0.0
+    user_declined_breakeven:  bool = False
 
 
 class PositionMonitor:
@@ -274,7 +275,8 @@ class PositionMonitor:
 
                 if (position.tp1_closed
                         and not position.be_activated
-                        and not position.awaiting_partial_confirm):
+                        and not position.awaiting_partial_confirm
+                        and not position.user_declined_breakeven):
                     self._handle_be_activation(position)
 
                 if position.tp1_closed and self._check_tp2_hit(position):
@@ -344,8 +346,13 @@ class PositionMonitor:
                 "Moving SL to breakeven and holding to TP2.",
                 position.ticket, position.volume, MIN_LOT_FOR_PARTIAL)
             self._handle_be_activation(position)
-            pips = utils.calculate_pips(
-                position.symbol, position.entry_price, position.take_profit_1)
+            pip_size = utils.get_pip_value(position.symbol)
+            if pip_size <= 0:
+                pip_size = 0.0001
+            if position.direction == 'BUY':
+                pips = (position.take_profit_1 - position.entry_price) / pip_size
+            else:
+                pips = (position.entry_price - position.take_profit_1) / pip_size
             self._send_notification(
                 position.telegram_id,
                 "TP1 REACHED - HOLDING TO TP2\n\n"
@@ -356,7 +363,7 @@ class PositionMonitor:
                 "Your position size (%.2f lots) cannot be partially closed "
                 "as this would create a sub-minimum position.\n"
                 "Stop loss has been moved to breakeven.\n"
-                "Full position is running to TP2." % (
+                "Full position is running to TP2 automatically." % (
                     position.ticket,
                     position.symbol,
                     utils.format_price(position.symbol, position.take_profit_1),
@@ -386,11 +393,11 @@ class PositionMonitor:
 
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    "Take 50 Percent Profit Now",
+                    "Yes - Take 50 Percent Now",
                     callback_data="partial_close_yes_%d" % position.ticket
                 ),
                 InlineKeyboardButton(
-                    "Hold Full Position to TP2",
+                    "No - Hold to TP2",
                     callback_data="partial_close_no_%d" % position.ticket
                 ),
             ]])
@@ -518,28 +525,181 @@ class PositionMonitor:
             self.logger.error(
                 "Error activating breakeven for ticket %d: %s", position.ticket, e
             )
+            
+    def execute_confirmed_partial_close(self, ticket: int) -> Tuple[bool, str]:
+        """
+        Called by bot.py inline keyboard callback handler when the user
+        confirms they want to take 50 percent partial profit at TP1.
+
+        Closes half the position, moves the stop-loss to breakeven plus the
+        configured buffer, and clears the awaiting_partial_confirm flag so
+        normal monitoring resumes on the remaining 50 percent.
+
+        Returns:
+            (True, confirmation_message) on success
+            (False, error_message) on failure
+        """
+        position = self.get_position_by_ticket(ticket)
+        if position is None:
+            return False, (
+                "Position %d was not found. "
+                "It may have already been closed automatically." % ticket
+            )
+        if not position.awaiting_partial_confirm:
+            return False, (
+                "This position is no longer awaiting a partial close decision. "
+                "It may have already been processed."
+            )
+        try:
+            success, message = self.mt5.close_partial_position(
+                telegram_id=position.telegram_id,
+                ticket=ticket,
+                close_pct=0.5,
+            )
+            position.awaiting_partial_confirm = False
+            if success:
+                self._handle_be_activation(position)
+                pip_size = utils.get_pip_value(position.symbol)
+                if pip_size <= 0:
+                    pip_size = 0.0001
+                if position.direction == 'BUY':
+                    pips = (position.take_profit_1 - position.entry_price) / pip_size
+                else:
+                    pips = (position.entry_price - position.take_profit_1) / pip_size
+                self.logger.info(
+                    "Partial close confirmed and executed: ticket=%d symbol=%s "
+                    "50 percent closed at TP1 (%.1f pips). Breakeven activated.",
+                    ticket, position.symbol, pips)
+                return True, (
+                    "50 percent of your position has been closed at TP1 (+%.1f pips). "
+                    "Stop loss moved to breakeven. "
+                    "Remaining position is running to TP2 automatically." % pips
+                )
+            else:
+                self.logger.error(
+                    "Partial close execution failed for ticket %d: %s", ticket, message)
+                return False, (
+                    "Partial close could not be executed at this time: %s. "
+                    "Full position continues to TP2." % message
+                )
+        except Exception as e:
+            position.awaiting_partial_confirm = False
+            self.logger.error(
+                "Error executing confirmed partial close for ticket %d: %s", ticket, e)
+            return False, (
+                "An error occurred during partial close. "
+                "Full position continues to TP2."
+            )
+
+    def hold_full_position_to_tp2(self, ticket: int) -> Tuple[bool, str]:
+        """
+        Called by bot.py inline keyboard callback handler when the user
+        declines partial close and chooses to hold the full position to TP2.
+
+        Clears the confirmation pending flag, activates breakeven protection,
+        and allows monitoring to continue normally.
+
+        Returns:
+            (True, confirmation_message) on success
+            (False, error_message) if position not found
+        """
+        position = self.get_position_by_ticket(ticket)
+        if position is None:
+            return False, (
+                "Position %d was not found. "
+                "It may have already been closed." % ticket
+            )
+        position.awaiting_partial_confirm = False
+        if not position.be_activated:
+            self._handle_be_activation(position)
+        self.logger.info(
+            "User elected to hold full position to TP2 for ticket %d.", ticket)
+        return True, (
+            "Full position is holding to TP2. "
+            "Stop loss has been moved to breakeven. "
+            "The position is being monitored automatically."
+        )
 
     def _handle_position_closed(self, position: MonitoredPosition):
-        """Position disappeared from MT5 - stop loss or manual close."""
+        """
+        Position disappeared from MT5. Determine outcome from the last
+        known profit value recorded on the MonitoredPosition object.
+
+        Three reasons a position can disappear:
+          1. Stop loss hit (profit <= 0 => LOSS)
+          2. TP2 hit by MT5 natively before the 10-second monitor cycle
+             caught it (profit > 0 => WIN)
+          3. Manual close by the user (profit determines outcome)
+
+        Using position.profit, which is refreshed from the live MT5 data
+        on every monitor cycle, gives the correct outcome for all three cases.
+        """
+        pip_size = utils.get_pip_value(position.symbol)
+        if pip_size <= 0:
+            pip_size = 0.0001
+
+        profit_value = float(position.profit)
+
+        if profit_value > 0:
+            outcome = 'WIN'
+            if position.direction == 'BUY':
+                pips = (position.current_price - position.entry_price) / pip_size
+            else:
+                pips = (position.entry_price - position.current_price) / pip_size
+            pips = max(pips, 0.0)
+        elif profit_value < 0:
+            outcome = 'LOSS'
+            if position.direction == 'BUY':
+                pips = (position.current_price - position.entry_price) / pip_size
+            else:
+                pips = (position.entry_price - position.current_price) / pip_size
+        else:
+            outcome = 'BREAKEVEN'
+            pips    = 0.0
+
         self.logger.info(
-            "Position %d (%s) is no longer in MT5. Recording as LOSS.",
-            position.ticket, position.symbol,
+            "Position %d (%s) is no longer in MT5. "
+            "outcome=%s profit=%.2f pips=%.1f.",
+            position.ticket, position.symbol, outcome, profit_value, pips,
         )
+
         try:
-            position.status = 'STOPPED'
+            position.status = 'STOPPED' if outcome == 'LOSS' else 'CLOSED'
             duration        = self._trade_duration(position)
+
+            if outcome == 'WIN':
+                close_line = (
+                    "Position closed at a profit.\n"
+                    "Pips:      +%.1f" % pips
+                )
+            elif outcome == 'LOSS':
+                close_line = (
+                    "Stop loss closed the position to protect your account.\n"
+                    "Pips:      %.1f" % pips
+                )
+            else:
+                close_line = "Position closed at breakeven."
+
             self._send_notification(
                 position.telegram_id,
-                f"POSITION CLOSED\n\n"
-                f"Ticket:    {position.ticket}\n"
-                f"Symbol:    {position.symbol}\n"
-                f"Direction: {position.direction}\n"
-                f"Entry:     {utils.format_price(position.symbol, position.entry_price)}\n"
-                f"Stop Loss: {utils.format_price(position.symbol, position.stop_loss)}\n"
-                f"Duration:  {duration}\n\n"
-                f"Stop loss closed the position to protect your account."
+                "POSITION CLOSED\n\n"
+                "Ticket:    %d\n"
+                "Symbol:    %s\n"
+                "Direction: %s\n"
+                "Entry:     %s\n"
+                "Close:     %s\n"
+                "Duration:  %s\n\n"
+                "%s" % (
+                    position.ticket,
+                    position.symbol,
+                    position.direction,
+                    utils.format_price(position.symbol, position.entry_price),
+                    utils.format_price(position.symbol, position.current_price),
+                    duration,
+                    close_line,
+                )
             )
-            self._log_trade_completion(position, 'LOSS', position.profit)
+            self._log_trade_completion(position, outcome, profit_value)
         except Exception as e:
             self.logger.error(
                 "Error handling closed position %d: %s", position.ticket, e
@@ -604,11 +764,14 @@ class PositionMonitor:
         can learn from this trade when it auto-retrains after 100 outcomes.
         """
         try:
-            pips = utils.calculate_pips(
-                position.symbol, position.entry_price, position.current_price
-            )
-            if position.direction == 'SELL':
-                pips = -pips
+            pip_size = utils.get_pip_value(position.symbol)
+            if pip_size <= 0:
+                pip_size = 0.0001
+
+            if position.direction == 'BUY':
+                pips = (position.current_price - position.entry_price) / pip_size
+            else:
+                pips = (position.entry_price - position.current_price) / pip_size
 
             sl_distance = abs(position.entry_price - position.stop_loss)
             rr = (

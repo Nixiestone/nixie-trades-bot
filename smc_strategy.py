@@ -161,7 +161,8 @@ class SMCStrategy:
         self,
         data: pd.DataFrame,
         direction: str,
-        min_impulse_pips: float = 20
+        min_impulse_pips: float = 20,
+        symbol: str = 'EURUSD',
     ) -> List[Dict]:
         """
         Detect Order Blocks with volume confirmation (REFINEMENT #1).
@@ -199,8 +200,14 @@ class SMCStrategy:
                 else:
                     impulse_move = candle['high'] - next_candles['low'].min()
                 
-                # Convert to pips (assuming EURUSD-like, adjust for symbol)
-                impulse_pips = impulse_move / 0.0001
+                # Convert to pips using the correct pip size for this symbol.
+                # Using 0.0001 for all pairs overstates Gold pips by 1000x and
+                # JPY pips by 100x, causing every OB on those instruments to be
+                # incorrectly scored as having a massive impulse.
+                _ob_pip_size  = utils.get_pip_value(symbol) if symbol else 0.0001
+                if _ob_pip_size <= 0:
+                    _ob_pip_size = 0.0001
+                impulse_pips = impulse_move / _ob_pip_size
                 
                 if impulse_pips < min_impulse_pips:
                     continue
@@ -408,29 +415,31 @@ class SMCStrategy:
             current_price = data.iloc[-1]['close']
             
             if htf_trend == 'BULLISH':
-                # Look for break of internal low (bearish MSS)
-                internal_low = min(s['price'] for s in recent_swings[-5:] if s['direction'] == 'LOW')
-                
-                if current_price < internal_low * 0.998:  # Broke below with confirmation
+                low_prices = [s['price'] for s in recent_swings if s['direction'] == 'LOW']
+                if len(low_prices) < 2:
+                    return None
+                internal_low = min(low_prices[-5:])
+                if current_price < internal_low * 0.998:
                     return {
-                        'type': 'MSS',
-                        'direction': 'BEARISH',
-                        'level': internal_low,
+                        'type':         'MSS',
+                        'direction':    'BEARISH',
+                        'level':        internal_low,
                         'displacement': abs(current_price - internal_low) / 0.0001,
-                        'timestamp': data.index[-1]
+                        'timestamp':    data.index[-1],
                     }
-            
-            else:  # BEARISH
-                # Look for break of internal high (bullish MSS)
-                internal_high = max(s['price'] for s in recent_swings[-5:] if s['direction'] == 'HIGH')
-                
+
+            else:
+                high_prices = [s['price'] for s in recent_swings if s['direction'] == 'HIGH']
+                if len(high_prices) < 2:
+                    return None
+                internal_high = max(high_prices[-5:])
                 if current_price > internal_high * 1.002:
                     return {
-                        'type': 'MSS',
-                        'direction': 'BULLISH',
-                        'level': internal_high,
+                        'type':         'MSS',
+                        'direction':    'BULLISH',
+                        'level':        internal_high,
                         'displacement': abs(current_price - internal_high) / 0.0001,
-                        'timestamp': data.index[-1]
+                        'timestamp':    data.index[-1],
                     }
             
             return None
@@ -461,30 +470,32 @@ class SMCStrategy:
             tail_data = data.tail(50)
             swings    = self._identify_swings(tail_data)
 
+            # tail_data is a slice of data. swings[i]['index'] is positional
+            # within tail_data. We need the positional offset in the full data
+            # DataFrame so we can use iloc safely and avoid duplicate-label bugs
+            # that occur when MT5 returns repeated timestamps at session boundaries.
+            tail_start_pos = len(data) - len(tail_data)
+
             if htf_trend == 'BULLISH':
                 for i in range(len(swings) - 1):
                     if swings[i]['direction'] == 'HIGH':
-                        swing_high  = swings[i]['price']
-                        # Convert positional index within tail_data to an actual label
-                        swing_label = tail_data.index[swings[i]['index']]
-                        later_candles = data.loc[swing_label:]
-
+                        swing_high     = swings[i]['price']
+                        full_pos       = tail_start_pos + swings[i]['index']
+                        later_candles  = data.iloc[full_pos:]
                         if later_candles['close'].max() > swing_high:
                             bos_events.append({
                                 'type':      'BOS',
                                 'direction': 'BULLISH',
                                 'level':     swing_high,
-                                # idxmax() returns a label directly - do not wrap in .index[]
                                 'timestamp': later_candles['close'].idxmax(),
                             })
 
             else:  # BEARISH
                 for i in range(len(swings) - 1):
                     if swings[i]['direction'] == 'LOW':
-                        swing_low   = swings[i]['price']
-                        swing_label = tail_data.index[swings[i]['index']]
-                        later_candles = data.loc[swing_label:]
-
+                        swing_low      = swings[i]['price']
+                        full_pos       = tail_start_pos + swings[i]['index']
+                        later_candles  = data.iloc[full_pos:]
                         if later_candles['close'].min() < swing_low:
                             bos_events.append({
                                 'type':      'BOS',
@@ -1372,27 +1383,28 @@ class SMCStrategy:
                         sweep_pips = (sweep_level - float(candle['low'])) / _pip_size
                         if sweep_pips >= 3.0:
                             sweep_candle = {
-                                'index': j, 'timestamp': df.index[j],
+                                'index':       j,
+                                'timestamp':   df.index[j],
                                 'sweep_level': round(sweep_level, 5),
-                                'sweep_low': round(float(candle['low']), 5),
-                                'close': round(float(candle['close']), 5),
-                                'sweep_pips': round(sweep_pips, 1),
+                                'sweep_low':   round(float(candle['low']), 5),
+                                'close':       round(float(candle['close']), 5),
+                                'sweep_pips':  round(sweep_pips, 1),
                             }
                             break
-                        else:
-                            
-                            if (float(candle['high']) > sweep_level
-                                and float(candle['close']) < sweep_level):
-                                sweep_pips = (float(candle['high']) - sweep_level) / _pip_size
-                                if sweep_pips >= 3.0:
-                                    sweep_candle = {
-                                        'index': j, 'timestamp': df.index[j],
-                                        'sweep_level': round(sweep_level, 5),
-                                        'sweep_high': round(float(candle['high']), 5),
-                                        'close': round(float(candle['close']), 5),
-                                        'sweep_pips': round(sweep_pips, 1),
-                                    }   
-                                    break
+                else:
+                    if (float(candle['high']) > sweep_level
+                            and float(candle['close']) < sweep_level):
+                        sweep_pips = (float(candle['high']) - sweep_level) / _pip_size
+                        if sweep_pips >= 3.0:
+                            sweep_candle = {
+                                'index':       j,
+                                'timestamp':   df.index[j],
+                                'sweep_level': round(sweep_level, 5),
+                                'sweep_high':  round(float(candle['high']), 5),
+                                'close':       round(float(candle['close']), 5),
+                                'sweep_pips':  round(sweep_pips, 1),
+                            }
+                            break                                
 
             if sweep_candle is None:
                 self.logger.info(

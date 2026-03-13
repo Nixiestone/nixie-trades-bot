@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import time
 import requests
 from typing import Dict, List, Optional, Tuple
@@ -136,17 +136,23 @@ class NewsFetcher:
             list: List of NewsEvent objects
         """
         try:
-            # Check cache first
-            cache_key = f"{hours_ahead}_{impact_filter}"
-            now_utc = datetime.now(timezone.utc)
+            # The cache is keyed by hours_ahead only, always storing ALL impact levels.
+            # Impact filtering is applied after retrieval. This prevents multiple
+            # parallel cache keys for the same time window that would each trigger
+            # separate HTTP fetches to Forex Factory and cause HTTP 429 rate limiting.
+            cache_key = str(hours_ahead)
+            now_utc   = datetime.now(timezone.utc)
 
             if cache_key in self.cache and cache_key in self.cache_expiry:
                 if now_utc < self.cache_expiry[cache_key]:
+                    cached = self.cache[cache_key]
+                    if impact_filter != 'ALL':
+                        cached = [e for e in cached if e.impact == impact_filter]
                     self.logger.debug(
-                        "Returning cached news (%d events)",
-                        len(self.cache[cache_key]),
+                        "Returning cached news (%d events after filter %s)",
+                        len(cached), impact_filter,
                     )
-                    return self.cache[cache_key]
+                    return cached
 
             stale_cache = self.cache.get(cache_key, [])
             
@@ -192,11 +198,9 @@ class NewsFetcher:
                     self.cache[cache_key] = stale_filtered
                     self.cache_expiry[cache_key] = now_utc + self.cache_duration
                     return stale_filtered
-            # Filter by impact
-            if impact_filter != 'ALL':
-                events = [e for e in events if e.impact == impact_filter]
-
-            # De-duplicate (source overlap can return same event multiple times)
+            # De-duplicate before caching, before impact filter.
+            # Cache stores all impact levels so a single fetch serves all callers.
+            
             deduped = {}
             for event in events:
                 ts = event.timestamp
@@ -216,13 +220,20 @@ class NewsFetcher:
             
             # Sort by timestamp
             events.sort(key=lambda x: x.timestamp)
-            
-            # Update cache
-            self.cache[cache_key] = events
+
+            # Cache the full unfiltered list
+            self.cache[cache_key]        = events
             self.cache_expiry[cache_key] = now_utc + self.cache_duration
-            
-            self.logger.info(f"Fetched {len(events)} news events (next {hours_ahead}h)")
-            return events
+
+            # Apply impact filter for this specific caller after caching
+            filtered = events if impact_filter == 'ALL' else [
+                e for e in events if e.impact == impact_filter
+            ]
+            self.logger.info(
+                "Fetched %d news events (next %dh), returning %d after filter=%s",
+                len(events), hours_ahead, len(filtered), impact_filter,
+            )
+            return filtered
         
         except Exception as e:
             self.logger.error(f"Error fetching news: {e}")
@@ -468,12 +479,33 @@ class NewsFetcher:
             _time.sleep(1)
             resp = requests.post(url, headers=headers, data=payload, timeout=15)
             if resp.status_code != 200:
-                self.logger.warning("Investing.com returned status %d", resp.status_code)
+                self.logger.warning(
+                    "Investing.com returned status %d. "
+                    "This source is blocked or rate-limited. "
+                    "Response preview: %s",
+                    resp.status_code,
+                    resp.text[:200] if resp.text else 'empty',
+                )
                 return []
 
-            data = resp.json() if resp.content else {}
+            try:
+                data = resp.json()
+            except Exception:
+                self.logger.warning(
+                    "Investing.com response was not valid JSON "
+                    "(likely a CAPTCHA or block page). "
+                    "Response preview: %s",
+                    resp.text[:200] if resp.text else 'empty',
+                )
+                return []
+
             html_content = data.get('data', '') if isinstance(data, dict) else ''
             if not html_content:
+                self.logger.warning(
+                    "Investing.com returned valid JSON but no 'data' field. "
+                    "Keys present: %s",
+                    list(data.keys()) if isinstance(data, dict) else 'non-dict response',
+                )
                 return []
 
             from bs4 import BeautifulSoup

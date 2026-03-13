@@ -230,15 +230,35 @@ class NixTradesScheduler:
                         pass
 
                     elif status == 'CLOSED':
-                        profit_pips = float(status_info.get('profit_pips', 0) or 0)
-                        close_price = float(status_info.get('close_price', 0) or 0)
-                        closed_at   = status_info.get('closed_at', '')
-                        outcome     = 'WIN' if profit_pips > 0 else ('LOSS' if profit_pips < 0 else 'BREAKEVEN')
-                        db.mark_trade_reconciled(ticket, outcome, profit_pips, close_price, closed_at)
+                        profit_pips  = float(status_info.get('profit_pips',  0) or 0)
+                        close_price  = float(status_info.get('close_price',  0) or 0)
+                        closed_at    = status_info.get('closed_at', '')
+                        realized_pnl = status_info.get('realized_pnl')
+                        realized_pnl = float(realized_pnl) if realized_pnl is not None else None
+                        # Use realized_pnl sign for outcome when available because
+                        # profit_pips magnitude can be approximate for cross pairs.
+                        if realized_pnl is not None:
+                            outcome = (
+                                'WIN'       if realized_pnl > 0 else
+                                ('LOSS'     if realized_pnl < 0 else
+                                 'BREAKEVEN')
+                            )
+                        else:
+                            outcome = (
+                                'WIN'       if profit_pips > 0 else
+                                ('LOSS'     if profit_pips < 0 else
+                                 'BREAKEVEN')
+                            )
+                        db.mark_trade_reconciled(
+                            ticket, outcome, profit_pips,
+                            close_price, closed_at,
+                            realized_pnl=realized_pnl,
+                        )
                         self.logger.info(
                             "Reconciliation: ticket %d CLOSED offline — "
-                            "outcome=%s pips=%.1f.",
+                            "outcome=%s pips=%.1f pnl=%s.",
                             ticket, outcome, profit_pips,
+                            ('%.2f' % realized_pnl) if realized_pnl is not None else 'N/A',
                         )
 
                     elif status in ('NOT_FOUND', 'UNKNOWN'):
@@ -389,16 +409,13 @@ class NixTradesScheduler:
                     getattr(news_event, 'title', ''))
                 return
 
-            # Avoid duplicate setups within the signal expiry window.
-            # H1 signals expire in 8 hours (480 minutes). Checking only the
-            # scan interval (15 min) caused the same setup to fire on every
-            # scan cycle for hours while the structure remained valid.
-            _signal_cooldown_minutes = 480   # matches expiry_hours=8 set in setup_data
-            if db.recent_signal_exists(symbol, minutes=_signal_cooldown_minutes):
-                self.logger.info(
-                    "Skipping %s: signal already generated within %d minute cooldown.",
-                    symbol, _signal_cooldown_minutes,
-                )
+            # 15-minute guard: prevents reprocessing the exact same pair
+            # on back-to-back scan cycles before any new structure can form.
+            # The 480-minute per-direction guard is applied later after the
+            # trade direction is determined from the POI.
+            if db.recent_signal_exists(symbol, minutes=15):
+                self.logger.debug(
+                    "Skipping %s: signal sent within the last 15 minutes.", symbol)
                 return
 
             # Fetch multi-timeframe data
@@ -433,17 +450,16 @@ class NixTradesScheduler:
                 self.logger.info("%s D1 trend is RANGING. Skipping.", symbol)
                 return
 
-            # H4 intermediate confirmation - must agree with D1 direction.
-            # If H4 is ranging or opposing D1, skip to avoid counter-trend entries.
-            h4_aligned = False
+            # H4 confirmation is stored here but the gate is NOT applied yet.
+            # setup_type is not known until after BOS/MSS detection below.
+            # The gate only applies to BOS (continuation) setups.
+            # MSS (reversal) setups are inherently counter-trend and must
+            # not be blocked by H4 alignment.
+            h4_aligned    = False
+            h4_trend_data = None
             if h4_df is not None and len(h4_df) >= 50:
-                h4_trend = self.smc.determine_htf_trend(h4_df)
-                h4_aligned = h4_trend.get('trend') == htf_trend.get('trend')
-                if not h4_aligned and h4_trend.get('trend') != 'RANGING':
-                    self.logger.info(
-                        "%s H4 trend (%s) opposes D1 trend (%s). Skipping.",
-                        symbol, h4_trend.get('trend'), htf_trend.get('trend'))
-                    return
+                h4_trend_data = self.smc.determine_htf_trend(h4_df)
+                h4_aligned    = h4_trend_data.get('trend') == htf_trend.get('trend')
                 
             # Phase 2: Intermediate structure (H1)
             bos_events = self.smc.detect_break_of_structure(h1_df, htf_trend['trend'])
@@ -459,17 +475,57 @@ class NixTradesScheduler:
                     h1_df, htf_trend['trend'],
                     htf_trend.get('swing_high', 0),
                     htf_trend.get('swing_low', 0))
-                obs = self.smc.detect_order_blocks(h1_df, htf_trend['trend'])
+                obs = self.smc.detect_order_blocks(
+                    h1_df, htf_trend['trend'], symbol=symbol)
                 all_candidates = breakers + obs
             elif mss_event:
                 setup_type = 'MSS'
-                obs = self.smc.detect_order_blocks(h1_df, mss_event['direction'])
+                obs = self.smc.detect_order_blocks(
+                    h1_df, mss_event['direction'], symbol=symbol)
                 all_candidates = obs
 
             if not all_candidates or setup_type is None:
                 self.logger.info(
                     "%s: no valid structure or POI candidates found.", symbol)
                 return
+
+            # Apply the H4 alignment gate now that setup_type is known.
+            # BOS is a trend continuation trade and requires H4 to agree.
+            # MSS is a reversal trade; requiring H4 alignment on a reversal
+            # is a logical contradiction and must be skipped.
+            if setup_type == 'BOS' and h4_trend_data is not None:
+                if not h4_aligned and h4_trend_data.get('trend') != 'RANGING':
+                    self.logger.info(
+                        "%s BOS: H4 trend (%s) opposes D1 trend (%s). "
+                        "BOS setups require HTF alignment. Skipping.",
+                        symbol,
+                        h4_trend_data.get('trend'),
+                        htf_trend.get('trend'),
+                    )
+                    return
+            elif setup_type == 'MSS':
+                self.logger.debug(
+                    "%s MSS: H4 alignment check skipped. "
+                    "MSS is a reversal trade.", symbol)
+
+            # Apply the H4 alignment gate now that setup_type is known.
+            # BOS is a trend continuation trade and requires H4 to agree.
+            # MSS is a reversal trade; requiring H4 alignment on a reversal
+            # is a logical contradiction and must be skipped.
+            if setup_type == 'BOS' and h4_trend_data is not None:
+                if not h4_aligned and h4_trend_data.get('trend') != 'RANGING':
+                    self.logger.info(
+                        "%s BOS: H4 trend (%s) opposes D1 trend (%s). "
+                        "BOS setups require HTF alignment. Skipping.",
+                        symbol,
+                        h4_trend_data.get('trend'),
+                        htf_trend.get('trend'),
+                    )
+                    return
+            elif setup_type == 'MSS':
+                self.logger.debug(
+                    "%s MSS: H4 alignment check skipped. "
+                    "MSS is a reversal trade.", symbol)
 
             # Filter out any POI that has already been mitigated by price action.
             # A mitigated zone means institutions already filled their orders there;
@@ -514,6 +570,16 @@ class NixTradesScheduler:
                 return
 
             sweep_level = float(inducement.get('sweep_level', 0))
+
+            # Direction is now confirmed from the anchor POI.
+            # Apply the 480-minute per-direction cooldown here so that a SELL
+            # can fire on a pair that already had a BUY in the last 8 hours.
+            _dir_str = 'BUY' if trade_direction == 'BULLISH' else 'SELL'
+            if db.recent_signal_exists(symbol, minutes=480, direction=_dir_str):
+                self.logger.info(
+                    "COOLDOWN | %s %s | same direction sent within 480 minutes. "
+                    "Skipping.", symbol, _dir_str)
+                return
 
             # Now that the sweep is confirmed, pick the CLOSEST unmitigated POI
             # to the sweep level. This is the real entry zone — the nearest
@@ -571,7 +637,7 @@ class NixTradesScheduler:
             if m5_df is not None and len(m5_df) >= 50:
                 try:
                     m5_obs = self.smc.detect_order_blocks(
-                        m5_df.tail(50), poi['direction'])
+                        m5_df.tail(50), poi['direction'], symbol=symbol)
                     if m5_obs:
                         poi_high = float(poi.get('high', entry_cfg['entry_price']))
                         poi_low  = float(poi.get('low',  entry_cfg['entry_price']))
@@ -622,17 +688,18 @@ class NixTradesScheduler:
                 event_ts = next_news.timestamp
                 if event_ts.tzinfo is None:
                     event_ts = event_ts.replace(tzinfo=timezone.utc)
+                else:
+                    event_ts = event_ts.astimezone(timezone.utc)
                 mins = int((event_ts - datetime.now(timezone.utc)).total_seconds() / 60)
-                if 0 < mins <= 240:
-                    if mins >= 60:
-                        _hours     = mins // 60
-                        _remaining = mins % 60
-                        _time_str  = f"{_hours}h {_remaining}m" if _remaining else f"{_hours}h"
-                    else:
-                        _time_str = f"{mins}m"
+                if 0 < mins <= 480:
+                    _time_str = utils.calculate_time_until(event_ts)
                     news_warn = (
-                        f"Note: {next_news.currency} {next_news.title} "
-                        f"scheduled in {_time_str}. Exercise caution."
+                        "Note: %s %s in approximately %s. "
+                        "Consider reducing position size or waiting for the release." % (
+                            next_news.currency,
+                            next_news.title,
+                            _time_str,
+                        )
                     )
 
             setup_tier  = 'UNICORN' if tier == 'PREMIUM' else 'STANDARD'
@@ -813,7 +880,8 @@ class NixTradesScheduler:
         as a pending order rather than executing at a worse price.
         """
         try:
-            bid, ask = await asyncio.get_event_loop().run_in_executor(
+            loop     = asyncio.get_running_loop()
+            bid, ask = await loop.run_in_executor(
                 None, self.mt5.get_current_price, symbol
             )
             if bid is None or ask is None:
@@ -854,9 +922,8 @@ class NixTradesScheduler:
                     # mt5_connected flag checked first, then credentials as fallback
                     # so a user who connected but whose flag was not set still executes.
                     lot_size = None
-                    mt5_flag = bool(user.get('mt5_connected'))
-                    has_creds = bool(db.get_mt5_credentials(tid))
-                    can_execute = mt5_flag or has_creds
+                    mt5_flag    = bool(user.get('mt5_connected'))
+                    can_execute = mt5_flag
 
                     if not auto_execute:
                         self.logger.info(
@@ -864,9 +931,9 @@ class NixTradesScheduler:
                             "(consensus below threshold or agreement=WEAK)", tid)
                     elif not can_execute:
                         self.logger.info(
-                            "AUTO-EXECUTE SKIP | user %d | reason: mt5_connected=%s "
-                            "has_creds=%s. User has not linked MT5 account.",
-                            tid, mt5_flag, has_creds)
+                            "AUTO-EXECUTE SKIP | user %d | reason: mt5_connected=%s. "
+                            "User has not linked MT5 account.",
+                            tid, mt5_flag)
                     else:
                         lot_size = await self._calculate_user_lot_size(user, setup_data)
                         if lot_size is None:
@@ -897,6 +964,7 @@ class NixTradesScheduler:
                         session=setup_data.get('session', 'N/A'),
                         order_type=setup_data.get('order_type', 'LIMIT'),
                         lot_size=lot_size,
+                        expiry_hours=int(setup_data.get('expiry_hours', 8)),
                     )
 
                     if news_warn:
@@ -949,7 +1017,10 @@ class NixTradesScheduler:
             if not creds:
                 return None
 
-            ok, account_info = self.mt5.get_account_info(user['telegram_id'])
+            loop              = asyncio.get_running_loop()
+            ok, account_info  = await loop.run_in_executor(
+                None, self.mt5.get_account_info, user['telegram_id']
+            )
             if not ok or not account_info:
                 return None
 
@@ -998,30 +1069,38 @@ class NixTradesScheduler:
                 return
 
             # Determine order type (LIMIT vs MARKET) based on current price
-            bid, ask = self.mt5.get_current_price(symbol)
-            current  = ask if direction == 'BUY' else bid
-            entry    = setup_data['entry_price']
+            loop     = asyncio.get_running_loop()
+            bid, ask = await loop.run_in_executor(
+                None, self.mt5.get_current_price, symbol
+            )
+            current = ask if direction == 'BUY' else bid
+            entry   = setup_data['entry_price']
 
-            # If price is already at or past the entry, use MARKET
             if direction == 'BUY':
                 order_type = 'MARKET' if (current is not None and current <= entry) else 'LIMIT'
             else:
                 order_type = 'MARKET' if (current is not None and current >= entry) else 'LIMIT'
 
-            success, ticket, message = self.mt5.place_order(
-                telegram_id=tid,
-                symbol=symbol,
-                direction=direction,
-                lot_size=lot_size,
-                entry_price=entry,
-                stop_loss=setup_data['stop_loss'],
-                take_profit=setup_data['take_profit_1'],
-                take_profit_2=setup_data['take_profit_2'],
-                order_type=order_type,
-                comment='Nix Trades Auto',
-                sl_pips=float(setup_data.get('sl_pips', 20.0)),
-                risk_percent=float(user.get('risk_percent', config.DEFAULT_RISK_PERCENT)),
-            )
+            expiry_minutes = int(setup_data.get('expiry_hours', 8)) * 60
+
+            def _place_blocking():
+                return self.mt5.place_order(
+                    telegram_id=tid,
+                    symbol=symbol,
+                    direction=direction,
+                    lot_size=lot_size,
+                    entry_price=entry,
+                    stop_loss=setup_data['stop_loss'],
+                    take_profit=setup_data['take_profit_1'],
+                    take_profit_2=setup_data['take_profit_2'],
+                    order_type=order_type,
+                    comment='Nix Trades Auto',
+                    sl_pips=float(setup_data.get('sl_pips', 20.0)),
+                    risk_percent=float(user.get('risk_percent', config.DEFAULT_RISK_PERCENT)),
+                    expiry_minutes=expiry_minutes,
+                )
+
+            success, ticket, message = await loop.run_in_executor(None, _place_blocking)
 
             if success and ticket:
                 self.logger.info(
@@ -1427,6 +1506,9 @@ class NixTradesScheduler:
     async def _safe_send(self, telegram_id: int, text: str) -> bool:
         """
         Send a message. If user is unreachable, queue it for later delivery.
+        Uses SYSTEM_MESSAGE type which is one of the three valid values in the
+        message_queue CHECK constraint. SCHEDULED_ALERT is not a valid type
+        and would cause a database constraint violation on every failed send.
         """
         try:
             await self.bot.send_message(chat_id=telegram_id, text=text)
@@ -1435,14 +1517,20 @@ class NixTradesScheduler:
             self.logger.info("User %d blocked the bot. Message not sent.", telegram_id)
             return False
         except NetworkError as e:
-            self.logger.warning("Network error sending to user %d: %s. Queuing.", telegram_id, e)
+            self.logger.warning(
+                "Network error sending to user %d: %s. Queuing.", telegram_id, e)
             try:
-                db.queue_message(telegram_id, text, 'SCHEDULED_ALERT')
-            except Exception:
-                pass
+                db.queue_message(telegram_id, text, 'SYSTEM_MESSAGE')
+            except Exception as queue_err:
+                self.logger.error(
+                    "Failed to queue message for user %d: %s", telegram_id, queue_err)
             return False
         except Exception as e:
             self.logger.warning("Send error for user %d: %s", telegram_id, e)
+            try:
+                db.queue_message(telegram_id, text, 'SYSTEM_MESSAGE')
+            except Exception:
+                pass
             return False
 
     # ==================== TEST TRIGGER METHODS ====================

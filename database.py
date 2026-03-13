@@ -261,24 +261,35 @@ def get_user_statistics(telegram_id: int) -> dict:
         .execute()
     )
 
-    all_trades    = all_result.data or []
-    total         = len(all_trades)
-    open_count    = sum(1 for t in all_trades if t.get('status') == 'OPEN')
-    closed_trades = [t for t in all_trades if t.get('status') == 'CLOSED']
-    closed_count  = len(closed_trades)
+    all_trades      = all_result.data or []
+    total           = len(all_trades)
+    open_count      = sum(1 for t in all_trades if t.get('status') == 'OPEN')
+    closed_trades   = [t for t in all_trades if t.get('status') == 'CLOSED']
+    closed_count    = len(closed_trades)
 
-    wins   = sum(1 for t in closed_trades if t.get('outcome') == 'WIN')
-    losses = sum(1 for t in closed_trades if t.get('outcome') == 'LOSS')
-    pips   = sum(float(t.get('profit_pips') or 0) for t in closed_trades)
+    # Only count trades where the outcome was conclusively recorded.
+    # Trades closed by reconciliation may have status=CLOSED but outcome=None
+    # during the window between broker close and bot processing. Exclude these
+    # from the win/loss ratio so the displayed success rate is always accurate.
+    concluded       = [t for t in closed_trades if t.get('outcome') in ('WIN', 'LOSS', 'BREAKEVEN')]
+    concluded_count = len(concluded)
+    wins            = sum(1 for t in concluded if t.get('outcome') == 'WIN')
+    losses          = sum(1 for t in concluded if t.get('outcome') == 'LOSS')
+    breakevens      = sum(1 for t in concluded if t.get('outcome') == 'BREAKEVEN')
+    pips            = sum(float(t.get('profit_pips') or 0) for t in closed_trades)
 
     return {
-        'total_trades':  total,
-        'open_trades':   open_count,
-        'closed_trades': closed_count,
-        'wins':          wins,
-        'losses':        losses,
-        'win_rate':      round((wins / closed_count * 100) if closed_count > 0 else 0.0, 1),
-        'total_pips':    round(pips, 1),
+        'total_trades':      total,
+        'open_trades':       open_count,
+        'closed_trades':     closed_count,
+        'concluded_trades':  concluded_count,
+        'wins':              wins,
+        'losses':            losses,
+        'breakevens':        breakevens,
+        'win_rate':          round(
+            (wins / concluded_count * 100) if concluded_count > 0 else 0.0, 1
+        ),
+        'total_pips':        round(pips, 1),
     }
 
 
@@ -413,10 +424,13 @@ def save_signal(
         if 'UNICORN' in setup_upper or 'PREMIUM' in setup_upper
         else 'STANDARD'
     )
-    next_signal_number = get_signal_count() + 1
 
+    # Do NOT set signal_number manually. The database sequence
+    # signals_signal_number_seq assigns it atomically, which prevents the
+    # race condition where two simultaneous scans calculate the same count
+    # and both try to insert with the same signal_number, causing one to
+    # fail with a unique constraint violation and the signal to be lost.
     signal_data = {
-        'signal_number': next_signal_number,
         'symbol':        symbol,
         'direction':     direction,
         'setup_type':    normalized_setup_type,
@@ -445,7 +459,7 @@ def save_signal(
         logger.info(
             "Signal saved: id=%s number=%s %s %s score=%d setup=%s",
             row.get('id'), row.get('signal_number'),
-            symbol, direction, ml_score, normalized_setup_type
+            symbol, direction, ml_score, normalized_setup_type,
         )
         return row
     return None
@@ -619,65 +633,86 @@ def mark_trade_expired(trade_id: int) -> bool:
 
 @_db_retry()
 def mark_trade_reconciled(
-    ticket: int,
-    outcome: str,
-    profit_pips: float,
-    close_price: float,
-    closed_at: str,
+    ticket:       int,
+    outcome:      str,
+    profit_pips:  float,
+    close_price:  float,
+    closed_at:    str,
+    realized_pnl: Optional[float] = None,
 ) -> bool:
     """
     Update a trade that closed while the bot was offline.
     Called by the scheduler reconciliation job when MT5 deal history
     shows a position that our database still has as OPEN.
+    realized_pnl is the actual account currency P&L from the broker,
+    used by the daily loss circuit breaker.
     """
-    _client().table('trades').update({
+    update_data = {
         'status':      'CLOSED',
         'outcome':     outcome,
         'profit_pips': profit_pips,
         'close_price': close_price,
         'closed_at':   closed_at,
         'updated_at':  datetime.now(timezone.utc).isoformat(),
-    }).eq('mt5_ticket', ticket).execute()
+    }
+    if realized_pnl is not None:
+        update_data['realized_pnl'] = round(realized_pnl, 2)
+
+    _client().table('trades').update(update_data).eq(
+        'mt5_ticket', ticket
+    ).execute()
     logger.info(
-        "Trade ticket=%d reconciled: outcome=%s pips=%.1f.",
+        "Trade ticket=%d reconciled: outcome=%s pips=%.1f pnl=%s.",
         ticket, outcome, profit_pips,
+        ('%.2f' % realized_pnl) if realized_pnl is not None else 'N/A',
     )
     return True
 
 @_db_retry()
-def recent_signal_exists(symbol: str, minutes: int = 15) -> bool:
+def recent_signal_exists(
+    symbol:    str,
+    minutes:   int = 15,
+    direction: Optional[str] = None,
+) -> bool:
     """
     Return True if a setup for this symbol was saved within the last N minutes.
-    Used by scheduler to prevent sending duplicate setups for the same pair.
+
+    When direction is supplied, only signals in that direction are checked.
+    This allows a valid counter-signal (e.g. SELL after BUY) to pass through
+    the cooldown window, which is correct SMC behaviour.
 
     Args:
-        symbol:  Trading symbol (e.g. 'EURUSD')
-        minutes: Look-back window in minutes
+        symbol:    Trading symbol (e.g. 'EURUSD')
+        minutes:   Look-back window in minutes
+        direction: Optional 'BUY' or 'SELL' to filter by direction
 
     Returns:
-        bool: True if a recent signal exists for this symbol
+        bool: True if a matching recent signal exists
     """
     try:
         client = _client()
         cutoff = (
-            utils.get_current_utc_time() - timedelta(minutes=minutes)
+            datetime.now(timezone.utc) - timedelta(minutes=minutes)
         ).isoformat()
 
-        response = (
+        query = (
             client.table('signals')
             .select('id')
             .eq('symbol', symbol)
             .gte('created_at', cutoff)
-            .limit(1)
-            .execute()
         )
+
+        if direction is not None:
+            query = query.eq('direction', direction.upper())
+
+        response = query.limit(1).execute()
         return bool(response.data)
 
     except Exception as e:
         logger.error(
             "Error checking recent signal for %s: %s", symbol, e
         )
-        return False   # Default: allow the signal through on error
+        return False
 
 
 def save_trade_outcome_for_ml(
@@ -802,7 +837,7 @@ def get_daily_loss_percent(
     result = (
         _client()
         .table('trades')
-        .select('profit_pips, lot_size, symbol')
+        .select('profit_pips, lot_size, symbol, realized_pnl')
         .eq('telegram_id', telegram_id)
         .eq('status', 'CLOSED')
         .gte('updated_at', since.isoformat())
@@ -813,22 +848,28 @@ def get_daily_loss_percent(
     if not trades:
         return 0.0
 
-    total_loss_pips = sum(
-        float(t.get('profit_pips') or 0) for t in trades
-        if float(t.get('profit_pips') or 0) < 0
+    # Use realized_pnl (actual account currency P&L recorded at close) rather
+    # than converting pips with a hardcoded multiplier. realized_pnl is set by
+    # position_monitor._log_trade_completion from the MT5 profit field, which
+    # already accounts for lot size, pip value, and account currency correctly.
+    total_loss_currency = sum(
+        float(t.get('realized_pnl') or 0) for t in trades
+        if float(t.get('realized_pnl') or 0) < 0
     )
 
-    # Fetch user's stored balance for percent calculation
-    user = get_user(telegram_id)
+    user    = get_user(telegram_id)
     balance = float(user.get('mt5_account_balance', 0)) if user else 0.0
 
     if balance <= 0:
-        # Cannot calculate percent without balance; use pip threshold (50 pips = alert)
+        # Cannot calculate percent without a stored balance.
+        # Fall back to pip count with a conservative threshold.
+        total_loss_pips = sum(
+            float(t.get('profit_pips') or 0) for t in trades
+            if float(t.get('profit_pips') or 0) < 0
+        )
         return 3.0 if abs(total_loss_pips) >= 50 else 0.0
 
-    # Rough loss in account currency: assume 1 pip = $10 per standard lot
-    loss_currency = abs(total_loss_pips) * 10
-    return round((loss_currency / balance) * 100, 2)
+    return round((abs(total_loss_currency) / balance) * 100, 2)
 
 
 # ==================== QUEUED MESSAGES ====================

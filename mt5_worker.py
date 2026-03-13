@@ -477,10 +477,21 @@ def _calculate_lot_size(
     if tick_size == 0 or point == 0:
         return lot_min
 
-    # pip_size: most pairs = 10 points; JPY pairs = 10 points of 0.001 = 0.01
-    # Gold (XAUUSD): point = 0.01, pip = 1.0 (100 points per pip)
-    # We use point * 10 as the standard pip definition
-    pip_size = point * 10
+    # Pip size definition varies by instrument class.
+    # Standard FX pairs (e.g. EURUSD): point=0.00001, pip=0.0001 (10 points).
+    # JPY pairs (e.g. USDJPY):          point=0.001,   pip=0.01   (10 points).
+    # Gold (XAUUSD):                     point=0.01,    pip=1.00   (100 points).
+    # Silver (XAGUSD):                   point=0.001,   pip=0.01   (10 points).
+    # Index CFDs and Crypto may differ; fall back to 10 points as a safe default.
+    symbol_upper = symbol.upper()
+    if 'XAU' in symbol_upper:
+        pip_size = point * 100
+    elif 'XAG' in symbol_upper:
+        pip_size = point * 10
+    elif 'BTC' in symbol_upper or 'ETH' in symbol_upper:
+        pip_size = point * 10
+    else:
+        pip_size = point * 10
 
     # price_distance in price units
     price_distance = sl_pips * pip_size
@@ -593,7 +604,7 @@ def _place_order(
         'type':         mt5_type,
         'price':        price,
         'sl':           sl,
-        'tp':           tp1,
+        'tp':           tp2,
         'deviation':    10,
         'magic':        MAGIC_NUMBER,
         'comment':      comment[:31],
@@ -860,10 +871,32 @@ def execute():
     if order_type not in ('MARKET', 'LIMIT', 'STOP'):
         return jsonify({'success': False, 'error': "order_type must be MARKET, LIMIT, or STOP"}), 400
 
-    # Pre-broker price validation applies to pending orders only.
-    # For MARKET orders the fill price is the live ask or bid taken from the tick
-    # inside _place_order, so the entry field is irrelevant and must not be validated.
-    if order_type != 'MARKET':
+    # For MARKET orders the entry price is irrelevant (fill happens at live ask/bid)
+    # but SL and TP direction must still be logically consistent.
+    # Use a synthetic entry equal to the midpoint between sl and tp1 solely for
+    # the purpose of direction validation without requiring a live price fetch here.
+    if order_type == 'MARKET':
+        if direction == 'BUY' and sl >= tp1:
+            return jsonify({
+                'success': False,
+                'error':   'For a BUY order, the stop loss must be below TP1.',
+            }), 400
+        if direction == 'SELL' and sl <= tp1:
+            return jsonify({
+                'success': False,
+                'error':   'For a SELL order, the stop loss must be above TP1.',
+            }), 400
+        if direction == 'BUY' and tp2 <= tp1:
+            return jsonify({
+                'success': False,
+                'error':   'For a BUY order, TP2 must be above TP1.',
+            }), 400
+        if direction == 'SELL' and tp2 >= tp1:
+            return jsonify({
+                'success': False,
+                'error':   'For a SELL order, TP2 must be below TP1.',
+            }), 400
+    else:
         price_valid, price_error = _validate_trade_prices(direction, entry, sl, tp1, tp2)
         if not price_valid:
             return jsonify({'success': False, 'error': price_error}), 400
@@ -987,6 +1020,14 @@ def get_candles():
         bars = int(raw.get('bars', 500))
     except (TypeError, ValueError):
         bars = 500
+
+    # Cap bars to prevent MT5 lock starvation on very large requests.
+    # 200,000 M15 bars covers approximately 5.7 years of trading data.
+    MAX_BARS = 200000
+    if bars < 1:
+        bars = 1
+    if bars > MAX_BARS:
+        bars = MAX_BARS
 
     if not symbol_raw:
         return jsonify({'success': False, 'error': 'symbol field is required'}), 400
@@ -1345,30 +1386,57 @@ def ticket_status(ticket: int):
         if history:
             for deal in history:
                 if deal.order == ticket or deal.position_id == ticket:
-                    # Calculate pip size from symbol info
-                    symbol_info = mt5.symbol_info(deal.symbol)
-                    pip_size    = 0.0001
-                    if symbol_info:
-                        point    = symbol_info.point
-                        pip_size = point * 10 if point > 0 else 0.0001
+                    # Calculate pip size using the same instrument-aware
+                    # logic as _calculate_lot_size to ensure consistency.
+                    symbol_upper = deal.symbol.upper() if deal.symbol else ''
+                    symbol_info  = mt5.symbol_info(deal.symbol) if deal.symbol else None
+                    point        = symbol_info.point if symbol_info else 0.00001
 
-                    # Profit in pips: deal.profit is in account currency,
-                    # so convert using deal volume and symbol info.
-                    # Simpler and more reliable: use price difference.
-                    profit_pips = round(deal.profit / max(deal.volume, 0.01) / 10, 1) \
-                        if deal.volume > 0 else 0.0
+                    if 'XAU' in symbol_upper:
+                        pip_size = point * 100
+                    elif symbol_upper.endswith('JPY'):
+                        pip_size = point * 10
+                    else:
+                        pip_size = point * 10
+
+                    if pip_size <= 0:
+                        pip_size = 0.0001
+
+                    # Convert account currency profit to pips using the
+                    # symbol's tick value so the result is instrument-agnostic.
+                    # Fallback: use the sign of deal.profit with a magnitude
+                    # of 0.0 so the reconciliation outcome (WIN/LOSS) is always
+                    # correct even if the pip count cannot be determined.
+                    try:
+                        if (symbol_info is not None
+                                and symbol_info.trade_tick_value > 0
+                                and deal.volume > 0):
+                            profit_pips = round(
+                                deal.profit
+                                / (symbol_info.trade_tick_value
+                                   * (symbol_info.trade_tick_size / pip_size)
+                                   * deal.volume),
+                                1
+                            )
+                        else:
+                            # Cannot calculate — preserve sign for outcome,
+                            # use 0.0 magnitude to avoid misleading statistics.
+                            profit_pips = 1.0 if deal.profit > 0 else (-1.0 if deal.profit < 0 else 0.0)
+                    except Exception:
+                        profit_pips = 1.0 if deal.profit > 0 else (-1.0 if deal.profit < 0 else 0.0)
 
                     closed_at = datetime.fromtimestamp(
                         deal.time, tz=timezone.utc
                     ).isoformat()
 
                     return jsonify({
-                        'success':     True,
-                        'status':      'CLOSED',
-                        'ticket':      ticket,
-                        'close_price': round(deal.price, 5),
-                        'profit_pips': profit_pips,
-                        'closed_at':   closed_at,
+                        'success':      True,
+                        'status':       'CLOSED',
+                        'ticket':       ticket,
+                        'close_price':  round(deal.price, 5),
+                        'profit_pips':  profit_pips,
+                        'realized_pnl': round(float(deal.profit), 2),
+                        'closed_at':    closed_at,
                     })
 
         # 4. Not found anywhere

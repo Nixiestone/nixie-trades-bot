@@ -185,7 +185,12 @@ class NixTradesBot:
             database=db,
             telegram_bot=application.bot,
         )
-        self.position_monitor.start()  # No arguments - runs in its own thread
+        self.position_monitor.start()
+
+        # Make position_monitor accessible to all callback handlers via
+        # context.bot_data. This is the correct PTB pattern for sharing
+        # application-level state with handler functions.
+        application.bot_data['position_monitor'] = self.position_monitor
 
         # Start the scheduler (APScheduler, shares the running event loop)
         self.scheduler_obj = NixTradesScheduler(
@@ -317,6 +322,10 @@ class NixTradesBot:
         app.add_handler(CallbackQueryHandler(
             self.callback_partial_close,
             pattern=r'^partial_close_(yes|no)_\d+$'
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_breakeven_decision,
+            pattern=r'^breakeven_(yes|no)_\d+$'
         ))
         app.add_handler(CommandHandler('test_briefing', self.cmd_test_briefing))
         app.add_handler(CommandHandler('test_news',     self.cmd_test_news))
@@ -893,19 +902,23 @@ class NixTradesBot:
                     f"Broker:              {user.get('mt5_broker_name', 'N/A')}",
                     f"Account:             ****{str(user.get('mt5_login', ''))[-4:]}",
                 ]
-            closed  = stats.get('closed_trades', 0)
-            open_ct = stats.get('open_trades', 0)
+            concluded = stats.get('concluded_trades', 0)
+            open_ct   = stats.get('open_trades', 0)
+            wins      = stats.get('wins', 0)
+            losses    = stats.get('losses', 0)
+            breakevens = stats.get('breakevens', 0)
             lines += [
                 "",
                 "TRADING STATISTICS",
                 "",
                 f"Total Setups Executed: {stats.get('total_trades', 0)}",
                 f"Currently Open:        {open_ct}",
-                f"Closed Trades:         {closed}",
-                f"Winning Trades:        {stats.get('wins', 0)}",
-                f"Losing Trades:         {stats.get('losses', 0)}",
-                f"Win Rate:              {stats.get('win_rate', 0.0):.1f}%"
-                f"  (based on {closed} closed trade(s))",
+                f"Closed Trades:         {stats.get('closed_trades', 0)}",
+                f"  Wins:                {wins}",
+                f"  Losses:              {losses}",
+                f"  Breakeven:           {breakevens}",
+                f"Historical Success Rate: {stats.get('win_rate', 0.0):.1f}%"
+                f"  (based on {concluded} concluded trade(s))",
                 "  Past performance does not guarantee future results.",
                 f"Total Pips (Closed):   {stats.get('total_pips', 0.0):+.1f}",
                 "",
@@ -953,6 +966,7 @@ class NixTradesBot:
                     session=signal.get('session', 'N/A'),
                     order_type=signal.get('order_type', 'LIMIT'),
                     lot_size=None,
+                    expiry_hours=int(signal.get('expiry_hours', 8)),
                 )
                 await self._reply(update, msg)
             else:
@@ -1357,11 +1371,15 @@ class NixTradesBot:
                 await query.edit_message_text(
                     utils.validate_user_message(
                         "PARTIAL CLOSE CONFIRMED\n\n"
-                        "Closed: %.2f lots\n"
-                        "Ticket: %d\n\n"
+                        "Symbol:    %s\n"
+                        "Ticket:    %d\n"
+                        "Closed:    %.2f lots\n\n"
                         "Remaining position is running to TP2.\n"
                         "Stop loss is being moved to breakeven.\n\n"
-                        "%s" % (half_lots, ticket, config.FOOTER)
+                        "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.\n\n"
+                        "%s" % (
+                            position.symbol, ticket, half_lots, config.FOOTER
+                        )
                     )
                 )
                 asyncio.create_task(
@@ -1369,16 +1387,49 @@ class NixTradesBot:
             else:
                 await query.edit_message_text(
                     utils.validate_user_message(
-                        "Partial close could not be executed.\n\nReason: %s\n\n"
-                        "Your full position remains open.\n\n%s" % (msg, config.FOOTER)
+                        "PARTIAL CLOSE FAILED\n\n"
+                        "Symbol:    %s\n"
+                        "Ticket:    %d\n\n"
+                        "Reason: %s\n\n"
+                        "Your full position remains open and is being "
+                        "monitored automatically.\n\n"
+                        "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.\n\n"
+                        "%s" % (
+                            position.symbol, ticket, msg, config.FOOTER
+                        )
                     )
                 )
         else:
+            # User declined partial close.
+            # Ask whether they want breakeven protection in the same message style.
+            be_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "Yes - Move to Breakeven",
+                    callback_data="breakeven_yes_%d" % ticket,
+                ),
+                InlineKeyboardButton(
+                    "No - Keep Current Stop",
+                    callback_data="breakeven_no_%d" % ticket,
+                ),
+            ]])
             await query.edit_message_text(
                 utils.validate_user_message(
-                    "Understood. Full position is held open to TP2.\n"
-                    "Ticket: %d\n\n%s" % (ticket, config.FOOTER)
-                )
+                    "BREAKEVEN PROTECTION - YOUR DECISION REQUIRED\n\n"
+                    "Symbol:     %s\n"
+                    "Direction:  %s\n"
+                    "Ticket:     %d\n\n"
+                    "You chose to hold the full position to TP2.\n\n"
+                    "Option 1: Move stop loss to entry price plus 5 pip buffer "
+                    "to protect from a loss if price reverses.\n\n"
+                    "Option 2: Keep the current stop loss in place and "
+                    "hold the full position as it stands.\n\n"
+                    "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE." % (
+                        position.symbol,
+                        position.direction,
+                        ticket,
+                    )
+                ),
+                reply_markup=be_keyboard,
             )
 
     async def _move_position_sl_to_breakeven(
@@ -1409,6 +1460,69 @@ class NixTradesBot:
             self.logger.error(
                 "Error moving SL to breakeven for ticket %d: %s",
                 position.ticket, e)
+            
+    async def callback_breakeven_decision(
+        self, update: Update,
+        context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """
+        Handle the inline keyboard response to the breakeven question.
+        Callback data format: 'breakeven_yes_TICKET' or 'breakeven_no_TICKET'.
+        Shown to the user after they decline partial close at TP1.
+        """
+        query = update.callback_query
+        await query.answer()
+        telegram_id = query.from_user.id
+        data        = query.data
+
+        try:
+            parts  = data.split('_')
+            action = parts[1]        # 'yes' or 'no'
+            ticket = int(parts[2])
+        except (IndexError, ValueError):
+            await query.edit_message_text(
+                "Invalid response. Position has not been changed."
+            )
+            return
+
+        position = None
+        if self.position_monitor:
+            position = self.position_monitor.get_position_by_ticket(ticket)
+
+        if position is None:
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "Position %d was not found. "
+                    "It may have already been closed automatically.\n\n"
+                    "%s" % (ticket, config.FOOTER)
+                )
+            )
+            return
+
+        if action == 'yes':
+            asyncio.create_task(
+                self._move_position_sl_to_breakeven(telegram_id, position)
+            )
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "Stop loss is being moved to breakeven for %s #%d.\n\n"
+                    "Your full position continues to TP2 automatically.\n\n"
+                    "%s" % (position.symbol, ticket, config.FOOTER)
+                )
+            )
+        else:
+            # User explicitly chose to keep the current stop loss.
+            # Set the flag so the position monitor does not automatically
+            # activate breakeven on the next 10-second cycle, which would
+            # override the user's decision.
+            position.user_declined_breakeven = True
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "Understood. No changes made for %s #%d.\n\n"
+                    "Your full position continues to TP2 at the current stop loss.\n\n"
+                    "%s" % (position.symbol, ticket, config.FOOTER)
+                )
+            )
 
 
     async def cmd_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1611,6 +1725,7 @@ class NixTradesBot:
                 session=setup_data.get('session', 'N/A'),
                 order_type=setup_data.get('order_type', 'LIMIT'),
                 lot_size=lot_size,
+                expiry_hours=int(setup_data.get('expiry_hours', 8)),
             )
             sent = await self._send_with_retry(telegram_id, message)
             if not sent:

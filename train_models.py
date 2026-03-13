@@ -3,6 +3,7 @@ import sys
 import logging
 import signal
 import time
+from datetime import datetime, timezone
 
 # Make sure we can import project modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,7 +32,7 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 def main():
     start_date = '2020-01-01'
-    end_date = '2026-02-24'
+    end_date   = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
     logger.info("=" * 60)
     logger.info("NIX TRADES - ML MODEL TRAINING")

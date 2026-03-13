@@ -211,20 +211,28 @@ def calculate_time_until(target_time: datetime) -> str:
         target_time: Future datetime (timezone-aware UTC preferred)
 
     Returns:
-        str: e.g. '1h 25m', '45m', 'now'
+        str: e.g. '1hr 25mins', '45mins', 'now'
     """
     try:
         now = datetime.now(timezone.utc)
         if target_time.tzinfo is None:
             target_time = target_time.replace(tzinfo=timezone.utc)
+        else:
+            target_time = target_time.astimezone(timezone.utc)
         delta = target_time - now
         if delta.total_seconds() <= 0:
             return 'now'
         total_minutes = int(delta.total_seconds() // 60)
         hours, minutes = divmod(total_minutes, 60)
+        days, hours    = divmod(hours, 24)
+        parts = []
+        if days > 0:
+            parts.append("%dday%s" % (days, 's' if days != 1 else ''))
         if hours > 0:
-            return f"{hours}h {minutes}m"
-        return f"{minutes}m"
+            parts.append("%dhr%s" % (hours, 's' if hours != 1 else ''))
+        if minutes > 0 or not parts:
+            parts.append("%dmin%s" % (minutes, 's' if minutes != 1 else ''))
+        return ' '.join(parts)
     except Exception as e:
         logger.error("Error calculating time until: %s", e)
         return 'unknown'
@@ -404,6 +412,7 @@ def format_setup_message(
     session:        str,
     order_type:     str,
     lot_size:       Optional[float] = None,
+    expiry_hours:   int = 8,
 ) -> str:
     """
     Format a standardised automated setup alert message for Telegram.
@@ -441,7 +450,8 @@ def format_setup_message(
         "Management:",
         "- TP1 hit: 50% closed, stop loss moved to breakeven",
         "- TP2 hit: Remaining 50% closed",
-        "- Orders expire in 1 hour if not filled",
+        "- Orders expire in %d hour%s if not filled" % (
+            expiry_hours, 's' if expiry_hours != 1 else ''),
         "",
         "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.",
         "Past performance does not guarantee future results.",
