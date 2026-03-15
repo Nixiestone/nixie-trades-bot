@@ -283,7 +283,11 @@ class MLEnsemble:
         labels: List[float]      = []
         window_size  = 100
         forward_bars = 32     # 8 hours on M15 (4 bars/hour) - matches live H1 expiry
-        step         = 40
+        # Step must be >= forward_bars to ensure non-overlapping labeling windows.
+        # Using step=40 with forward_bars=32 means adjacent windows share future bars,
+        # creating autocorrelation between labels that inflates test accuracy to 98%.
+        # step=64 gives non-overlapping future windows and independent labels.
+        step         = 64
 
         # Diagnostic counters - logged at end so you know where samples are lost
         _cnt_total       = 0
@@ -296,10 +300,20 @@ class MLEnsemble:
         _cnt_no_label    = 0
         _cnt_labeled     = 0
 
+        # Suppress INFO-level logs from SMC detection functions during training.
+        # detect_break_of_structure and detect_market_structure_shift both log at
+        # INFO level on every window call, producing thousands of log lines that
+        # belong to the training loop, not to live signal detection.
+        # They are restored to their original level after the loop completes.
+        import logging as _logging
+        _smc_logger      = _logging.getLogger('smc_strategy.SMCStrategy')
+        _original_level  = _smc_logger.level
+        _smc_logger.setLevel(_logging.WARNING)
+
         try:
             for i in range(window_size, len(m15_df) - forward_bars, step):
                 cur_time = m15_df.index[i]
-                
+
                 # Skip Asian session windows - they produce low-quality training samples
                 utc_hour = cur_time.hour if hasattr(cur_time, 'hour') else 12
                 if utc_hour >= 22 or utc_hour < 7:
@@ -342,6 +356,7 @@ class MLEnsemble:
                         h1_ctx, smc_dir, symbol=symbol)
 
                     if len(bos_events) >= 2:
+                        # BOS: Priority 1 = BB, Fallback = OB. Matches live scanner.
                         setup_type = 'BOS'
                         breakers   = self.smc.detect_breaker_blocks(
                             h1_ctx,
@@ -358,14 +373,25 @@ class MLEnsemble:
                                 poi = obs[0]
 
                     elif mss_event:
-                        setup_type = 'MSS'
-                        obs        = self.smc.detect_order_blocks(
-                            h1_ctx,
-                            mss_event.get('direction', smc_dir),
-                            symbol=symbol,
-                        )
+                        # MSS: Priority 1 = OB, Fallback = BB. Matches live scanner.
+                        # Previously only OBs were checked here, causing MSS windows
+                        # with no OBs to be silently dropped. This meant the training
+                        # data never contained MSS+BB setups even though the live
+                        # scanner generates them, creating a training/live mismatch.
+                        setup_type  = 'MSS'
+                        mss_dir     = mss_event.get('direction', smc_dir)
+                        obs         = self.smc.detect_order_blocks(
+                            h1_ctx, mss_dir, symbol=symbol)
                         if obs:
                             poi = obs[0]
+                        else:
+                            breakers = self.smc.detect_breaker_blocks(
+                                h1_ctx, mss_dir,
+                                float(htf_trend.get('swing_high', 0)),
+                                float(htf_trend.get('swing_low', 0)),
+                            )
+                            if breakers:
+                                poi = breakers[0]
                 except Exception as _e:
                     self.logger.debug("Structure detection error at window %d: %s", i, _e)
                     continue
@@ -476,6 +502,10 @@ class MLEnsemble:
         except Exception as e:
             self.logger.error("Sample generation error for %s: %s", symbol, e)
 
+        finally:
+            # Always restore the SMC logger level even if an exception occurred
+            _smc_logger.setLevel(_original_level)
+
         self.logger.info(
             "%s sample generation summary: "
             "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
@@ -525,14 +555,21 @@ class MLEnsemble:
             dtrain = xgb.DMatrix(X_tr, label=y_tr)
             dtest  = xgb.DMatrix(X_te, label=y_te)
             params = {
-                'objective': 'binary:logistic', 'max_depth': 6,
-                'learning_rate': 0.05, 'subsample': 0.8,
-                'colsample_bytree': 0.8, 'min_child_weight': 3,
-                'gamma': 0.1, 'eval_metric': 'auc', 'seed': 42,
+                'objective':        'binary:logistic',
+                'max_depth':        4,      # Reduced from 6. Prevents memorising individual setups.
+                'learning_rate':    0.03,   # Slower learning forces more generalisation.
+                'subsample':        0.7,    # Reduced from 0.8 for more regularisation.
+                'colsample_bytree': 0.7,    # Reduced from 0.8.
+                'min_child_weight': 15,     # Increased from 3. Requires larger node populations.
+                'gamma':            0.3,    # Increased from 0.1. Harder to split nodes.
+                'reg_alpha':        0.1,    # L1 regularisation - new, removes weak features.
+                'reg_lambda':       1.5,    # L2 regularisation - increased penalty on weights.
+                'eval_metric':      'auc',
+                'seed':             42,
             }
             self.xgboost_model = xgb.train(
-                params, dtrain, num_boost_round=400,
-                evals=[(dtest, 'test')], early_stopping_rounds=30,
+                params, dtrain, num_boost_round=300,
+                evals=[(dtest, 'test')], early_stopping_rounds=40,
                 verbose_eval=False)
             y_prob = self.xgboost_model.predict(dtest)
             acc = accuracy_score(y_te, (y_prob > 0.5).astype(int))
@@ -551,6 +588,12 @@ class MLEnsemble:
             self.logger.error("XGBoost training failed: %s", e)
             return False
 
+        if acc > 0.85:
+            self.logger.warning(
+                "XGBoost accuracy %.1f%% is suspiciously high. "
+                "This indicates overfitting. Expected range for this strategy: 65-80%%.",
+                acc * 100,
+            )
         self.logger.info(
             "XGBoost training complete. Accuracy: %.1f%%  AUC: %.3f  "
             "Train: %d  Test: %d", acc * 100, auc, len(X_tr), len(X_te))
@@ -565,8 +608,14 @@ class MLEnsemble:
         """GradientBoostingClassifier with different hyperparameters for ensemble diversity."""
         try:
             self.lstm_model = GradientBoostingClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.06,
-                subsample=0.75, min_samples_leaf=10, random_state=99)
+                n_estimators=200,         # Reduced from 300.
+                max_depth=3,              # Reduced from 4. Shallower trees generalise better.
+                learning_rate=0.04,       # Reduced from 0.06.
+                subsample=0.65,           # Reduced from 0.75.
+                min_samples_leaf=20,      # Increased from 10. Requires more evidence per leaf.
+                min_samples_split=40,     # New. Requires more evidence to split.
+                max_features='sqrt',      # New. Only considers sqrt(features) per split.
+                random_state=99)
             self.lstm_model.fit(X_tr, y_tr)
             y_prob = self.lstm_model.predict_proba(X_te)[:, 1]
             acc = accuracy_score(y_te, (y_prob > 0.5).astype(int))
@@ -593,9 +642,9 @@ class MLEnsemble:
             from sklearn.ensemble import RandomForestClassifier
             self.rf_model = RandomForestClassifier(
                 n_estimators=300,
-                max_depth=8,
-                min_samples_leaf=15,
-                min_samples_split=30,
+                max_depth=5,              # Reduced from 8. Prevents deep memorisation.
+                min_samples_leaf=25,      # Increased from 15. Smoother decision boundaries.
+                min_samples_split=50,     # Increased from 30.
                 max_features='sqrt',
                 class_weight='balanced',
                 n_jobs=-1,
