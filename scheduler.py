@@ -304,7 +304,7 @@ class NixTradesScheduler:
 
             message = utils.validate_user_message(
                 f"GOOD MORNING - DAILY MARKET OVERVIEW\n"
-                f"{datetime.utcnow().strftime('%A, %B %d, %Y')} (UTC)\n\n"
+                f"{datetime.now(timezone.utc).strftime('%A, %B %d, %Y')} (UTC)\n\n"
                 f"{market_overview}\n\n"
                 f"HIGH-IMPACT NEWS TODAY:\n"
                 f"{news_summary}\n\n"
@@ -488,25 +488,6 @@ class NixTradesScheduler:
                 self.logger.info(
                     "%s: no valid structure or POI candidates found.", symbol)
                 return
-
-            # Apply the H4 alignment gate now that setup_type is known.
-            # BOS is a trend continuation trade and requires H4 to agree.
-            # MSS is a reversal trade; requiring H4 alignment on a reversal
-            # is a logical contradiction and must be skipped.
-            if setup_type == 'BOS' and h4_trend_data is not None:
-                if not h4_aligned and h4_trend_data.get('trend') != 'RANGING':
-                    self.logger.info(
-                        "%s BOS: H4 trend (%s) opposes D1 trend (%s). "
-                        "BOS setups require HTF alignment. Skipping.",
-                        symbol,
-                        h4_trend_data.get('trend'),
-                        htf_trend.get('trend'),
-                    )
-                    return
-            elif setup_type == 'MSS':
-                self.logger.debug(
-                    "%s MSS: H4 alignment check skipped. "
-                    "MSS is a reversal trade.", symbol)
 
             # Apply the H4 alignment gate now that setup_type is known.
             # BOS is a trend continuation trade and requires H4 to agree.
@@ -797,7 +778,7 @@ class NixTradesScheduler:
                 "setup continues regardless.", symbol, atr_ratio)
 
             # Filter 2: Session - Asian is Unicorn-only, all other sessions trade
-            utc_hour     = datetime.utcnow().hour
+            utc_hour     = datetime.now(timezone.utc).hour
             session_name = utils.get_session_name(utc_hour)
             if session_name == 'Asian':
                 if tier != 'PREMIUM':

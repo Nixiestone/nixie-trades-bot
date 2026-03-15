@@ -27,10 +27,12 @@ except ImportError:
 # ==================== LOGGING WITH ROTATION ====================
 # Maximum 10 MB per file, 5 backup files = 50 MB total disk usage cap.
 
+# MT5 worker log: 5 MB x 4 files = 20 MB maximum.
+# This brings the total log footprint across all three log files to 60 MB.
 _log_handler_file    = RotatingFileHandler(
     'mt5_worker.log',
-    maxBytes=10 * 1024 * 1024,
-    backupCount=5,
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
     encoding='utf-8',
 )
 _log_handler_console = logging.StreamHandler()
@@ -1022,8 +1024,10 @@ def get_candles():
         bars = 500
 
     # Cap bars to prevent MT5 lock starvation on very large requests.
-    # 200,000 M15 bars covers approximately 5.7 years of trading data.
-    MAX_BARS = 200000
+    # 80,000 M15 bars covers approximately 2.3 years of trading data, which
+    # is the reliable maximum for all major retail MT5 brokers. Requesting
+    # more than this causes truncated responses or out-of-memory errors.
+    MAX_BARS = 80000
     if bars < 1:
         bars = 1
     if bars > MAX_BARS:

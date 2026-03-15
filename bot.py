@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
+from telegram.request import HTTPXRequest
 
 import config
 import utils
@@ -146,33 +147,141 @@ class NixTradesBot:
     # ==================== LIFECYCLE ====================
 
     def run(self):
-        """Build the Application, register handlers, and start polling."""
+        """
+        Entry point. Delegates all async work to asyncio.run() which creates
+        one persistent event loop for the entire bot lifetime. The retry loop
+        runs inside that single loop, which eliminates the 'Event loop is closed'
+        error that occurs when run_polling() is called more than once.
+        """
         try:
             db.init_supabase()
             self.logger.info("Database connection established.")
-
-            if not config.TELEGRAM_BOT_TOKEN:
-                raise ValueError("TELEGRAM_BOT_TOKEN is not set in your .env file.")
-
-            self.application = (
-                Application.builder()
-                .token(config.TELEGRAM_BOT_TOKEN)
-                .post_init(self._post_init)
-                .post_stop(self._post_stop)
-                .build()
-            )
-
-            self._register_handlers()
-
-            self.logger.info("Starting Nixie Trades Bot polling...")
-            self.application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-            )
-
         except Exception as e:
-            self.logger.critical("Fatal error starting bot: %s", e, exc_info=True)
+            self.logger.critical("Database initialisation failed: %s", e, exc_info=True)
             sys.exit(1)
+
+        if not config.TELEGRAM_BOT_TOKEN:
+            self.logger.critical("TELEGRAM_BOT_TOKEN is not set in your .env file.")
+            sys.exit(1)
+
+        try:
+            asyncio.run(self._main())
+        except KeyboardInterrupt:
+            self.logger.info("Bot stopped by keyboard interrupt.")
+
+    async def _main(self):
+        """
+        Persistent async retry loop running inside the single event loop
+        created by asyncio.run(). A failed connection attempt never closes
+        the loop so every retry receives a clean, live event loop.
+
+        Retry delays (seconds): 15, 30, 60, 120, 300, then capped at 300.
+        The attempt counter resets to 0 after every successful connection
+        so reconnections after a network drop always start from 15 seconds.
+        """
+        _attempt    = 0
+        _base_delay = 15
+        _max_delay  = 300
+
+        while True:
+            _attempt += 1
+            _delay    = min(_base_delay * _attempt, _max_delay)
+            self.application    = None
+            _app_started        = False
+            _polling_started    = False
+
+            try:
+                _request = HTTPXRequest(
+                    connection_pool_size=8,
+                    connect_timeout=20.0,
+                    read_timeout=30.0,
+                    write_timeout=30.0,
+                    pool_timeout=15.0,
+                )
+                # Build without PTB post_init/post_stop hooks.
+                # Lifecycle is managed manually below for full retry control.
+                self.application = (
+                    Application.builder()
+                    .token(config.TELEGRAM_BOT_TOKEN)
+                    .request(_request)
+                    .build()
+                )
+                self._register_handlers()
+                self.logger.info(
+                    "Connecting to Telegram (attempt %d, "
+                    "next retry delay if this fails: %ds)...",
+                    _attempt, _delay,
+                )
+
+                # async with calls application.initialize() on entry which
+                # performs the getMe() network call that validates the token.
+                # If the network is down this raises and we go to the except block.
+                async with self.application:
+                    try:
+                        await self._post_init(self.application)
+                        await self.application.start()
+                        _app_started = True
+
+                        await self.application.updater.start_polling(
+                            allowed_updates=Update.ALL_TYPES,
+                            drop_pending_updates=(_attempt == 1),
+                        )
+                        _polling_started = True
+
+                        self.logger.info(
+                            "Nixie Trades Bot is running. "
+                            "Connection established on attempt %d.",
+                            _attempt,
+                        )
+                        # Reset counter so next reconnect starts from 15s
+                        _attempt = 0
+
+                        # Block here until Ctrl+C cancels this coroutine
+                        await asyncio.Event().wait()
+
+                    except (asyncio.CancelledError, KeyboardInterrupt):
+                        self.logger.info(
+                            "Shutdown signal received. Stopping cleanly...")
+
+                    finally:
+                        if _polling_started:
+                            try:
+                                await self.application.updater.stop()
+                            except Exception as _ue:
+                                self.logger.debug(
+                                    "Updater stop error (non-critical): %s", _ue)
+                        if _app_started:
+                            try:
+                                await self._post_stop(self.application)
+                                await self.application.stop()
+                            except Exception as _ae:
+                                self.logger.debug(
+                                    "Application stop error (non-critical): %s", _ae)
+
+                # Reached only after a clean Ctrl+C shutdown
+                if _polling_started:
+                    return
+
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                return
+
+            except (TelegramError, NetworkError, OSError) as e:
+                self.logger.warning(
+                    "Connection failed (attempt %d): %s. "
+                    "Retrying automatically in %d seconds. "
+                    "The bot will keep retrying until the network is available.",
+                    _attempt, e, _delay,
+                )
+                await asyncio.sleep(_delay)
+
+            except Exception as e:
+                self.logger.error(
+                    "Unexpected error on attempt %d: %s. "
+                    "Retrying in %d seconds.",
+                    _attempt, e, _delay,
+                    exc_info=True,
+                )
+                await asyncio.sleep(_delay)
 
     async def _post_init(self, application: Application):
         """
@@ -206,13 +315,21 @@ class NixTradesBot:
         self.logger.info("Background services started: position monitor and market scanner.")
 
     async def _post_stop(self, application: Application):
-        """Called after polling stops. Shut down background services cleanly."""
+        """
+        Stops all background services.
+        Called manually from _main() before application.stop().
+        Sets references to None after stopping so repeated calls are safe.
+        """
+        if self.scheduler_obj is None and self.position_monitor is None:
+            return
         self.logger.info("Shutting down background services...")
         if self.scheduler_obj:
             self.scheduler_obj.stop()
+            self.scheduler_obj = None
         if self.position_monitor:
             self.position_monitor.stop()
-        self.logger.info("All services stopped. Bot shut down cleanly.")
+            self.position_monitor = None
+        self.logger.info("All services stopped.")
 
     # ==================== HANDLER REGISTRATION ====================
 

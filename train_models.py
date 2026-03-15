@@ -3,7 +3,7 @@ import sys
 import logging
 import signal
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Make sure we can import project modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,11 +31,16 @@ signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 def main():
-    start_date = '2020-01-01'
     end_date   = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    # Calculate the training window dynamically from today backwards.
+    # Two years of M15 history produces approximately 70,000 bars per symbol,
+    # which is within the reliable delivery limit of all major retail MT5
+    # brokers. A fixed date such as 2020 requests 200,000+ bars and causes
+    # the broker to return empty responses, silently discarding the symbol.
+    start_date = (datetime.now(timezone.utc) - timedelta(days=730)).strftime('%Y-%m-%d')
 
     logger.info("=" * 60)
-    logger.info("NIX TRADES - ML MODEL TRAINING")
+    logger.info("NIXIE TRADES - ML MODEL TRAINING")
     logger.info("Training on MT5 historical data from %s to %s", start_date, end_date)
     logger.info("=" * 60)
 

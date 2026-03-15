@@ -162,13 +162,13 @@ class MLEnsemble:
             total_days = 730
 
         # M15: 252 trading days x 96 bars = 24,192 bars per year.
-        # For a 6-year window: ~145,000 bars. Cap at 200,000 to accommodate
-        # brokers with extended history while staying within memory limits.
-        # H1: 252 x 24 = 6,048 bars per year. Cap at 60,000 for 10 years.
-        # D1: 252 bars per year. Cap at 5,000 for ~20 years.
-        m15_bars = min(max(total_days * 96  + 500, 2000), 200000)
-        h1_bars  = min(max(total_days * 24  + 300, 1000),  60000)
-        d1_bars  = min(max(total_days       + 60,  300),    5000)
+        # Cap at 80,000 (~2.3 years). All major retail MT5 brokers reliably
+        # return this volume in a single request. Requesting more triggers
+        # truncated or empty responses which silently discard training samples.
+        # H1: cap at 20,000 (~2.3 years). D1: cap at 3,000 (~12 years).
+        m15_bars = min(max(total_days * 96  + 500, 2000), 80000)
+        h1_bars  = min(max(total_days * 24  + 300, 1000), 20000)
+        d1_bars  = min(max(total_days       + 60,  300),   3000)
         return m15_bars, h1_bars, d1_bars
 
     def train_on_historical_data(

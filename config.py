@@ -267,14 +267,18 @@ WORD_REPLACEMENTS = {
 LOG_LEVEL             = os.getenv('LOG_LEVEL', 'INFO')
 LOG_FORMAT            = '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s'
 LOG_DATE_FORMAT       = '%Y-%m-%d %H:%M:%S'
-LOG_FILE_MAX_BYTES    = 10 * 1024 * 1024   # 10 MB per main log file
-LOG_FILE_BACKUP_COUNT = 5                   # 5 backups = 50 MB max for main log
+# Main log: 5 MB x 4 files = 20 MB on disk.
+# Trade history: 5 MB x 4 files = 20 MB on disk.
+# MT5 worker log: 5 MB x 4 files = 20 MB on disk.
+# Combined total cap across all log files: 60 MB.
+LOG_FILE_MAX_BYTES    = 5 * 1024 * 1024    # 5 MB per main log file
+LOG_FILE_BACKUP_COUNT = 3                   # 3 backups + 1 active = 4 files = 20 MB
 
 # Dedicated trade history log (separate from main application log)
-# Rotating: 5 files x 10 MB = 50 MB maximum total on disk
+# Rotating: 4 files x 5 MB = 20 MB maximum total on disk
 TRADE_HISTORY_LOG_FILE     = os.getenv('TRADE_HISTORY_LOG_FILE', 'trade_history.log')
-TRADE_HISTORY_MAX_BYTES    = 10 * 1024 * 1024   # 10 MB per file
-TRADE_HISTORY_BACKUP_COUNT = 4                   # 4 backups + 1 active = 5 files = 50 MB
+TRADE_HISTORY_MAX_BYTES    = 5 * 1024 * 1024    # 5 MB per file
+TRADE_HISTORY_BACKUP_COUNT = 3                   # 3 backups + 1 active = 4 files = 20 MB
 
 # ==================== DATABASE CONFIGURATION ====================
 

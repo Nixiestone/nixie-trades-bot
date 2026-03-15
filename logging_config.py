@@ -113,15 +113,19 @@ def setup_logging(log_level: str = 'INFO', log_file: Optional[str] = None) -> No
     for mod in own_modules:
         logging.getLogger(mod).setLevel(numeric_level)
 
+    _main_max_mb  = (config.LOG_FILE_MAX_BYTES * (config.LOG_FILE_BACKUP_COUNT + 1)) // (1024 * 1024)
+    _trade_max_mb = (config.TRADE_HISTORY_MAX_BYTES * (config.TRADE_HISTORY_BACKUP_COUNT + 1)) // (1024 * 1024)
     logging.info(
-        "Logging ready. Level: %s | Main log: %s (%d MB x %d files) | "
-        "Trade log: %s (%d MB x %d files = 50 MB max) | Scrubbing: active",
+        "Logging ready. Level: %s | Main log: %s (%d MB x %d files = %d MB max) | "
+        "Trade log: %s (%d MB x %d files = %d MB max) | Scrubbing: active",
         log_level.upper(), log_file,
         config.LOG_FILE_MAX_BYTES // (1024 * 1024),
         config.LOG_FILE_BACKUP_COUNT + 1,
+        _main_max_mb,
         config.TRADE_HISTORY_LOG_FILE,
         config.TRADE_HISTORY_MAX_BYTES // (1024 * 1024),
         config.TRADE_HISTORY_BACKUP_COUNT + 1,
+        _trade_max_mb,
     )
 
 
