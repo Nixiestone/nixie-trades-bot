@@ -1,11 +1,19 @@
 -- ============================================================
 -- NIXIE TRADES — MASTER DATABASE SETUP
--- Version: 3.0 FINAL
+-- Version: 4.0 FINAL
 -- Author: Blessing Omoregie (Nixie Trades)
 -- Role: Data Engineer + Infrastructure Engineer + Security Engineer
 --
--- SAFE TO RE-RUN: All statements use IF NOT EXISTS or DROP IF EXISTS,
--- so you can run this again without breaking anything.
+-- HOW TO USE:
+--   1. Open your Supabase project
+--   2. Click "SQL Editor" in the left sidebar
+--   3. Click "New Query"
+--   4. Copy this ENTIRE file and paste it in
+--   5. Click the green "Run" button
+--   6. You should see: "All tables, views, and policies created successfully!"
+--
+-- SAFE TO RE-RUN: All statements use IF NOT EXISTS or DROP IF EXISTS
+-- so you can run this again without breaking existing data.
 -- ============================================================
 
 
@@ -15,14 +23,11 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 
--- ==================== STEP 2: DROP OLD TABLES ====================
--- This clears out any old version of the schema so we start clean.
--- CASCADE means any views or dependencies are dropped too.
+-- ==================== STEP 2: TABLES ====================
 
-
--- ==================== STEP 3: TELEGRAM USERS ====================
--- This table stores every person who uses the bot.
--- Their broker password is stored encrypted (never plain text).
+-- ---- 2.1 TELEGRAM USERS ----
+-- Stores every person who uses the bot.
+-- The broker password is stored encrypted (never plain text).
 
 CREATE TABLE IF NOT EXISTS telegram_users (
     id                          BIGSERIAL       PRIMARY KEY,
@@ -42,6 +47,12 @@ CREATE TABLE IF NOT EXISTS telegram_users (
     risk_percent                NUMERIC(4,2)    NOT NULL DEFAULT 1.0
                                                 CHECK (risk_percent >= 0.1 AND risk_percent <= 5.0),
 
+    -- Autonomous position management
+    -- When TRUE, the bot automatically manages TP1 partial close and breakeven
+    -- without asking the user for confirmation each time.
+    -- User must accept the autonomous management disclaimer before this can be enabled.
+    auto_position_management    BOOLEAN         NOT NULL DEFAULT FALSE,
+
     -- MT5 broker connection
     mt5_login                   BIGINT,
     mt5_password_encrypted      TEXT,
@@ -57,13 +68,13 @@ CREATE TABLE IF NOT EXISTS telegram_users (
     updated_at                  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_telegram_users_telegram_id
+CREATE INDEX IF NOT EXISTS idx_telegram_users_telegram_id
     ON telegram_users (telegram_id);
 
-CREATE INDEX idx_telegram_users_subscription_status
+CREATE INDEX IF NOT EXISTS idx_telegram_users_subscription_status
     ON telegram_users (subscription_status);
 
-CREATE INDEX idx_telegram_users_mt5_connected
+CREATE INDEX IF NOT EXISTS idx_telegram_users_mt5_connected
     ON telegram_users (mt5_connected);
 
 COMMENT ON TABLE telegram_users IS
@@ -72,8 +83,12 @@ COMMENT ON TABLE telegram_users IS
 COMMENT ON COLUMN telegram_users.mt5_password_encrypted IS
     'Fernet-encrypted MT5 broker password. Never stored in plain text.';
 
+COMMENT ON COLUMN telegram_users.auto_position_management IS
+    'When TRUE the bot manages TP1 partial close and breakeven automatically '
+    'without asking the user for confirmation. Requires disclaimer acceptance.';
 
--- ==================== STEP 4: SIGNALS ====================
+
+-- ---- 2.2 SIGNALS ----
 -- Every trade setup the bot detects is saved here.
 -- All users share this table (one setup fired to everyone subscribed).
 
@@ -94,28 +109,28 @@ CREATE TABLE IF NOT EXISTS signals (
     tp2_pips        NUMERIC(10,2),
     rr_tp1          NUMERIC(6,2),
     rr_tp2          NUMERIC(6,2),
-    ml_score        INT             CHECK (ml_score     BETWEEN 0 AND 100),
-    lstm_score      INT             CHECK (lstm_score   BETWEEN 0 AND 100),
+    ml_score        INT             CHECK (ml_score      BETWEEN 0 AND 100),
+    lstm_score      INT             CHECK (lstm_score    BETWEEN 0 AND 100),
     xgboost_score   INT             CHECK (xgboost_score BETWEEN 0 AND 100),
     session         TEXT,
     order_type      TEXT            CHECK (order_type IN ('MARKET', 'LIMIT', 'STOP')),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_signals_created_at
+CREATE INDEX IF NOT EXISTS idx_signals_created_at
     ON signals (created_at DESC);
 
-CREATE INDEX idx_signals_symbol
+CREATE INDEX IF NOT EXISTS idx_signals_symbol
     ON signals (symbol);
 
-CREATE INDEX idx_signals_symbol_direction_created
+CREATE INDEX IF NOT EXISTS idx_signals_symbol_direction_created
     ON signals (symbol, direction, created_at DESC);
 
 COMMENT ON TABLE signals IS
     'Automated SMC trading setup history. One record per setup, shared across all users.';
 
 
--- ==================== STEP 5: TRADES ====================
+-- ---- 2.3 TRADES ----
 -- When a user executes a setup (manually or via auto-trade),
 -- one row is created here per user per trade.
 
@@ -150,23 +165,23 @@ CREATE TABLE IF NOT EXISTS trades (
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_trades_telegram_id
+CREATE INDEX IF NOT EXISTS idx_trades_telegram_id
     ON trades (telegram_id);
 
-CREATE INDEX idx_trades_status
+CREATE INDEX IF NOT EXISTS idx_trades_status
     ON trades (status);
 
-CREATE INDEX idx_trades_mt5_ticket
+CREATE INDEX IF NOT EXISTS idx_trades_mt5_ticket
     ON trades (mt5_ticket);
 
-CREATE INDEX idx_trades_telegram_status
+CREATE INDEX IF NOT EXISTS idx_trades_telegram_status
     ON trades (telegram_id, status);
 
 COMMENT ON TABLE trades IS
     'Individual trade executions per user. One row per user per trade.';
 
 
--- ==================== STEP 6: NEWS EVENTS ====================
+-- ---- 2.4 NEWS EVENTS ----
 -- The bot caches upcoming economic news here so it can skip
 -- trading during high-impact events.
 
@@ -182,23 +197,22 @@ CREATE TABLE IF NOT EXISTS news_events (
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_news_events_time
+CREATE INDEX IF NOT EXISTS idx_news_events_time
     ON news_events (event_time_utc);
 
-CREATE INDEX idx_news_events_currency
+CREATE INDEX IF NOT EXISTS idx_news_events_currency
     ON news_events (currency);
 
-CREATE INDEX idx_news_events_impact_time
+CREATE INDEX IF NOT EXISTS idx_news_events_impact_time
     ON news_events (impact, event_time_utc);
 
 COMMENT ON TABLE news_events IS
     'Cached high-impact economic calendar events used for news blackout filtering.';
 
 
--- ==================== STEP 7: MESSAGE QUEUE ====================
--- When the bot needs to send a Telegram message to a user but
--- they were offline or the send failed, the message is saved here
--- and retried on the next scan.
+-- ---- 2.5 MESSAGE QUEUE ----
+-- When the bot needs to send a Telegram message to a user but they were
+-- offline or the send failed, the message is saved here and retried.
 
 CREATE TABLE IF NOT EXISTS message_queue (
     id              BIGSERIAL       PRIMARY KEY,
@@ -218,20 +232,20 @@ CREATE TABLE IF NOT EXISTS message_queue (
     sent_at         TIMESTAMPTZ
 );
 
-CREATE INDEX idx_message_queue_telegram_id
+CREATE INDEX IF NOT EXISTS idx_message_queue_telegram_id
     ON message_queue (telegram_id);
 
-CREATE INDEX idx_message_queue_status
+CREATE INDEX IF NOT EXISTS idx_message_queue_status
     ON message_queue (status);
 
-CREATE INDEX idx_message_queue_created_at
+CREATE INDEX IF NOT EXISTS idx_message_queue_created_at
     ON message_queue (created_at);
 
 COMMENT ON TABLE message_queue IS
     'Queued Telegram messages for offline users. Retried on next scheduler cycle.';
 
 
--- ==================== STEP 8: ML TRAINING DATA ====================
+-- ---- 2.6 ML TRAINING DATA ----
 -- Every completed trade feeds back into this table so the machine
 -- learning models can retrain on real outcomes over time.
 
@@ -243,16 +257,16 @@ CREATE TABLE IF NOT EXISTS ml_training_data (
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_ml_training_created
+CREATE INDEX IF NOT EXISTS idx_ml_training_created
     ON ml_training_data (created_at DESC);
 
 COMMENT ON TABLE ml_training_data IS
     'Feature vectors and outcomes used to retrain ML models on live trade results.';
 
 
--- ==================== STEP 9: MODEL METRICS ====================
--- Every time the ML models are evaluated, their accuracy scores
--- are saved here so we can track improvement over time.
+-- ---- 2.7 MODEL METRICS ----
+-- Every time the ML models are evaluated, their accuracy scores are
+-- saved here so performance can be tracked over time.
 
 CREATE TABLE IF NOT EXISTS model_metrics (
     id              BIGSERIAL       PRIMARY KEY,
@@ -263,19 +277,50 @@ CREATE TABLE IF NOT EXISTS model_metrics (
     timestamp       TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_model_metrics_model_timestamp
+CREATE INDEX IF NOT EXISTS idx_model_metrics_model_timestamp
     ON model_metrics (model_name, timestamp DESC);
 
 COMMENT ON TABLE model_metrics IS
     'ML model performance metrics tracked over time.';
 
 
--- ==================== STEP 10: QUEUED_MESSAGES VIEW ====================
+-- ==================== STEP 3: COLUMN MIGRATIONS ====================
+-- Add new columns to existing tables.
+-- Uses IF NOT EXISTS so this is safe to re-run on a table that
+-- already has the column from a previous migration.
+
+ALTER TABLE telegram_users
+    ADD COLUMN IF NOT EXISTS auto_position_management BOOLEAN NOT NULL DEFAULT FALSE;
+
+
+-- ==================== STEP 4: SIGNAL NUMBER SEQUENCE ====================
+-- The database hands out signal numbers using a sequence counter.
+-- This prevents the race condition where two simultaneous signals
+-- could try to insert the same signal_number and one would crash.
+
+CREATE SEQUENCE IF NOT EXISTS signals_signal_number_seq;
+
+-- Sync the sequence to the highest existing signal_number.
+-- If you have 3 signals already, the next one will be 4.
+-- If you have 0 signals, the next one will be 1.
+SELECT setval(
+    'signals_signal_number_seq',
+    (SELECT COALESCE(MAX(signal_number), 0) FROM signals)
+);
+
+-- Wire the sequence to the column so it fires automatically on every INSERT.
+ALTER TABLE signals
+    ALTER COLUMN signal_number
+    SET DEFAULT nextval('signals_signal_number_seq');
+
+
+-- ==================== STEP 5: QUEUED_MESSAGES VIEW ====================
 -- The bot code references "queued_messages" (with an s).
 -- This view sits on top of the message_queue table and translates
 -- the column names the code expects.
--- security_invoker = true means the view respects RLS — it does NOT
--- bypass row-level security the way a SECURITY DEFINER view would.
+-- security_invoker = true means the view respects RLS.
+
+DROP VIEW IF EXISTS public.queued_messages;
 
 CREATE VIEW public.queued_messages
 WITH (security_invoker = true)
@@ -291,14 +336,12 @@ SELECT
 FROM public.message_queue;
 
 COMMENT ON VIEW public.queued_messages IS
-    'Read-only view over message_queue. security_invoker=true enforces RLS of the calling role.';
+    'Read-only view over message_queue. security_invoker=true enforces RLS.';
 
 
--- ==================== STEP 11: ROW LEVEL SECURITY ====================
--- RLS means the database enforces access control at the row level.
--- We lock every table so ONLY the bot server (service_role) can
--- read or write. No direct public access is possible even if someone
--- gets hold of the anon key.
+-- ==================== STEP 6: ROW LEVEL SECURITY ====================
+-- RLS locks every table so ONLY the bot server (service_role) can
+-- read or write. No direct public access is possible.
 
 ALTER TABLE telegram_users      ENABLE ROW LEVEL SECURITY;
 ALTER TABLE signals             ENABLE ROW LEVEL SECURITY;
@@ -308,7 +351,6 @@ ALTER TABLE message_queue       ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ml_training_data    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE model_metrics       ENABLE ROW LEVEL SECURITY;
 
--- Drop old policies before recreating (safe to re-run)
 DROP POLICY IF EXISTS telegram_users_service_only   ON telegram_users;
 DROP POLICY IF EXISTS signals_service_only          ON signals;
 DROP POLICY IF EXISTS trades_service_only           ON trades;
@@ -346,10 +388,9 @@ CREATE POLICY model_metrics_service_only    ON model_metrics
     WITH CHECK (auth.role() = 'service_role');
 
 
--- ==================== STEP 12: FUNCTION SEARCH PATH HARDENING ====================
--- This patches any existing PostgreSQL functions so they cannot be
--- tricked into using the wrong schema via a search_path injection attack.
--- Skips gracefully if a function does not exist yet.
+-- ==================== STEP 7: FUNCTION SEARCH PATH HARDENING ====================
+-- Patches any existing PostgreSQL functions so they cannot be exploited
+-- via a search_path injection attack. Skips gracefully if not found.
 
 DO $$
 DECLARE
@@ -374,99 +415,76 @@ BEGIN
             );
             RAISE NOTICE 'Patched search_path on function: %', _fn;
         ELSE
-            RAISE NOTICE 'Function % not found as a Postgres function - skipped (normal).', _fn;
+            RAISE NOTICE 'Function % not found - skipped (normal).', _fn;
         END IF;
     END LOOP;
 END
 $$;
 
 
--- ==================== STEP 13: VERIFY ====================
--- This final block prints a confirmation that everything was created.
+-- ==================== STEP 8: VERIFY ====================
 
 DO $$
 DECLARE
-    _table_count INT;
+    _table_count   INT;
+    _seq_default   TEXT;
+    _has_auto_col  BOOLEAN;
 BEGIN
+    -- Check all 7 tables exist
     SELECT COUNT(*) INTO _table_count
     FROM information_schema.tables
     WHERE table_schema = 'public'
       AND table_type   = 'BASE TABLE'
       AND table_name IN (
-          'telegram_users',
-          'signals',
-          'trades',
-          'news_events',
-          'message_queue',
-          'ml_training_data',
-          'model_metrics'
+          'telegram_users', 'signals', 'trades',
+          'news_events', 'message_queue',
+          'ml_training_data', 'model_metrics'
       );
 
-    IF _table_count = 7 THEN
-        RAISE NOTICE '====================================================';
-        RAISE NOTICE 'All tables, views, and policies created successfully!';
-        RAISE NOTICE 'Tables confirmed: %/7', _table_count;
-        RAISE NOTICE '====================================================';
-    ELSE
-        RAISE WARNING 'Only %/7 tables found. Re-check for errors above.', _table_count;
-    END IF;
-END
-$$;
-
-
--- NIXIE TRADES — SIGNAL NUMBER SEQUENCE FIX
--- Run this ONCE in the Supabase SQL Editor.
--- Safe to run even if you have zero signals so far.
--- This fixes the race condition where two simultaneous signals
--- could try to save with the same signal_number and one gets lost.
---
--- PLAIN ENGLISH:
--- Before this fix, the Python code calculated the next signal number
--- by counting existing rows and adding 1. If two scans ran at the exact
--- same moment, both would count the same number and try to insert the
--- same number, causing one to crash.
--- After this fix, the database itself hands out signal numbers one at
--- a time using a counter (called a sequence) that can never give the
--- same number twice, even to simultaneous requests.
-
--- Step 1: Create the sequence
-CREATE SEQUENCE IF NOT EXISTS signals_signal_number_seq;
-
--- Step 2: Set it to start from wherever your current data is
--- (if you have 10 signals already, the next one will be 11)
-SELECT setval(
-    'signals_signal_number_seq',
-    (SELECT COALESCE(MAX(signal_number), 0) FROM signals)
-);
-
--- Step 3: Make the signal_number column use this sequence automatically
-ALTER TABLE signals
-    ALTER COLUMN signal_number
-    SET DEFAULT nextval('signals_signal_number_seq');
-
--- Verify it worked
-DO $$
-DECLARE
-    _default_val TEXT;
-BEGIN
-    SELECT column_default INTO _default_val
+    -- Check signal_number sequence is active
+    SELECT column_default INTO _seq_default
     FROM information_schema.columns
     WHERE table_schema = 'public'
       AND table_name   = 'signals'
       AND column_name  = 'signal_number';
 
-    IF _default_val LIKE '%nextval%' THEN
-        RAISE NOTICE 'SUCCESS: signal_number sequence is active. Race condition fixed.';
+    -- Check auto_position_management column exists
+    SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'telegram_users'
+          AND column_name  = 'auto_position_management'
+    ) INTO _has_auto_col;
+
+    RAISE NOTICE '====================================================';
+
+    IF _table_count = 7 THEN
+        RAISE NOTICE 'Tables:              OK (%/7 confirmed)', _table_count;
     ELSE
-        RAISE WARNING 'Something went wrong. column_default = %', _default_val;
+        RAISE WARNING 'Tables:              PROBLEM — only %/7 found', _table_count;
+    END IF;
+
+    IF _seq_default LIKE '%nextval%' THEN
+        RAISE NOTICE 'Signal sequence:     OK (race condition protection active)';
+    ELSE
+        RAISE WARNING 'Signal sequence:     PROBLEM — signal_number has no default';
+    END IF;
+
+    IF _has_auto_col THEN
+        RAISE NOTICE 'Auto mgmt column:    OK (auto_position_management present)';
+    ELSE
+        RAISE WARNING 'Auto mgmt column:    PROBLEM — column not found';
+    END IF;
+
+    IF _table_count = 7 AND _seq_default LIKE '%nextval%' AND _has_auto_col THEN
+        RAISE NOTICE '====================================================';
+        RAISE NOTICE 'All checks passed. Database is ready.';
+        RAISE NOTICE '====================================================';
+    ELSE
+        RAISE WARNING '====================================================';
+        RAISE WARNING 'One or more checks failed. Review warnings above.';
+        RAISE WARNING '====================================================';
     END IF;
 END
 $$;
-
-ALTER TABLE telegram_users
-    ADD COLUMN IF NOT EXISTS auto_position_management BOOLEAN NOT NULL DEFAULT FALSE;
-
-COMMENT ON COLUMN telegram_users.auto_position_management IS
-    'When TRUE, the bot automatically manages TP1 partial close and breakeven '
-    'without asking the user for confirmation. User must accept the autonomous '
-    'management disclaimer before this can be enabled.';
