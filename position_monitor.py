@@ -372,7 +372,92 @@ class PositionMonitor:
                 )
             )
         else:
-            # Ask user for confirmation before closing 50%
+            # Check whether this user has enabled autonomous management.
+            # If enabled, execute the partial close immediately without asking.
+            # If disabled (default), send the confirmation keyboard and wait.
+            _auto_manage = False
+            try:
+                user_row = db.get_user(position.telegram_id)
+                _auto_manage = bool(
+                    user_row.get('auto_position_management', False)
+                ) if user_row else False
+            except Exception as _db_err:
+                self.logger.warning(
+                    "Could not read auto_position_management for user %d: %s. "
+                    "Defaulting to manual confirmation.",
+                    position.telegram_id, _db_err,
+                )
+
+            if _auto_manage:
+                self._execute_auto_partial_close(position)
+            else:
+                position.awaiting_partial_confirm = True
+                position.partial_confirm_sent_at  = time_module.time()
+                self._request_partial_profit_confirmation(position)
+                
+    def _execute_auto_partial_close(self, position: MonitoredPosition):
+        """
+        Execute a 50 percent partial close automatically without user confirmation.
+        Called when the user has enabled autonomous position management in /settings.
+        Moves the stop loss to breakeven after the partial close succeeds.
+        Notifies the user after the fact.
+        """
+        try:
+            pip_size = utils.get_pip_value(position.symbol)
+            if pip_size <= 0:
+                pip_size = 0.0001
+            if position.direction == 'BUY':
+                pips = (position.take_profit_1 - position.entry_price) / pip_size
+            else:
+                pips = (position.entry_price - position.take_profit_1) / pip_size
+
+            success, message = self.mt5.close_partial_position(
+                telegram_id=position.telegram_id,
+                ticket=position.ticket,
+                close_pct=0.5,
+            )
+
+            if success:
+                self._handle_be_activation(position)
+                half_lots = round(position.volume / 2, 2)
+                self._send_notification(
+                    position.telegram_id,
+                    "TP1 HIT - AUTO PARTIAL CLOSE EXECUTED\n\n"
+                    "Ticket:    %d\n"
+                    "Symbol:    %s\n"
+                    "Closed:    %.2f lots at TP1\n"
+                    "Pips:      +%.1f\n\n"
+                    "Stop loss has been moved to breakeven automatically.\n"
+                    "Remaining 50 percent is running to TP2.\n\n"
+                    "Autonomous management is active. No confirmation was required.\n"
+                    "Use /settings to change this preference." % (
+                        position.ticket,
+                        position.symbol,
+                        half_lots,
+                        pips,
+                    )
+                )
+                self.logger.info(
+                    "Auto partial close executed: ticket=%d symbol=%s "
+                    "%.2f lots closed at TP1 (+%.1f pips). BE activated.",
+                    position.ticket, position.symbol, half_lots, pips,
+                )
+            else:
+                self.logger.error(
+                    "Auto partial close FAILED for ticket %d: %s. "
+                    "Falling back to manual confirmation.",
+                    position.ticket, message,
+                )
+                # Fallback: ask the user manually since the auto-close failed
+                position.awaiting_partial_confirm = True
+                position.partial_confirm_sent_at  = time_module.time()
+                self._request_partial_profit_confirmation(position)
+
+        except Exception as e:
+            self.logger.error(
+                "Error in _execute_auto_partial_close for ticket %d: %s",
+                position.ticket, e,
+            )
             position.awaiting_partial_confirm = True
             position.partial_confirm_sent_at  = time_module.time()
             self._request_partial_profit_confirmation(position)

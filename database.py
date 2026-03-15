@@ -226,6 +226,26 @@ def update_timezone(telegram_id: int, tz: str) -> bool:
 
 
 @_db_retry()
+def update_auto_position_management(telegram_id: int, enabled: bool) -> bool:
+    """
+    Enable or disable autonomous position management for a user.
+    When enabled, the bot executes TP1 partial close and breakeven
+    automatically without asking the user for confirmation each time.
+    The user must have accepted the autonomous management disclaimer
+    before this can be set to True.
+    """
+    _client().table('telegram_users').update({
+        'auto_position_management': enabled,
+        'updated_at':               datetime.now(timezone.utc).isoformat(),
+    }).eq('telegram_id', telegram_id).execute()
+    logger.info(
+        "Auto position management set to %s for user %d.",
+        enabled, telegram_id,
+    )
+    return True
+
+
+@_db_retry()
 def get_subscribed_users() -> List[dict]:
     """
     Return all users with active subscriptions.

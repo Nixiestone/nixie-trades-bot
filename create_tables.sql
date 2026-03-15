@@ -4,14 +4,6 @@
 -- Author: Blessing Omoregie (Nixie Trades)
 -- Role: Data Engineer + Infrastructure Engineer + Security Engineer
 --
--- HOW TO USE:
---   1. Open your Supabase project
---   2. Click "SQL Editor" in the left sidebar
---   3. Click "New query"
---   4. Copy this ENTIRE file and paste it in
---   5. Click the green "Run" button
---   6. You should see: "All tables, views, and policies created successfully!"
---
 -- SAFE TO RE-RUN: All statements use IF NOT EXISTS or DROP IF EXISTS,
 -- so you can run this again without breaking anything.
 -- ============================================================
@@ -27,21 +19,12 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- This clears out any old version of the schema so we start clean.
 -- CASCADE means any views or dependencies are dropped too.
 
-DROP TABLE IF EXISTS model_metrics        CASCADE;
-DROP TABLE IF EXISTS ml_training_data     CASCADE;
-DROP TABLE IF EXISTS news_events          CASCADE;
-DROP TABLE IF EXISTS message_queue        CASCADE;
-DROP TABLE IF EXISTS trades               CASCADE;
-DROP TABLE IF EXISTS signals              CASCADE;
-DROP TABLE IF EXISTS telegram_users       CASCADE;
-DROP VIEW  IF EXISTS queued_messages      CASCADE;
-
 
 -- ==================== STEP 3: TELEGRAM USERS ====================
 -- This table stores every person who uses the bot.
 -- Their broker password is stored encrypted (never plain text).
 
-CREATE TABLE telegram_users (
+CREATE TABLE IF NOT EXISTS telegram_users (
     id                          BIGSERIAL       PRIMARY KEY,
     telegram_id                 BIGINT          NOT NULL UNIQUE,
     username                    TEXT,
@@ -94,7 +77,7 @@ COMMENT ON COLUMN telegram_users.mt5_password_encrypted IS
 -- Every trade setup the bot detects is saved here.
 -- All users share this table (one setup fired to everyone subscribed).
 
-CREATE TABLE signals (
+CREATE TABLE IF NOT EXISTS signals (
     id              BIGSERIAL       PRIMARY KEY,
     signal_number   INT             NOT NULL UNIQUE,
     symbol          TEXT            NOT NULL,
@@ -136,7 +119,7 @@ COMMENT ON TABLE signals IS
 -- When a user executes a setup (manually or via auto-trade),
 -- one row is created here per user per trade.
 
-CREATE TABLE trades (
+CREATE TABLE IF NOT EXISTS trades (
     id              BIGSERIAL       PRIMARY KEY,
     telegram_id     BIGINT          NOT NULL
                                     REFERENCES telegram_users(telegram_id)
@@ -187,7 +170,7 @@ COMMENT ON TABLE trades IS
 -- The bot caches upcoming economic news here so it can skip
 -- trading during high-impact events.
 
-CREATE TABLE news_events (
+CREATE TABLE IF NOT EXISTS news_events (
     id              BIGSERIAL       PRIMARY KEY,
     event_time_utc  TIMESTAMPTZ     NOT NULL,
     currency        TEXT            NOT NULL,
@@ -217,7 +200,7 @@ COMMENT ON TABLE news_events IS
 -- they were offline or the send failed, the message is saved here
 -- and retried on the next scan.
 
-CREATE TABLE message_queue (
+CREATE TABLE IF NOT EXISTS message_queue (
     id              BIGSERIAL       PRIMARY KEY,
     telegram_id     BIGINT          NOT NULL
                                     REFERENCES telegram_users(telegram_id)
@@ -252,7 +235,7 @@ COMMENT ON TABLE message_queue IS
 -- Every completed trade feeds back into this table so the machine
 -- learning models can retrain on real outcomes over time.
 
-CREATE TABLE ml_training_data (
+CREATE TABLE IF NOT EXISTS ml_training_data (
     id              BIGSERIAL       PRIMARY KEY,
     mt5_ticket      BIGINT,
     features_json   TEXT            NOT NULL,
@@ -271,7 +254,7 @@ COMMENT ON TABLE ml_training_data IS
 -- Every time the ML models are evaluated, their accuracy scores
 -- are saved here so we can track improvement over time.
 
-CREATE TABLE model_metrics (
+CREATE TABLE IF NOT EXISTS model_metrics (
     id              BIGSERIAL       PRIMARY KEY,
     model_name      TEXT            NOT NULL,
     metric_type     TEXT            NOT NULL,
@@ -479,3 +462,11 @@ BEGIN
     END IF;
 END
 $$;
+
+ALTER TABLE telegram_users
+    ADD COLUMN IF NOT EXISTS auto_position_management BOOLEAN NOT NULL DEFAULT FALSE;
+
+COMMENT ON COLUMN telegram_users.auto_position_management IS
+    'When TRUE, the bot automatically manages TP1 partial close and breakeven '
+    'without asking the user for confirmation. User must accept the autonomous '
+    'management disclaimer before this can be enabled.';

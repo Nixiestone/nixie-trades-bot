@@ -38,12 +38,13 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONVERSATION STATES ====================
 
-DISCLAIMER_SHOWN      = 0
-MT5_WAITING_LOGIN     = 0
-MT5_WAITING_PASSWORD  = 1
-MT5_WAITING_SERVER    = 2
-SETTINGS_WAITING_RISK = 0
-SETTINGS_WAITING_TZ   = 1
+DISCLAIMER_SHOWN           = 0
+MT5_WAITING_LOGIN          = 0
+MT5_WAITING_PASSWORD       = 1
+MT5_WAITING_SERVER         = 2
+SETTINGS_WAITING_RISK      = 0
+SETTINGS_WAITING_TZ        = 1
+AUTO_MGMT_DISCLAIMER_SHOWN = 0
 
 # ==================== RATE LIMITER ====================
 
@@ -126,6 +127,30 @@ The system scans all pairs every 15 minutes. Qualifying setups will be sent when
 
 EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.
 Nixie Trades | Smart Money, Automated Logic"""
+
+
+AUTO_MGMT_DISCLAIMER = (
+    "AUTONOMOUS POSITION MANAGEMENT - RISK DISCLOSURE\n\n"
+    "You are about to enable autonomous position management.\n\n"
+    "What this means:\n"
+    "When enabled, Nixie Trades will automatically:\n"
+    "  - Close 50 percent of your position when TP1 is reached\n"
+    "  - Move your stop loss to breakeven after TP1\n"
+    "  - Close the remaining 50 percent when TP2 is reached\n\n"
+    "No confirmation message will be sent to you before each action.\n"
+    "The bot will act immediately and notify you after the fact.\n\n"
+    "What this does NOT change:\n"
+    "  - You retain full control of your MetaTrader 5 account at all times\n"
+    "  - You can disconnect the bot or close trades manually at any time\n"
+    "  - You can disable this setting again at any time via /settings\n\n"
+    "ACKNOWLEDGMENT\n"
+    "By tapping 'Enable Autonomous Management', you confirm:\n"
+    "  - You authorise Nixie Trades to modify and partially close positions "
+    "on your account without asking for confirmation each time\n"
+    "  - You understand this is an automated educational tool, not financial advice\n"
+    "  - You accept full responsibility for all outcomes\n\n"
+    f"{config.FOOTER}"
+)
 
 
 class NixTradesBot:
@@ -443,6 +468,32 @@ class NixTradesBot:
         app.add_handler(CallbackQueryHandler(
             self.callback_breakeven_decision,
             pattern=r'^breakeven_(yes|no)_\d+$'
+        ))
+        # ---- Auto position management disclaimer conversation ----
+        auto_mgmt_conv = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(
+                    self.callback_auto_mgmt_prompt,
+                    pattern='^settings_auto_mgmt_prompt$'),
+            ],
+            states={
+                AUTO_MGMT_DISCLAIMER_SHOWN: [
+                    CallbackQueryHandler(
+                        self.callback_auto_mgmt_enable,
+                        pattern='^auto_mgmt_enable$'),
+                    CallbackQueryHandler(
+                        self.callback_auto_mgmt_cancel,
+                        pattern='^auto_mgmt_cancel$'),
+                ],
+            },
+            fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
+            per_user=True,
+            per_chat=True,
+            per_message=False,
+        )
+        app.add_handler(auto_mgmt_conv)
+        app.add_handler(CallbackQueryHandler(
+            self.callback_auto_mgmt_disable, pattern='^auto_mgmt_disable$'
         ))
         app.add_handler(CommandHandler('test_briefing', self.cmd_test_briefing))
         app.add_handler(CommandHandler('test_news',     self.cmd_test_news))
@@ -763,7 +814,6 @@ class NixTradesBot:
             utils.validate_user_message(
                 "Account number received.\n\n"
                 "Now please type your MT5 PASSWORD:\n\n"
-                "Please delete this message immediately after sending for your security.\n\n"
                 f"{config.FOOTER}"
             ),
         )
@@ -1122,6 +1172,18 @@ class NixTradesBot:
                 user.get('timezone') or user.get('user_timezone') or 'UTC'
             ) if user else 'UTC'
 
+            auto_mgmt_enabled = bool(user.get('auto_position_management', False)) if user else False
+            auto_mgmt_label   = (
+                "Auto-Manage Positions: ON  (tap to disable)"
+                if auto_mgmt_enabled
+                else "Auto-Manage Positions: OFF  (tap to enable)"
+            )
+            auto_mgmt_callback = (
+                'auto_mgmt_disable'
+                if auto_mgmt_enabled
+                else 'settings_auto_mgmt_prompt'
+            )
+
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
@@ -1151,18 +1213,28 @@ class NixTradesBot:
                         callback_data='settings_tz_prompt'),
                 ],
                 [
+                    InlineKeyboardButton(
+                        auto_mgmt_label,
+                        callback_data=auto_mgmt_callback),
+                ],
+                [
                     InlineKeyboardButton("Done", callback_data='settings_done'),
                 ],
             ])
 
+            auto_mgmt_status = "ENABLED" if auto_mgmt_enabled else "DISABLED"
             await self._reply(
                 update,
                 utils.validate_user_message(
                     f"SETTINGS\n\n"
-                    f"Current risk per trade: {current}%\n"
-                    f"Current timezone:       {tz}\n\n"
+                    f"Current risk per trade:    {current}%\n"
+                    f"Current timezone:          {tz}\n"
+                    f"Auto position management:  {auto_mgmt_status}\n\n"
                     f"Tap a risk percentage to change it.\n"
-                    f"Tap 'Set Timezone' to change your timezone.\n\n"
+                    f"Tap 'Set Timezone' to change your timezone.\n"
+                    f"Tap 'Auto-Manage Positions' to control whether the bot\n"
+                    f"manages TP1, breakeven, and TP2 automatically without\n"
+                    f"asking for your confirmation each time.\n\n"
                     f"Recommended risk levels:\n"
                     f"  Beginner:     0.5%\n"
                     f"  Intermediate: 1% - 2%\n"
@@ -1374,6 +1446,96 @@ class NixTradesBot:
             utils.validate_user_message(f"Settings saved.\n\n{config.FOOTER}")
         )
         return ConversationHandler.END
+    
+    async def callback_auto_mgmt_prompt(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """
+        User tapped 'Auto-Manage Positions: OFF' in settings.
+        Show the autonomous management disclaimer with Accept/Cancel buttons.
+        User must explicitly accept before the feature is enabled.
+        """
+        query = update.callback_query
+        await query.answer()
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "Enable Autonomous Management",
+                callback_data='auto_mgmt_enable'),
+            InlineKeyboardButton(
+                "Cancel",
+                callback_data='auto_mgmt_cancel'),
+        ]])
+        await query.edit_message_text(
+            utils.validate_user_message(AUTO_MGMT_DISCLAIMER),
+            reply_markup=keyboard,
+        )
+        return AUTO_MGMT_DISCLAIMER_SHOWN
+
+    async def callback_auto_mgmt_enable(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """User accepted the autonomous management disclaimer. Enable the feature."""
+        query = update.callback_query
+        await query.answer()
+        telegram_id = query.from_user.id
+        try:
+            db.update_auto_position_management(telegram_id, True)
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "Autonomous position management is now ENABLED.\n\n"
+                    "The bot will automatically close 50 percent of your position "
+                    "at TP1, move the stop loss to breakeven, and close the remaining "
+                    "50 percent at TP2 without asking for confirmation.\n\n"
+                    "You will still receive a notification after each action is taken.\n\n"
+                    "To disable this, use /settings at any time.\n\n"
+                    f"{config.FOOTER}"
+                )
+            )
+        except Exception as e:
+            self.logger.error(
+                "Error enabling auto position management for user %d: %s",
+                telegram_id, e)
+            await query.edit_message_text(config.ERROR_MESSAGES['general_error'])
+        return ConversationHandler.END
+
+    async def callback_auto_mgmt_cancel(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """User cancelled the autonomous management disclaimer. No change."""
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            utils.validate_user_message(
+                "No changes made. Autonomous position management remains disabled.\n\n"
+                "The bot will continue to ask for your confirmation at TP1.\n\n"
+                f"{config.FOOTER}"
+            )
+        )
+        return ConversationHandler.END
+
+    async def callback_auto_mgmt_disable(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """User tapped 'Auto-Manage Positions: ON' to disable the feature."""
+        query = update.callback_query
+        await query.answer()
+        telegram_id = query.from_user.id
+        try:
+            db.update_auto_position_management(telegram_id, False)
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "Autonomous position management is now DISABLED.\n\n"
+                    "The bot will ask for your confirmation before taking "
+                    "partial profit at TP1.\n\n"
+                    "Use /settings to enable it again at any time.\n\n"
+                    f"{config.FOOTER}"
+                )
+            )
+        except Exception as e:
+            self.logger.error(
+                "Error disabling auto position management for user %d: %s",
+                telegram_id, e)
+            await query.edit_message_text(config.ERROR_MESSAGES['general_error'])
 
     async def cmd_unsubscribe(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

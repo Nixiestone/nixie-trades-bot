@@ -282,8 +282,8 @@ class MLEnsemble:
         feats:  List[np.ndarray] = []
         labels: List[float]      = []
         window_size  = 100
-        forward_bars = 80
-        step         = 40     # Reduced from 60 to generate more samples
+        forward_bars = 32     # 8 hours on M15 (4 bars/hour) - matches live H1 expiry
+        step         = 40
 
         # Diagnostic counters - logged at end so you know where samples are lost
         _cnt_total       = 0
@@ -425,26 +425,47 @@ class MLEnsemble:
                     self.logger.debug("Feature extraction error at window %d: %s", i, _e)
                     continue
 
-                # --- Phase 5: Label WIN/LOSS from future bars ---
-                future = m15_df.iloc[i: i + forward_bars]
-                if len(future) < forward_bars:
+                # --- Phase 5: Label WIN/LOSS from future bars (chronological) ---
+                # forward_bars matches live H1 setup expiry of 8 hours on M15
+                # (8 hours x 4 bars per hour = 32 bars).
+                # Using 80 bars (20 hours) incorrectly includes price action that
+                # occurs after a real order would have expired, inflating WIN rate.
+                _expiry_bars = 32
+                future = m15_df.iloc[i: i + _expiry_bars]
+                if len(future) < 10:
                     continue
 
-                target_reward = risk * 2.5   # 1:2.5 RR target
+                # Use config.MIN_RR_TP2 (3.0) to match the live system exactly.
+                # Training with 2.5 while live uses 3.0 means the model is
+                # calibrated for different price levels than it actually operates on.
+                target_reward = risk * config.MIN_RR_TP2
                 is_buy = direction == 'BULLISH'
 
-                if is_buy:
-                    won     = future['high'].max() >= (entry + target_reward)
-                    knocked = future['low'].min()  <= sl
-                else:
-                    won     = future['low'].min()  <= (entry - target_reward)
-                    knocked = future['high'].max() >= sl
+                # Chronological bar-by-bar scan. The FIRST level reached determines
+                # the label. Checking max/min over the whole window simultaneously
+                # corrupts labels when price eventually touches both levels in any order.
+                label          = None
+                _tp_price      = (entry + target_reward) if is_buy else (entry - target_reward)
 
-                if won and not knocked:
-                    label = 1.0
-                elif knocked:
-                    label = 0.0
-                else:
+                for _bar in future.itertuples():
+                    if is_buy:
+                        if float(_bar.high) >= _tp_price:
+                            label = 1.0   # TP reached first
+                            break
+                        if float(_bar.low) <= sl:
+                            label = 0.0   # SL reached first
+                            break
+                    else:
+                        if float(_bar.low) <= _tp_price:
+                            label = 1.0   # TP reached first
+                            break
+                        if float(_bar.high) >= sl:
+                            label = 0.0   # SL reached first
+                            break
+
+                if label is None:
+                    # Neither level reached within the expiry window.
+                    # This is an inconclusive outcome — discard rather than guess.
                     _cnt_no_label += 1
                     continue
 
