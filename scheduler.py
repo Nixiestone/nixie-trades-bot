@@ -1109,7 +1109,7 @@ class NixTradesScheduler:
                     take_profit=setup_data['take_profit_1'],
                     take_profit_2=setup_data['take_profit_2'],
                     order_type=order_type,
-                    comment='Nix Trades Auto',
+                    comment='NIXIE TRADES',
                     sl_pips=float(setup_data.get('sl_pips', 20.0)),
                     risk_percent=float(user.get('risk_percent', config.DEFAULT_RISK_PERCENT)),
                     expiry_minutes=expiry_minutes,

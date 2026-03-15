@@ -240,7 +240,6 @@ WORD_REPLACEMENTS = {
     'ai predictions':     'model agreement scores',
     'guaranteed win':     'historical pattern',
     'guaranteed wins':    'historical patterns',
-    'guarantee':          'historical performance',
     'investment advice':  'technical analysis',
     'we recommend you buy':  'the setup indicates a long opportunity',
     'we recommend you sell': 'the setup indicates a short opportunity',
