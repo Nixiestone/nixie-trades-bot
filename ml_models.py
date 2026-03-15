@@ -338,7 +338,8 @@ class MLEnsemble:
 
                 try:
                     bos_events = self.smc.detect_break_of_structure(h1_ctx, smc_dir)
-                    mss_event  = self.smc.detect_market_structure_shift(h1_ctx, smc_dir)
+                    mss_event  = self.smc.detect_market_structure_shift(
+                        h1_ctx, smc_dir, symbol=symbol)
 
                     if len(bos_events) >= 2:
                         setup_type = 'BOS'

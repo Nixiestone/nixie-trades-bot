@@ -393,59 +393,107 @@ class SMCStrategy:
     def detect_market_structure_shift(
         self,
         data: pd.DataFrame,
-        htf_trend: str
+        htf_trend: str,
+        symbol: str = 'EURUSD',
     ) -> Optional[Dict]:
         """
         Detect Market Structure Shift (potential reversal).
-        
+
+        A Bearish MSS fires when the HTF trend is BULLISH but price breaks
+        below the MOST RECENT internal swing low — the first sign institutions
+        are distributing and reversing direction.
+
+        A Bullish MSS fires when the HTF trend is BEARISH but price breaks
+        above the MOST RECENT internal swing high — the first sign of
+        accumulation and a potential upside reversal.
+
+        Only fires when HTF trend is clearly BULLISH or BEARISH. RANGING
+        markets are excluded because there is no established structure to shift.
+
         Args:
-            data: OHLCV DataFrame
-            htf_trend: Current HTF trend
-            
+            data:      H1 OHLCV DataFrame
+            htf_trend: D1 trend string from determine_htf_trend()
+            symbol:    Trading symbol for correct pip size calculation
+
         Returns:
-            dict: MSS information if detected, None otherwise
+            dict: MSS event dict if detected, None otherwise
         """
         try:
-            # Look for displacement breaking internal structure
+            # Only look for MSS against a clear directional trend.
+            # A RANGING market has no established structure to shift.
+            if htf_trend not in ('BULLISH', 'BEARISH'):
+                return None
+
             recent_swings = self._identify_swings(data.tail(50), lookback=3)
-            
+
             if len(recent_swings) < 3:
                 return None
-            
-            current_price = data.iloc[-1]['close']
-            
+
+            current_price = float(data.iloc[-1]['close'])
+            pip_size      = utils.get_pip_value(symbol)
+            if pip_size <= 0:
+                pip_size = 0.0001
+
             if htf_trend == 'BULLISH':
-                low_prices = [s['price'] for s in recent_swings if s['direction'] == 'LOW']
-                if len(low_prices) < 2:
+                # Bearish MSS: price breaks below the MOST RECENT internal swing low.
+                # Using the most recent low (not the minimum) matches the SMC rule:
+                # the first internal low that breaks signals a structure shift.
+                low_swings = [
+                    s for s in recent_swings if s['direction'] == 'LOW'
+                ]
+                if len(low_swings) < 2:
                     return None
-                internal_low = min(low_prices[-5:])
-                if current_price < internal_low * 0.998:
+                # Most recent internal low is the last one in time-sorted list
+                internal_low = float(low_swings[-1]['price'])
+                if current_price < internal_low * 0.9995:
+                    displacement_pips = abs(current_price - internal_low) / pip_size
+                    # Minimum 5-pip displacement to reject noise
+                    if displacement_pips < 5.0:
+                        return None
+                    self.logger.info(
+                        "Bearish MSS detected: price %.5f broke below "
+                        "internal low %.5f (%.1f pips displacement).",
+                        current_price, internal_low, displacement_pips,
+                    )
                     return {
-                        'type':         'MSS',
-                        'direction':    'BEARISH',
-                        'level':        internal_low,
-                        'displacement': abs(current_price - internal_low) / 0.0001,
-                        'timestamp':    data.index[-1],
+                        'type':              'MSS',
+                        'direction':         'BEARISH',
+                        'level':             internal_low,
+                        'displacement':      displacement_pips,
+                        'displacement_pips': displacement_pips,
+                        'timestamp':         data.index[-1],
                     }
 
-            else:
-                high_prices = [s['price'] for s in recent_swings if s['direction'] == 'HIGH']
-                if len(high_prices) < 2:
+            else:  # BEARISH
+                # Bullish MSS: price breaks above the MOST RECENT internal swing high.
+                high_swings = [
+                    s for s in recent_swings if s['direction'] == 'HIGH'
+                ]
+                if len(high_swings) < 2:
                     return None
-                internal_high = max(high_prices[-5:])
-                if current_price > internal_high * 1.002:
+                internal_high = float(high_swings[-1]['price'])
+                if current_price > internal_high * 1.0005:
+                    displacement_pips = abs(current_price - internal_high) / pip_size
+                    if displacement_pips < 5.0:
+                        return None
+                    self.logger.info(
+                        "Bullish MSS detected: price %.5f broke above "
+                        "internal high %.5f (%.1f pips displacement).",
+                        current_price, internal_high, displacement_pips,
+                    )
                     return {
-                        'type':         'MSS',
-                        'direction':    'BULLISH',
-                        'level':        internal_high,
-                        'displacement': abs(current_price - internal_high) / 0.0001,
-                        'timestamp':    data.index[-1],
+                        'type':              'MSS',
+                        'direction':         'BULLISH',
+                        'level':             internal_high,
+                        'displacement':      displacement_pips,
+                        'displacement_pips': displacement_pips,
+                        'timestamp':         data.index[-1],
                     }
-            
+
             return None
-        
+
         except Exception as e:
-            self.logger.error(f"Error detecting MSS: {e}")
+            self.logger.error("Error detecting MSS: %s", e)
             return None
     
     def detect_break_of_structure(

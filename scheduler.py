@@ -463,26 +463,60 @@ class NixTradesScheduler:
                 
             # Phase 2: Intermediate structure (H1)
             bos_events = self.smc.detect_break_of_structure(h1_df, htf_trend['trend'])
-            mss_event  = self.smc.detect_market_structure_shift(h1_df, htf_trend['trend'])
+            mss_event  = self.smc.detect_market_structure_shift(
+                h1_df, htf_trend['trend'], symbol=symbol)
 
             setup_type      = None
             poi             = None
             all_candidates: list = []
 
             if len(bos_events) >= 2:
+                # BOS continuation: Priority 1 = Breaker Block, Fallback = Order Block.
+                # Per PRD 3.2: in a strong double-BOS trend, BBs are more reliable.
+                # OBs are only used when no valid BBs exist.
                 setup_type = 'BOS'
                 breakers   = self.smc.detect_breaker_blocks(
                     h1_df, htf_trend['trend'],
                     htf_trend.get('swing_high', 0),
                     htf_trend.get('swing_low', 0))
-                obs = self.smc.detect_order_blocks(
-                    h1_df, htf_trend['trend'], symbol=symbol)
-                all_candidates = breakers + obs
+                if breakers:
+                    all_candidates = breakers
+                    self.logger.debug(
+                        "%s BOS: %d Breaker Block(s) found. "
+                        "Using BB as primary candidates.",
+                        symbol, len(breakers))
+                else:
+                    obs = self.smc.detect_order_blocks(
+                        h1_df, htf_trend['trend'], symbol=symbol)
+                    all_candidates = obs
+                    self.logger.info(
+                        "%s BOS: No Breaker Blocks found. "
+                        "Falling back to %d Order Block(s).",
+                        symbol, len(obs))
+
             elif mss_event:
+                # MSS reversal: Priority 1 = Order Block, Fallback = Breaker Block.
+                # Per PRD 3.1: algorithm prioritizes the extreme OB candle responsible
+                # for the MSS displacement. BB is only used if no valid OB exists.
                 setup_type = 'MSS'
                 obs = self.smc.detect_order_blocks(
                     h1_df, mss_event['direction'], symbol=symbol)
-                all_candidates = obs
+                if obs:
+                    all_candidates = obs
+                    self.logger.debug(
+                        "%s MSS: %d Order Block(s) found. "
+                        "Using OB as primary candidates.",
+                        symbol, len(obs))
+                else:
+                    breakers = self.smc.detect_breaker_blocks(
+                        h1_df, mss_event['direction'],
+                        htf_trend.get('swing_high', 0),
+                        htf_trend.get('swing_low', 0))
+                    all_candidates = breakers
+                    self.logger.info(
+                        "%s MSS: No Order Blocks found. "
+                        "Falling back to %d Breaker Block(s).",
+                        symbol, len(breakers))
 
             if not all_candidates or setup_type is None:
                 self.logger.info(
