@@ -454,7 +454,7 @@ def format_setup_message(
             expiry_hours, 's' if expiry_hours != 1 else ''),
         "",
         "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.",
-        "Past performance does not guarantee future results.",
+        "Past performance is not indicative of future results.",
         "",
         config.FOOTER,
     ]
@@ -572,14 +572,151 @@ def calculate_sharpe_ratio(
 
 # ==================== LOT SIZE ====================
 
+def _usd_to_account(account_currency: str, rates: dict) -> float:
+    """
+    Return how many units of account_currency equal 1 USD.
+    Falls back to 1.0 if rates are unavailable.
+    """
+    if account_currency == 'USD':
+        return 1.0
+    direct = rates.get('USD' + account_currency)
+    if direct and direct > 0:
+        return float(direct)
+    inverse = rates.get(account_currency + 'USD')
+    if inverse and inverse > 0:
+        return 1.0 / float(inverse)
+    return 1.0
+
+
 def calculate_lot_size(
-    account_balance: float,
-    risk_percent:    float,
-    sl_pips:         float,
-    symbol:          str,
-    account_currency: str = 'USD',
-    exchange_rates:  Optional[dict] = None,
+    account_balance:  float,
+    risk_percent:     float,
+    sl_pips:          float,
+    symbol:           str,
+    account_currency: str            = 'USD',
+    exchange_rates:   Optional[dict] = None,
 ) -> float:
+    """
+    Calculate lot size using the correct per-instrument formula.
+
+    Formula:
+        risk_amount        = balance * risk_percent / 100
+        pip_val_per_lot    = pip_size * contract_size * quote_to_account_rate
+        lots               = risk_amount / (sl_pips * pip_val_per_lot)
+
+    Instrument classes handled:
+        XAUUSD / XAGUSD  — commodity contracts (100 oz / 5 000 oz)
+        JPY crosses       — quote currency is JPY, converted to account currency
+        Standard FX pairs — quote currency converted to account currency
+        Unknown pairs     — safe fallback of $10 per pip per lot
+
+    Args:
+        account_balance:  Account balance in account_currency
+        risk_percent:     Risk per trade as a percentage (e.g. 1.0 = 1 percent)
+        sl_pips:          Stop-loss distance in pips
+        symbol:           Standard symbol name (e.g. EURUSD, GBPJPY, XAUUSD)
+        account_currency: Three-letter currency code of the account (e.g. USD, EUR)
+        exchange_rates:   Dict of mid-prices from /exchange_rates endpoint
+
+    Returns:
+        float: Lot size rounded to 2 decimal places, clamped between MIN and MAX
+    """
+    try:
+        if account_balance <= 0 or risk_percent <= 0 or sl_pips <= 0:
+            return config.MIN_LOT_SIZE
+
+        rates       = exchange_rates or {}
+        risk_amount = account_balance * risk_percent / 100.0
+        clean       = _clean_symbol(symbol).upper()
+
+        # ---- Commodity contracts ----
+        if clean.startswith('XAU'):
+            # Gold: 1 standard lot = 100 oz; pip = $0.10; pip value = $10 per lot
+            pip_val_usd       = 10.0
+            pip_value_per_lot = pip_val_usd * _usd_to_account(account_currency, rates)
+
+        elif clean.startswith('XAG'):
+            # Silver: 1 standard lot = 5 000 oz; pip = $0.001; pip value = $50 per lot
+            pip_val_usd       = 50.0
+            pip_value_per_lot = pip_val_usd * _usd_to_account(account_currency, rates)
+
+        else:
+            # ---- Standard forex pairs ----
+            pip_size       = get_pip_value(clean)
+            if pip_size <= 0:
+                pip_size = 0.0001
+            contract_size  = 100_000          # 1 standard lot = 100,000 base units
+            quote_currency = clean[3:6] if len(clean) >= 6 else 'USD'
+
+            # Pip value in quote currency per lot
+            pip_val_quote = pip_size * contract_size   # e.g. 10 USD for EURUSD
+
+            if quote_currency == account_currency:
+                # Quote and account are the same currency — no conversion needed
+                # e.g. EURUSD with USD account, EURGBP with GBP account
+                pip_value_per_lot = pip_val_quote
+
+            elif quote_currency == 'USD':
+                # Quote is USD (e.g. EURUSD, GBPUSD) but account is non-USD
+                # Convert $10 to account currency
+                pip_value_per_lot = pip_val_quote * _usd_to_account(
+                    account_currency, rates)
+
+            elif account_currency == 'USD':
+                # Account is USD, quote is a non-USD currency
+                # e.g. EURGBP, EURJPY, GBPJPY, USDCHF
+                # Need: quote_currency → USD rate
+                quote_usd = rates.get(quote_currency + 'USD')
+                if quote_usd and quote_usd > 0:
+                    pip_value_per_lot = pip_val_quote * float(quote_usd)
+                else:
+                    # Inverse: USD/quote rate available
+                    usd_quote = rates.get('USD' + quote_currency)
+                    if usd_quote and usd_quote > 0:
+                        pip_value_per_lot = pip_val_quote / float(usd_quote)
+                    else:
+                        # Fallback: known common values
+                        _fallbacks = {
+                            'JPY': pip_val_quote / 150.0,
+                            'CHF': pip_val_quote * 1.10,
+                            'CAD': pip_val_quote * 0.73,
+                            'AUD': pip_val_quote * 0.65,
+                            'NZD': pip_val_quote * 0.60,
+                            'GBP': pip_val_quote * 1.27,
+                            'EUR': pip_val_quote * 1.08,
+                        }
+                        pip_value_per_lot = _fallbacks.get(quote_currency, 10.0)
+
+            else:
+                # Both quote and account are non-USD (rare cross-currency account)
+                # Route: quote → USD → account
+                quote_usd = rates.get(quote_currency + 'USD')
+                if not quote_usd:
+                    usd_quote = rates.get('USD' + quote_currency)
+                    quote_usd = (1.0 / float(usd_quote)) if usd_quote else 1.0
+                else:
+                    quote_usd = float(quote_usd)
+                usd_to_acc        = _usd_to_account(account_currency, rates)
+                pip_value_per_lot = pip_val_quote * quote_usd * usd_to_acc
+
+        if pip_value_per_lot <= 0:
+            pip_value_per_lot = 10.0   # Final safety fallback
+
+        lots = risk_amount / (sl_pips * pip_value_per_lot)
+        lots = round(lots, 2)
+        lots = max(config.MIN_LOT_SIZE, min(lots, config.MAX_LOT_SIZE))
+
+        logger.debug(
+            "Lot size: balance=%.2f risk=%.1f%% sl=%.1f pips "
+            "pip_val=%.4f/lot → %.2f lots (%s account: %s)",
+            account_balance, risk_percent, sl_pips,
+            pip_value_per_lot, lots, account_currency, clean,
+        )
+        return lots
+
+    except Exception as e:
+        logger.error("Error calculating lot size for %s: %s", symbol, e)
+        return config.MIN_LOT_SIZE
     """
     Calculate lot size from account balance, risk percentage, and stop-loss pips.
 

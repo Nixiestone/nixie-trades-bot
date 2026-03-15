@@ -336,11 +336,12 @@ class MT5Connector:
         success, result = self._post('/execute', payload)
 
         if success and isinstance(result, dict):
-            ticket = result.get('order') or result.get('deal')
-            return True, ticket, "Order placed successfully."
+            ticket     = result.get('order') or result.get('deal')
+            actual_lot = float(result.get('lot_size') or lot_size or 0.0)
+            return True, ticket, actual_lot, "Order placed successfully."
 
         error_msg = result if isinstance(result, str) else "Order placement failed."
-        return False, None, error_msg
+        return False, None, 0.0, error_msg
 
     # ==================== POSITION MANAGEMENT ====================
 

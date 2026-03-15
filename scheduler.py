@@ -1115,13 +1115,14 @@ class NixTradesScheduler:
                     expiry_minutes=expiry_minutes,
                 )
 
-            success, ticket, message = await loop.run_in_executor(None, _place_blocking)
+            success, ticket, actual_lot, message = await loop.run_in_executor(
+                None, _place_blocking)
 
             if success and ticket:
                 self.logger.info(
                     "Auto-executed trade for user %d: %s %s %.2f lots "
                     "at %.5f (ticket %d).",
-                    tid, direction, symbol, lot_size, entry, ticket)
+                    tid, direction, symbol, actual_lot, entry, ticket)
 
                 # Register with position monitor for TP1/TP2 automation
                 if self.monitor is not None:
@@ -1129,7 +1130,7 @@ class NixTradesScheduler:
                         ticket=ticket,
                         symbol=symbol,
                         direction=direction,
-                        volume=lot_size,
+                        volume=actual_lot,
                         entry_price=entry,
                         stop_loss=setup_data['stop_loss'],
                         take_profit_1=setup_data['take_profit_1'],
@@ -1145,7 +1146,7 @@ class NixTradesScheduler:
                     signal_id=setup_data.get('signal_id'),
                     symbol=symbol,
                     direction=direction,
-                    lot_size=lot_size,
+                    lot_size=actual_lot,
                     entry_price=entry,
                     fill_price=entry,
                     stop_loss=setup_data['stop_loss'],

@@ -30,6 +30,7 @@ class MonitoredPosition:
     magic_number:  int          = 234567
     opened_at:     datetime     = field(default_factory=datetime.now)
     last_check:    datetime     = field(default_factory=datetime.now)
+    is_filled:               bool  = False
     tp1_closed:              bool  = False
     be_activated:            bool  = False
     profit:                  float = 0.0
@@ -250,13 +251,25 @@ class PositionMonitor:
                     continue
 
                 if ticket not in mt5_map:
-                    # No longer in MT5 - stop loss hit or manually closed
+                    if not position.is_filled:
+                        # Ticket has never appeared as an open position.
+                        # This is a pending LIMIT or STOP order that has not
+                        # been filled yet. Do NOT declare it closed.
+                        self.logger.debug(
+                            "Ticket %d absent from open positions but "
+                            "is_filled=False — still a pending order. "
+                            "Skipping closure check.", ticket)
+                        continue
+                    # is_filled=True: was previously confirmed as open.
+                    # Now gone — closed by SL, TP, or manual action.
                     self._handle_position_closed(position)
                     tickets_to_remove.append(ticket)
                     continue
 
-                live                   = mt5_map[ticket]
-                position.current_price = float(live.get('price_current', position.current_price))
+                live               = mt5_map[ticket]
+                position.is_filled = True   # confirm ticket is an open position
+                position.current_price = float(
+                    live.get('price_current', position.current_price))
                 position.profit        = float(live.get('profit', 0.0))
                 position.last_check    = datetime.now()
                 
