@@ -697,10 +697,26 @@ class SMCStrategy:
                 wait_confirmation = True
                 expected_win_rate = 73
 
+            # Limit order entry must be at the BOUNDARY where price FIRST ENTERS
+            # the zone, not deep inside it.
+            #
+            # BUY setup:  price pulls BACK DOWN into a demand zone.
+            #             It enters through the TOP (poi_high).
+            #             Entry = poi_high - small zone offset.
+            #             Result: order fills as soon as price touches the zone.
+            #
+            # SELL setup: price rallies UP into a supply zone.
+            #             It enters through the BOTTOM (poi_low).
+            #             Entry = poi_low + small zone offset.
+            #             Result: order fills as soon as price touches the zone.
+            #
+            # Old code placed entry at the OPPOSITE end (deep inside zone).
+            # That required price to travel through the entire zone before filling,
+            # which almost never happens within the 8-hour expiry window.
             if direction in ('BULLISH', 'BUY'):
-                entry = poi_low + (poi_range * zone)
-            else:
                 entry = poi_high - (poi_range * zone)
+            else:
+                entry = poi_low + (poi_range * zone)
 
             return {
                 'entry_price': round(entry, 5),
@@ -900,6 +916,38 @@ class SMCStrategy:
                     "No valid external target for sniper continuation." % (
                         tp2_rr, config.MIN_RR_TP2)
                 )
+
+            # Cap TPs at maximum RR so price has a realistic chance of reaching them
+            # within the setup expiry window. The HTF D1 swing target is often
+            # 400-700 pips away, producing RR of 1:50+ on tight H1 SLs. These
+            # never fill and count as losses when the stop is hit on the reversal.
+            _max_tp1_rr = getattr(config, 'MAX_RR_TP1', 5.0)
+            _max_tp2_rr = getattr(config, 'MAX_RR_TP2', 10.0)
+            _is_buy_dir = direction_u in ('BULLISH', 'BUY')
+
+            _cap_tp1 = (entry + risk_price * _max_tp1_rr
+                        if _is_buy_dir else entry - risk_price * _max_tp1_rr)
+            _cap_tp2 = (entry + risk_price * _max_tp2_rr
+                        if _is_buy_dir else entry - risk_price * _max_tp2_rr)
+
+            if _is_buy_dir:
+                tp1 = min(tp1, _cap_tp1)
+                tp2 = min(tp2, _cap_tp2)
+            else:
+                tp1 = max(tp1, _cap_tp1)
+                tp2 = max(tp2, _cap_tp2)
+
+            # Ensure TP2 remains beyond TP1 after capping
+            if _is_buy_dir and tp2 <= tp1:
+                tp2 = tp1 + risk_price
+            elif not _is_buy_dir and tp2 >= tp1:
+                tp2 = tp1 - risk_price
+
+            # Recalculate pips and RR after capping
+            tp1_pips = utils.calculate_pips(symbol, entry, tp1)
+            tp2_pips = utils.calculate_pips(symbol, entry, tp2)
+            tp1_rr   = round(tp1_pips / risk_pips, 2) if risk_pips > 0 else 0.0
+            tp2_rr   = round(tp2_pips / risk_pips, 2) if risk_pips > 0 else 0.0
 
             return {
                 'tp1':      round(tp1, 5),

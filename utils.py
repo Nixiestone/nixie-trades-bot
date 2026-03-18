@@ -447,11 +447,9 @@ def format_setup_message(
 
     lines += [
         "",
-        "Management:",
-        "- TP1 hit: 50% closed, stop loss moved to breakeven",
-        "- TP2 hit: Remaining 50% closed",
-        "- Orders expire in %d hour%s if not filled" % (
+        "- Order expires in %d hour%s if not filled" % (
             expiry_hours, 's' if expiry_hours != 1 else ''),
+        "- If filled, the position is monitored and managed automatically",
         "",
         "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.",
         "Past performance is not indicative of future results.",

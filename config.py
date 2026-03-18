@@ -65,6 +65,12 @@ MIN_RR_RATIO   = 2.5   # Minimum acceptable risk-reward ratio for any setup
 MIN_RR_TP2     = 3.0   # Minimum R:R for TP2. If structure cannot offer this, TP2 collapses to TP1
 MIN_SETUP_QUALITY_SCORE = 55   # Setups scoring below this are rejected by _check_filters
 
+# Maximum RR caps — prevent unreachable TP targets derived from D1 swing levels.
+# H1 setups must target levels achievable within the 8-hour expiry window.
+# Without these caps, a 12-pip SL produces 660-pip TPs (RR 1:53) that never fill.
+MAX_RR_TP1 = 5.0    # TP1 never more than 5x risk from entry
+MAX_RR_TP2 = 10.0   # TP2 never more than 10x risk from entry
+
 
 # Fibonacci extension level for TP2 (1.618 = golden ratio)
 FIB_EXTENSION_LEVEL = 1.618
@@ -124,7 +130,7 @@ ML_TIER_STANDARD       = 60   # 60-69% = Standard tier, sent to subscribers
 ML_TIER_DISCRETIONARY  = 55   # 55-59% = Discretionary (optional, lower confidence)
 
 # Auto-execution threshold: only execute trades when ML agrees this strongly
-ML_AUTO_EXECUTE_THRESHOLD = 70
+ML_AUTO_EXECUTE_THRESHOLD = 60
 
 # ==================== RISK MANAGEMENT ====================
 
