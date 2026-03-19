@@ -686,6 +686,86 @@ def health():
     })
 
 
+@app.route('/lot_size', methods=['POST'])
+@require_api_key
+def calculate_lot_size_endpoint():
+    """
+    Calculate the correct lot size for a given account and trade setup.
+
+    This endpoint uses MT5's native trade_tick_value which is returned in
+    the account's base currency (USD, EUR, GBP, NGN, etc.) regardless of
+    what the traded instrument is. This makes it accurate for all account
+    currencies without needing external exchange rate lookups.
+
+    Request body:
+        {
+            "login":        12345678,
+            "password":     "...",
+            "server":       "Broker-Live",
+            "symbol":       "XAUUSD",
+            "sl_pips":      135.6,
+            "risk_percent": 1.0
+        }
+
+    Response:
+        { "success": true, "lot_size": 0.07, "currency": "USD", "balance": 10000.0 }
+    """
+    size_error = _check_request_size()
+    if size_error:
+        return size_error
+
+    data  = request.get_json(force=True, silent=True) or {}
+    error = _require_fields(data, 'login', 'password', 'server', 'symbol', 'sl_pips', 'risk_percent')
+    if error:
+        return jsonify({'success': False, 'error': error}), 400
+
+    valid, err_msg, login = _validate_login(data['login'])
+    if not valid:
+        return jsonify({'success': False, 'error': err_msg}), 400
+
+    sl_pips      = float(data['sl_pips'])
+    risk_percent = float(data['risk_percent'])
+
+    if sl_pips <= 0 or risk_percent <= 0:
+        return jsonify({'success': False, 'error': 'sl_pips and risk_percent must be positive.'}), 400
+
+    acquired = _mt5_lock.acquire(timeout=_MT5_LOCK_TIMEOUT)
+    if not acquired:
+        return jsonify({'success': False, 'error': 'Service busy. Please retry in 30 seconds.'}), 503
+    try:
+        ok, err = _initialise_headless(login, data['password'], data['server'])
+        if not ok:
+            return jsonify({'success': False, 'error': err})
+
+        account = _get_account_info()
+        if account is None:
+            return jsonify({'success': False, 'error': 'Failed to retrieve account information.'})
+
+        raw_symbol    = str(data['symbol']).upper()
+        broker_symbol = _normalise_symbol(raw_symbol)
+        if broker_symbol is None:
+            broker_symbol = raw_symbol
+
+        lot = _calculate_lot_size(
+            symbol=broker_symbol,
+            risk_percent=risk_percent,
+            sl_pips=sl_pips,
+            account_balance=account['balance'],
+            account_currency=account['currency'],
+        )
+
+        return jsonify({
+            'success':   True,
+            'lot_size':  lot,
+            'currency':  account['currency'],
+            'balance':   account['balance'],
+        })
+
+    finally:
+        _shutdown_safe()
+        _mt5_lock.release()
+
+
 @app.route('/tick', methods=['GET'])
 @require_api_key
 def get_tick():

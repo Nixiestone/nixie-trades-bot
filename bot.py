@@ -337,6 +337,8 @@ class NixTradesBot:
         )
         self.scheduler_obj.start()
 
+        # Pre-connect all registered MT5 accounts so first trades are instant
+        await self.mt5.connect_all_users()
         self.logger.info("Background services started: position monitor and market scanner.")
 
     async def _post_stop(self, application: Application):
@@ -902,7 +904,7 @@ class NixTradesBot:
         )
 
         try:
-            success, result = self.mt5.verify_credentials(telegram_id, login, password, raw)
+            success, result = await self.mt5.verify_credentials(telegram_id, login, password, raw)
 
             if success and isinstance(result, dict):
                 db.save_mt5_credentials(
@@ -913,6 +915,7 @@ class NixTradesBot:
                     broker_name=result.get('broker', ''),
                     balance=result.get('balance', 0.0),
                     currency=result.get('currency', 'USD'),
+                    metaapi_account_id=result.get('metaapi_account_id', ''),
                 )
                 masked = f"****{str(login)[-4:]}"
                 trade_status = (
@@ -1641,7 +1644,7 @@ class NixTradesBot:
 
         if action == 'yes':
             half_lots = round(position.volume / 2, 2)
-            success, msg = self.mt5.close_partial_position(
+            success, msg = await self.mt5.close_partial_position(
                 telegram_id=telegram_id,
                 ticket=ticket,
                 close_pct=0.5,
@@ -1723,7 +1726,7 @@ class NixTradesBot:
                 if position.direction == 'BUY'
                 else position.entry_price - buffer
             )
-            success, msg = self.mt5.modify_stop_loss(
+            success, msg = await self.mt5.modify_stop_loss(
                 telegram_id=telegram_id,
                 ticket=position.ticket,
                 new_sl=be_price,

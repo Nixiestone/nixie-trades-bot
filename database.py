@@ -257,7 +257,8 @@ def get_subscribed_users() -> List[dict]:
         .select(
             'telegram_id, username, first_name, timezone, risk_percent, '
             'mt5_login, mt5_server, mt5_broker_name, mt5_account_balance, '
-            'mt5_account_currency, mt5_connected, disclaimer_accepted'
+            'mt5_account_currency, mt5_connected, disclaimer_accepted, '
+            'metaapi_account_id, auto_position_management'
         )
         .eq('subscription_status', 'active')
         .execute()
@@ -324,6 +325,7 @@ def save_mt5_credentials(
     broker_name: str = '',
     balance: float = 0.0,
     currency: str = 'USD',
+    metaapi_account_id: str = '',
 ) -> bool:
     """
     Encrypt and save MT5 credentials for a user.
@@ -340,6 +342,7 @@ def save_mt5_credentials(
         'mt5_account_balance':   balance,
         'mt5_account_currency':  currency,
         'mt5_connected':         True,
+        'metaapi_account_id':    metaapi_account_id,
         'updated_at':            datetime.now(timezone.utc).isoformat(),
     }).eq('telegram_id', telegram_id).execute()
 
@@ -357,7 +360,7 @@ def get_mt5_credentials(telegram_id: int) -> Optional[dict]:
     result = (
         _client()
         .table('telegram_users')
-        .select('mt5_login, mt5_password_encrypted, mt5_server, mt5_account_currency')
+        .select('mt5_login, mt5_password_encrypted, mt5_server, mt5_account_currency, metaapi_account_id')
         .eq('telegram_id', telegram_id)
         .eq('mt5_connected', True)
         .execute()
@@ -380,12 +383,12 @@ def get_mt5_credentials(telegram_id: int) -> Optional[dict]:
         return None
 
     return {
-        'login':    row['mt5_login'],
-        'password': password,        # never logged after this point
-        'server':   row['mt5_server'],
-        'currency': row.get('mt5_account_currency', 'USD'),
+        'login':               row['mt5_login'],
+        'password':            password,
+        'server':              row['mt5_server'],
+        'currency':            row.get('mt5_account_currency', 'USD'),
+        'metaapi_account_id':  row.get('metaapi_account_id', ''),
     }
-
 
 @_db_retry()
 def delete_mt5_credentials(telegram_id: int) -> bool:

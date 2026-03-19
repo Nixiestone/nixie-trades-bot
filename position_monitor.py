@@ -28,6 +28,7 @@ class MonitoredPosition:
     status:        str          # 'ACTIVE', 'TP1_HIT', 'TP2_HIT', 'STOPPED'
     telegram_id:   int
     magic_number:  int          = 234567
+    account_currency: str      = 'USD'
     opened_at:     datetime     = field(default_factory=datetime.now)
     last_check:    datetime     = field(default_factory=datetime.now)
     is_filled:               bool  = False
@@ -113,6 +114,20 @@ class PositionMonitor:
         return True
 
     # ==================== MAIN LOOP ====================
+    
+    def _run_mt5_sync(self, coro, timeout: int = 30):
+        """
+        Run an async MT5 coroutine from the background monitor thread.
+        Uses the event loop captured from the main thread at startup.
+        This is the correct pattern for calling async code from a sync thread.
+        """
+        if self._loop is not None and self._loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            return future.result(timeout=timeout)
+        raise RuntimeError(
+            "Cannot call MT5: no running event loop. "
+            "Ensure position monitor starts after the bot event loop."
+        )
 
     def _monitor_loop(self):
         """Background thread: check all positions at each interval."""
@@ -134,16 +149,17 @@ class PositionMonitor:
 
     def add_position(
         self,
-        ticket:        int,
-        symbol:        str,
-        direction:     str,
-        volume:        float,
-        entry_price:   float,
-        stop_loss:     float,
-        take_profit_1: float,
-        take_profit_2: float,
-        telegram_id:   int,
-        magic_number:  int   = 234567,
+        ticket:           int,
+        symbol:           str,
+        direction:        str,
+        volume:           float,
+        entry_price:      float,
+        stop_loss:        float,
+        take_profit_1:    float,
+        take_profit_2:    float,
+        telegram_id:      int,
+        magic_number:     int   = 234567,
+        account_currency: str   = 'USD',
         ml_features=None,
     ) -> bool:
         """Register a newly opened trade for monitoring."""
@@ -161,6 +177,7 @@ class PositionMonitor:
                 status='ACTIVE',
                 telegram_id=telegram_id,
                 magic_number=magic_number,
+                account_currency=account_currency,
                 opened_at=datetime.now(),
                 ml_features=ml_features,
             )
@@ -218,7 +235,7 @@ class PositionMonitor:
             unavailable_users = set()
 
             for tid in user_ids:
-                ok, user_positions = self.mt5.get_positions(tid)
+                ok, user_positions = self._run_mt5_sync(self.mt5.get_positions(tid))
                 if not ok:
                     unavailable_users.add(tid)
                     self.logger.warning(
@@ -424,10 +441,12 @@ class PositionMonitor:
             else:
                 pips = (position.entry_price - position.take_profit_1) / pip_size
 
-            success, message = self.mt5.close_partial_position(
-                telegram_id=position.telegram_id,
-                ticket=position.ticket,
-                close_pct=0.5,
+            success, message = self._run_mt5_sync(
+                self.mt5.close_partial_position(
+                    telegram_id=position.telegram_id,
+                    ticket=position.ticket,
+                    close_pct=0.5,
+                )
             )
 
             if success:
@@ -558,10 +577,12 @@ class PositionMonitor:
         """Close remaining 50% and record WIN."""
         self.logger.info("TP2 hit for ticket %d (%s).", position.ticket, position.symbol)
         try:
-            success, message = self.mt5.close_partial_position(
-                telegram_id=position.telegram_id,
-                ticket=position.ticket,
-                close_pct=1.0,
+            success, message = self._run_mt5_sync(
+                self.mt5.close_partial_position(
+                    telegram_id=position.telegram_id,
+                    ticket=position.ticket,
+                    close_pct=1.0,
+                )
             )
             if success:
                 position.status = 'TP2_HIT'
@@ -569,16 +590,26 @@ class PositionMonitor:
                     position.symbol, position.entry_price, position.take_profit_2
                 )
                 duration = self._trade_duration(position)
+                _ccy = position.account_currency
                 self._send_notification(
                     position.telegram_id,
-                    f"TP2 HIT - TRADE COMPLETE\n\n"
-                    f"Ticket:   {position.ticket}\n"
-                    f"Symbol:   {position.symbol}\n"
-                    f"Entry:    {utils.format_price(position.symbol, position.entry_price)}\n"
-                    f"TP2:      {utils.format_price(position.symbol, position.take_profit_2)}\n"
-                    f"Pips:     +{pips:.1f}\n"
-                    f"Duration: {duration}\n\n"
-                    f"Full position closed. Trade complete."
+                    "TP2 HIT - TRADE COMPLETE\n\n"
+                    "Ticket:   %d\n"
+                    "Symbol:   %s\n"
+                    "Entry:    %s\n"
+                    "TP2:      %s\n"
+                    "P&L:      +%.2f %s    +%.1f pips\n"
+                    "Duration: %s\n\n"
+                    "Full position closed. Trade complete." % (
+                        position.ticket,
+                        position.symbol,
+                        utils.format_price(position.symbol, position.entry_price),
+                        utils.format_price(position.symbol, position.take_profit_2),
+                        position.profit,
+                        _ccy,
+                        pips,
+                        duration,
+                    )
                 )
                 self._log_trade_completion(position, 'WIN', position.profit)
                 self.logger.info(
@@ -603,10 +634,12 @@ class PositionMonitor:
                 position.entry_price + buffer if position.direction == 'BUY'
                 else position.entry_price - buffer
             )
-            success, message = self.mt5.modify_stop_loss(
-                telegram_id=position.telegram_id,
-                ticket=position.ticket,
-                new_sl=be_price,
+            success, message = self._run_mt5_sync(
+                self.mt5.modify_stop_loss(
+                    telegram_id=position.telegram_id,
+                    ticket=position.ticket,
+                    new_sl=be_price,
+                )
             )
             if success:
                 position.stop_loss    = be_price
@@ -649,10 +682,12 @@ class PositionMonitor:
                 "It may have already been processed."
             )
         try:
-            success, message = self.mt5.close_partial_position(
-                telegram_id=position.telegram_id,
-                ticket=ticket,
-                close_pct=0.5,
+            success, message = self._run_mt5_sync(
+                self.mt5.close_partial_position(
+                    telegram_id=position.telegram_id,
+                    ticket=ticket,
+                    close_pct=0.5,
+                )
             )
             position.awaiting_partial_confirm = False
             if success:
@@ -753,7 +788,7 @@ class PositionMonitor:
                 pips = (position.entry_price - position.current_price) / pip_size
         else:
             outcome = 'BREAKEVEN'
-            pips    = 0.0
+            pips = 0.0
 
         self.logger.info(
             "Position %d (%s) is no longer in MT5. "
@@ -765,18 +800,29 @@ class PositionMonitor:
             position.status = 'STOPPED' if outcome == 'LOSS' else 'CLOSED'
             duration        = self._trade_duration(position)
 
+            _ccy     = position.account_currency
+            _pnl_str = (
+                "+%.2f %s" % (profit_value, _ccy)
+                if profit_value >= 0
+                else "%.2f %s" % (profit_value, _ccy)
+            )
+            _pip_str = ("+%.1f pips" % pips) if pips >= 0 else ("%.1f pips" % pips)
+
             if outcome == 'WIN':
                 close_line = (
                     "Position closed at a profit.\n"
-                    "Pips:      +%.1f" % pips
+                    "P&L:       %s    %s" % (_pnl_str, _pip_str)
                 )
             elif outcome == 'LOSS':
                 close_line = (
                     "Stop loss closed the position to protect your account.\n"
-                    "Pips:      %.1f" % pips
+                    "P&L:       %s    %s" % (_pnl_str, _pip_str)
                 )
             else:
-                close_line = "Position closed at breakeven."
+                close_line = (
+                    "Position closed at breakeven.\n"
+                    "P&L:       %s    %s" % (_pnl_str, _pip_str)
+                )
 
             self._send_notification(
                 position.telegram_id,

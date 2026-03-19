@@ -219,6 +219,41 @@ class MT5Connector:
 
     # ==================== MARKET DATA ====================
 
+    def calculate_lot_size_remote(
+        self,
+        telegram_id: int,
+        symbol: str,
+        sl_pips: float,
+        risk_percent: float,
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """
+        Ask the MT5 worker to calculate the correct lot size for this user's account.
+
+        Uses MT5's native trade_tick_value which is already in the account's base
+        currency. This works correctly for all account currencies (USD, EUR, GBP,
+        NGN, ZAR, etc.) without any external exchange rate lookup.
+
+        Returns:
+            (lot_size, account_currency) on success
+            (None, None) on failure
+        """
+        creds = self._get_credentials(telegram_id)
+        if not creds:
+            return None, None
+
+        payload = {
+            'login':        creds['login'],
+            'password':     creds['password'],
+            'server':       creds['server'],
+            'symbol':       symbol,
+            'sl_pips':      sl_pips,
+            'risk_percent': risk_percent,
+        }
+        success, result = self._post('/lot_size', payload)
+        if success and isinstance(result, dict):
+            return float(result.get('lot_size', 0.01)), result.get('currency', 'USD')
+        return None, None
+
     def get_current_price(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         """
         Return current (bid, ask) for a symbol.

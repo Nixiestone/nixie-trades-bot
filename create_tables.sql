@@ -488,3 +488,7 @@ BEGIN
     END IF;
 END
 $$;
+
+
+ALTER TABLE telegram_users
+    ADD COLUMN IF NOT EXISTS metaapi_account_id TEXT;

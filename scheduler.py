@@ -218,7 +218,7 @@ class NixTradesScheduler:
                     continue
 
                 try:
-                    status_info = self.mt5.check_ticket_status(telegram_id, ticket)
+                    status_info = await self.mt5.check_ticket_status(telegram_id, ticket)
                     status      = status_info.get('status', 'UNKNOWN')
 
                     if status == 'POSITION':
@@ -279,9 +279,9 @@ class NixTradesScheduler:
 
     async def _run_reconciliation(self):
         """APScheduler entry point for the reconciliation job."""
-        if not self.mt5.is_worker_reachable():
+        if not await self.mt5.is_worker_reachable():
             self.logger.debug(
-                "Reconciliation skipped: MT5 worker not reachable.")
+                "Reconciliation skipped: MetaApi not reachable.")
             return
         await self._reconcile_open_trades()
 
@@ -365,9 +365,9 @@ class NixTradesScheduler:
         """Scan all monitored symbols on the configured scheduler interval."""
         try:
             self.logger.info("Starting market scan.")
-            if not self.mt5.is_worker_reachable():
+            if not await self.mt5.is_worker_reachable():
                 self.logger.warning(
-                    "MT5 worker not reachable. Skipping market scan. "
+                    "MetaApi not reachable. Skipping market scan. "
                     "Check Windows VPS worker is running.")
                 return
 
@@ -394,9 +394,9 @@ class NixTradesScheduler:
             # Bail immediately if the MT5 worker is offline.
             # Without this, the scan blocks for 10+ minutes per symbol
             # retrying 4 times per timeframe with no worker available.
-            if not self.mt5.is_worker_reachable():
+            if not await self.mt5.is_worker_reachable():
                 self.logger.info(
-                    "MT5 worker not reachable. Skipping %s.", symbol)
+                    "MetaApi not reachable. Skipping %s.", symbol)
                 return
 
             # Check news blackout window before doing any analysis
@@ -422,20 +422,46 @@ class NixTradesScheduler:
             # D1 provides HTF context, H4 provides intermediate confirmation,
             # H1 provides structure, M15 provides entry timing, M5 provides
             # precise entry refinement within the H1 POI zone.
-            d1_raw  = self.mt5.get_historical_data(symbol, 'D1',  bars=250)
-            h4_raw  = self.mt5.get_historical_data(symbol, 'H4',  bars=300)
-            h1_raw  = self.mt5.get_historical_data(symbol, 'H1',  bars=500)
-            m15_raw = self.mt5.get_historical_data(symbol, 'M15', bars=500)
-            m5_raw  = self.mt5.get_historical_data(symbol, 'M5',  bars=300)
+            # Candle counts are sized to the minimum each operation actually consumes:
+            #   D1:  _identify_swings uses tail(100), lookback=2 needs 104 minimum.
+            #         300 gives robust swing history across different market phases.
+            #   H4:  Same as D1. 400 covers ~67 trading days for alignment context.
+            #   H1:  OB rolling_avg_vol needs 20 bars, OB loop needs 10+6=16 bars,
+            #         detect_break_of_structure uses tail(50). 600 = ~25 trading days.
+            #   M15: Inducement lookback 80 bars (20 hours). ML features use 100 bars.
+            #         700 bars = ~175 hours of M15 data for POI and sweep detection.
+            #   M5:  OB refinement uses tail(80). 400 bars = 33 hours of M5 data.
+            d1_raw  = await self.mt5.get_historical_data(symbol, 'D1',  bars=300)
+            h4_raw  = await self.mt5.get_historical_data(symbol, 'H4',  bars=400)
+            h1_raw  = await self.mt5.get_historical_data(symbol, 'H1',  bars=600)
+            m15_raw = await self.mt5.get_historical_data(symbol, 'M15', bars=700)
+            m5_raw  = await self.mt5.get_historical_data(symbol, 'M5',  bars=400)
 
-            if not d1_raw or len(d1_raw) < 50:
-                self.logger.debug("Insufficient D1 data for %s. Skipping.", symbol)
+            # Minimum bar checks are set to what each algorithm actually requires.
+            # D1: _identify_swings uses tail(100) — need at least 105 bars.
+            if not d1_raw or len(d1_raw) < 105:
+                self.logger.debug(
+                    "Insufficient D1 data for %s (%d bars). Need 105. Skipping.",
+                    symbol, len(d1_raw) if d1_raw else 0)
                 return
-            if not h1_raw or len(h1_raw) < 100:
-                self.logger.debug("Insufficient H1 data for %s. Skipping.", symbol)
+            # H1: detect_break_of_structure uses tail(50), OB detection needs 36+.
+            #     200 bars is a conservative safe minimum for all H1 operations.
+            if not h1_raw or len(h1_raw) < 200:
+                self.logger.debug(
+                    "Insufficient H1 data for %s (%d bars). Need 200. Skipping.",
+                    symbol, len(h1_raw) if h1_raw else 0)
                 return
-            if not m15_raw or len(m15_raw) < 100:
-                self.logger.debug("Insufficient M15 data for %s. Skipping.", symbol)
+            # M15: inducement lookback is 80 bars, ML features need 100 bars.
+            if not m15_raw or len(m15_raw) < 120:
+                self.logger.debug(
+                    "Insufficient M15 data for %s (%d bars). Need 120. Skipping.",
+                    symbol, len(m15_raw) if m15_raw else 0)
+                return
+            # M5: OB refinement uses tail(80). 400 bars = 33 hours of M5 data.
+            if not m5_raw or len(m5_raw) < 400:
+                self.logger.debug(
+                    "Insufficient M5 data for %s (%d bars). Need 400. Skipping.",
+                    symbol, len(m5_raw) if m5_raw else 0)
                 return
 
             d1_df  = self._candles_to_df(d1_raw)
@@ -568,10 +594,16 @@ class NixTradesScheduler:
             # M15 confirms the liquidity sweep (inducement) has actually occurred.
             # M5 is used later for precise entry price refinement only.
             # This 3-layer zoom is the correct Smart Money workflow.
+            # Pass the full M15 DataFrame so the inducement detector can scan
+            # 80 bars (20 hours) of M15 history for the liquidity sweep.
+            # The previous tail(60) combined with the internal tail(40) was
+            # producing only 40 bars (10 hours), missing sweeps on slow setups.
+            # An H1 BOS can precede the sweep by up to 12-16 hours.
             inducement = self.smc.detect_inducement_post_structure(
-                m15_df.tail(60),
+                m15_df,
                 anchor_poi,
                 trade_direction,
+                lookback_bars=80,
                 symbol=symbol,
             )
             if inducement is None:
@@ -646,40 +678,106 @@ class NixTradesScheduler:
                 poi, poi['direction'], symbol,
                 self.smc._calculate_atr(m15_df.tail(20)))
             
-            # M5 precision entry refinement.
-            # If there is an M5 Order Block inside the H1 POI zone,
-            # tighten the entry to that M5 level for a better R:R.
-            if m5_df is not None and len(m5_df) >= 50:
+            # Multi-timeframe sniper entry refinement.
+            # Correct SMC sequence: drill down from H1 POI -> M15 OB -> M5 OB.
+            #
+            # ENTRY BOUNDARY RULE (Elite SMC):
+            #   BUY demand zone: price pulls back DOWN into zone.
+            #     Price enters through the TOP (poi_high).
+            #     Limit order at m_ob['high'] — fills on the first pip that
+            #     touches the lower-TF demand zone.
+            #   SELL supply zone: price rallies UP into zone.
+            #     Price enters through the BOTTOM (poi_low).
+            #     Limit order at m_ob['low'] — fills on first touch of supply.
+            #
+            # CRITICAL: When entry is refined to a lower-TF OB, the SL MUST also
+            # be recalculated from that same lower-TF OB. The H1 POI SL is too
+            # wide relative to the tighter M15/M5 entry boundary. Keeping the
+            # H1 SL was producing poor RR that the TP filter then rejected,
+            # suppressing valid sniper setups.
+            _poi_high   = float(poi.get('high', entry_cfg['entry_price']))
+            _poi_low    = float(poi.get('low',  entry_cfg['entry_price']))
+            _is_buy     = poi['direction'] == 'BULLISH'
+            _refined    = False
+            _refined_ob = None   # The lower-TF OB selected for entry
+
+            # Priority 1: M15 OB within the H1 POI zone.
+            if m15_df is not None and len(m15_df) >= 50:
+                try:
+                    m15_obs = self.smc.detect_order_blocks(
+                        m15_df.tail(80), poi['direction'], symbol=symbol)
+                    for m15_ob in m15_obs[:5]:
+                        boundary = (
+                            float(m15_ob.get('high', 0))
+                            if _is_buy
+                            else float(m15_ob.get('low', 0))
+                        )
+                        if _poi_low <= boundary <= _poi_high and boundary > 0:
+                            self.logger.info(
+                                "M15 OB sniper entry for %s: zone %.5f -> M15 boundary %.5f",
+                                symbol, entry_cfg['entry_price'], round(boundary, 5))
+                            entry_cfg['entry_price'] = round(boundary, 5)
+                            _refined_ob = m15_ob
+                            _refined    = True
+                            break
+                except Exception as m15_err:
+                    self.logger.debug(
+                        "M15 refinement skipped for %s: %s", symbol, m15_err)
+
+            # Priority 2: M5 OB within H1 POI zone (only if no M15 OB found).
+            if not _refined and m5_df is not None and len(m5_df) >= 50:
                 try:
                     m5_obs = self.smc.detect_order_blocks(
-                        m5_df.tail(50), poi['direction'], symbol=symbol)
-                    if m5_obs:
-                        poi_high = float(poi.get('high', entry_cfg['entry_price']))
-                        poi_low  = float(poi.get('low',  entry_cfg['entry_price']))
-                        candidates = []
-                        for m5_ob in m5_obs[:3]:
-                            m5_entry_candidate = (
-                                m5_ob.get('low', entry_cfg['entry_price'])
-                                if poi['direction'] == 'BULLISH'
-                                else m5_ob.get('high', entry_cfg['entry_price'])
-                            )
-                            if poi_low <= m5_entry_candidate <= poi_high:
-                                candidates.append(float(m5_entry_candidate))
-                        if candidates:
-                            best_candidate = (
-                                min(candidates)
-                                if poi['direction'] == 'BULLISH'
-                                else max(candidates)
-                            )
+                        m5_df.tail(80), poi['direction'], symbol=symbol)
+                    for m5_ob in m5_obs[:5]:
+                        boundary = (
+                            float(m5_ob.get('high', 0))
+                            if _is_buy
+                            else float(m5_ob.get('low', 0))
+                        )
+                        if _poi_low <= boundary <= _poi_high and boundary > 0:
                             self.logger.info(
-                                "M5 refinement for %s: entry %s -> %s",
-                                symbol,
-                                entry_cfg['entry_price'],
-                                round(best_candidate, 5))
-                            entry_cfg['entry_price'] = round(best_candidate, 5)
+                                "M5 OB sniper entry for %s: zone %.5f -> M5 boundary %.5f",
+                                symbol, entry_cfg['entry_price'], round(boundary, 5))
+                            entry_cfg['entry_price'] = round(boundary, 5)
+                            _refined_ob = m5_ob
+                            _refined    = True
+                            break
                 except Exception as m5_err:
                     self.logger.debug(
                         "M5 refinement skipped for %s: %s", symbol, m5_err)
+
+            # Recalculate SL from the lower-TF OB that was selected for entry.
+            # Without this, an M15 entry at 1.0852 could have an SL at the H1
+            # POI low of 1.0810 — a 42-pip stop on a 5-pip zone entry.
+            # The SL should sit just beyond the OPPOSITE end of the refined OB:
+            #   BUY:  SL below the M15/M5 OB low  (+ ATR structural buffer)
+            #   SELL: SL above the M15/M5 OB high (+ ATR structural buffer)
+            if _refined and _refined_ob is not None:
+                _refinement_atr = self.smc._calculate_atr(m15_df.tail(20))
+                sl_cfg = self.smc.calculate_stop_loss(
+                    _refined_ob,
+                    poi['direction'],
+                    symbol,
+                    _refinement_atr,
+                )
+                self.logger.info(
+                    "SL recalculated from lower-TF OB for %s: "
+                    "H1-POI SL %.5f -> refined OB SL %.5f (%.1f pips tighter).",
+                    symbol,
+                    float(poi.get('low', 0)) if _is_buy else float(poi.get('high', 0)),
+                    sl_cfg['stop_loss'],
+                    abs(
+                        (float(poi.get('low', 0)) if _is_buy else float(poi.get('high', 0)))
+                        - sl_cfg['stop_loss']
+                    ) / utils.get_pip_value(symbol),
+                )
+            else:
+                self.logger.debug(
+                    "No lower-TF OB found within H1 POI [%.5f - %.5f] for %s. "
+                    "Using H1 zone-percentage entry %.5f with H1 POI SL %.5f.",
+                    _poi_low, _poi_high, symbol,
+                    entry_cfg['entry_price'], sl_cfg['stop_loss'])
             try:
                 tp_cfg = self.smc.calculate_take_profits(
                     entry_cfg['entry_price'],
@@ -895,10 +993,7 @@ class NixTradesScheduler:
         as a pending order rather than executing at a worse price.
         """
         try:
-            loop     = asyncio.get_running_loop()
-            bid, ask = await loop.run_in_executor(
-                None, self.mt5.get_current_price, symbol
-            )
+            bid, ask = await self.mt5.get_current_price(symbol)
             if bid is None or ask is None:
                 return 'LIMIT'
 
@@ -1032,10 +1127,7 @@ class NixTradesScheduler:
             if not creds:
                 return None
 
-            loop              = asyncio.get_running_loop()
-            ok, account_info  = await loop.run_in_executor(
-                None, self.mt5.get_account_info, user['telegram_id']
-            )
+            ok, account_info = await self.mt5.get_account_info(user['telegram_id'])
             if not ok or not account_info:
                 return None
 
@@ -1047,7 +1139,7 @@ class NixTradesScheduler:
             if balance <= 0 or sl_pips <= 0:
                 return None
 
-            exchange_rates = self.mt5.get_exchange_rates()
+            exchange_rates = await self.mt5.get_exchange_rates()
             lot_size = utils.calculate_lot_size(
                 balance, risk_pct, sl_pips,
                 setup_data['symbol'], currency, exchange_rates)
@@ -1084,10 +1176,7 @@ class NixTradesScheduler:
                 return
 
             # Determine order type (LIMIT vs MARKET) based on current price
-            loop     = asyncio.get_running_loop()
-            bid, ask = await loop.run_in_executor(
-                None, self.mt5.get_current_price, symbol
-            )
+            bid, ask = await self.mt5.get_current_price(symbol)
             current = ask if direction == 'BUY' else bid
             entry   = setup_data['entry_price']
 
@@ -1098,25 +1187,21 @@ class NixTradesScheduler:
 
             expiry_minutes = int(setup_data.get('expiry_hours', 8)) * 60
 
-            def _place_blocking():
-                return self.mt5.place_order(
-                    telegram_id=tid,
-                    symbol=symbol,
-                    direction=direction,
-                    lot_size=lot_size,
-                    entry_price=entry,
-                    stop_loss=setup_data['stop_loss'],
-                    take_profit=setup_data['take_profit_1'],
-                    take_profit_2=setup_data['take_profit_2'],
-                    order_type=order_type,
-                    comment='NIXIE TRADES',
-                    sl_pips=float(setup_data.get('sl_pips', 20.0)),
-                    risk_percent=float(user.get('risk_percent', config.DEFAULT_RISK_PERCENT)),
-                    expiry_minutes=expiry_minutes,
-                )
-
-            success, ticket, actual_lot, message = await loop.run_in_executor(
-                None, _place_blocking)
+            success, ticket, actual_lot, message = await self.mt5.place_order(
+                telegram_id=tid,
+                symbol=symbol,
+                direction=direction,
+                lot_size=lot_size,
+                entry_price=entry,
+                stop_loss=setup_data['stop_loss'],
+                take_profit=setup_data['take_profit_1'],
+                take_profit_2=setup_data['take_profit_2'],
+                order_type=order_type,
+                comment='NIXIE TRADES',
+                sl_pips=float(setup_data.get('sl_pips', 20.0)),
+                risk_percent=float(user.get('risk_percent', config.DEFAULT_RISK_PERCENT)),
+                expiry_minutes=expiry_minutes,
+            )
 
             if success and ticket:
                 self.logger.info(
@@ -1126,6 +1211,15 @@ class NixTradesScheduler:
 
                 # Register with position monitor for TP1/TP2 automation
                 if self.monitor is not None:
+                    # Fetch account currency for accurate P&L display.
+                    _acct_ccy = 'USD'
+                    try:
+                        _ok2, _acct2 = self.mt5.get_account_info(tid)
+                        if _ok2 and _acct2:
+                            _acct_ccy = _acct2.get('currency', 'USD')
+                    except Exception:
+                        pass
+
                     self.monitor.add_position(
                         ticket=ticket,
                         symbol=symbol,
@@ -1137,6 +1231,7 @@ class NixTradesScheduler:
                         take_profit_2=setup_data['take_profit_2'],
                         telegram_id=tid,
                         magic_number=config.MAGIC_NUMBER,
+                        account_currency=_acct_ccy,
                         ml_features=setup_data.get('ml_features'),
                     )
 
@@ -1172,15 +1267,15 @@ class NixTradesScheduler:
         Analyses D1 trend for each major pair.
         """
         try:
-            if not self.mt5.is_worker_reachable():
-                return "Market data unavailable (MT5 worker not connected)."
+            if not await self.mt5.is_worker_reachable():
+                return "Market data unavailable (MetaApi not connected)."
 
             lines = ["MARKET STRUCTURE:"]
             major_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD']
 
             for symbol in major_pairs:
                 try:
-                    raw = self.mt5.get_historical_data(symbol, 'D1', bars=50)
+                    raw = await self.mt5.get_historical_data(symbol, 'D1', bars=50)
                     if not raw:
                         continue
                     df = self._candles_to_df(raw)
@@ -1297,14 +1392,14 @@ class NixTradesScheduler:
             ]
 
             try:
-                mt5_ok = self.mt5.is_worker_reachable()
+                mt5_ok = await self.mt5.is_worker_reachable()
             except Exception:
                 mt5_ok = False
 
             if mt5_ok:
                 for symbol in ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'GBPJPY', 'AUDUSD']:
                     try:
-                        raw = self.mt5.get_historical_data(symbol, 'D1', bars=100)
+                        raw = await self.mt5.get_historical_data(symbol, 'D1', bars=100)
                         if not raw:
                             continue
                         df = self._candles_to_df(raw)
@@ -1447,25 +1542,84 @@ class NixTradesScheduler:
             ]
 
             try:
-                mt5_ok = self.mt5.is_worker_reachable()
+                mt5_ok = await self.mt5.is_worker_reachable()
             except Exception:
                 mt5_ok = False
 
             if mt5_ok:
-                lines += ["WEEKLY BIAS (Daily Structure):", ""]
-                for symbol in ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
-                               'USDCAD', 'NZDUSD', 'XAUUSD', 'GBPJPY', 'EURJPY']:
+                lines += [
+                    "TOP-DOWN MARKET STRUCTURE ANALYSIS",
+                    "",
+                    "Reading: Monthly sets the macro bias. Weekly confirms the intermediate",
+                    "structure. Daily identifies the entry-level trend. A setup is highest",
+                    "quality when all three timeframes agree on direction.",
+                    "",
+                ]
+                _analysis_symbols = [
+                    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
+                    'USDCAD', 'NZDUSD', 'XAUUSD', 'GBPJPY', 'EURJPY',
+                ]
+                for symbol in _analysis_symbols:
                     try:
-                        raw_d1 = self.mt5.get_historical_data(symbol, 'D1', bars=50)
+                        # Fetch all three timeframes
+                        raw_mn1 = await self.mt5.get_historical_data(symbol, 'MN1', bars=24)
+                        raw_w1  = await self.mt5.get_historical_data(symbol, 'W1',  bars=52)
+                        raw_d1  = await self.mt5.get_historical_data(symbol, 'D1',  bars=300)
+
                         if not raw_d1:
+                            lines.append(f"  {symbol:<10} Data unavailable")
                             continue
-                        df = self._candles_to_df(raw_d1)
-                        htf        = self.smc.determine_htf_trend(df)
-                        trend      = htf.get('trend', 'UNKNOWN')
-                        confidence = htf.get('confidence', 0)
-                        lines.append(f"  {symbol:<10} {trend:<8}  ({confidence}% confidence)")
-                    except Exception:
-                        lines.append(f"  {symbol:<10} Data unavailable")
+
+                        d1_df = self._candles_to_df(raw_d1)
+                        d1_htf = self.smc.determine_htf_trend(d1_df)
+                        d1_trend = d1_htf.get('trend', 'UNKNOWN')
+                        d1_conf  = d1_htf.get('confidence', 0)
+
+                        mn1_trend = 'N/A'
+                        w1_trend  = 'N/A'
+
+                        if raw_mn1 and len(raw_mn1) >= 10:
+                            mn1_df    = self._candles_to_df(raw_mn1)
+                            mn1_htf   = self.smc.determine_htf_trend(mn1_df)
+                            mn1_trend = mn1_htf.get('trend', 'UNKNOWN')
+
+                        if raw_w1 and len(raw_w1) >= 10:
+                            w1_df    = self._candles_to_df(raw_w1)
+                            w1_htf   = self.smc.determine_htf_trend(w1_df)
+                            w1_trend = w1_htf.get('trend', 'UNKNOWN')
+
+                        # Determine alignment quality
+                        trends_known = [
+                            t for t in [mn1_trend, w1_trend, d1_trend]
+                            if t not in ('UNKNOWN', 'N/A', 'RANGING')
+                        ]
+                        if len(trends_known) >= 2 and len(set(trends_known)) == 1:
+                            alignment = 'ALIGNED'
+                        elif len(trends_known) >= 2 and len(set(trends_known)) > 1:
+                            alignment = 'MIXED'
+                        else:
+                            alignment = 'RANGING'
+
+                        lines.append(
+                            f"  {symbol:<10}  "
+                            f"MN1: {mn1_trend:<8}  "
+                            f"W1: {w1_trend:<8}  "
+                            f"D1: {d1_trend:<8} ({d1_conf}%)  "
+                            f"[{alignment}]"
+                        )
+                    except Exception as _sym_err:
+                        self.logger.warning(
+                            "Weekly analysis failed for %s: %s", symbol, _sym_err)
+                        lines.append(f"  {symbol:<10} Analysis unavailable")
+
+                lines += [
+                    "",
+                    "ALIGNMENT KEY:",
+                    "  ALIGNED  - All timeframes agree. Highest probability setups.",
+                    "  MIXED    - Timeframes disagree. Trade with reduced size or wait.",
+                    "  RANGING  - No clear direction. Avoid until structure forms.",
+                    "",
+                ]
             else:
                 lines.append("  Weekly bias unavailable. MT5 worker is offline.")
 

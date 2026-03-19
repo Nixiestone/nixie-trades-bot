@@ -55,20 +55,50 @@ class SMCStrategy:
             bearish_ratio = (ll_count + lh_count) / total
             
             if bullish_ratio >= 0.6:
+                # swing_high must come from HIGH direction swings only: HH or LH.
+                # HL is a Higher Low — it is a LOW price, not a HIGH price.
+                # Using HL here was putting a trough price into the TP target for BUY.
+                high_swings = [s for s in swings if s['direction'] == 'HIGH']
+                low_swings  = [s for s in swings if s['direction'] == 'LOW']
+                _swing_high = (
+                    high_swings[-1]['price']
+                    if high_swings
+                    else max(s['price'] for s in swings)
+                )
+                _swing_low = (
+                    min(s['price'] for s in low_swings)
+                    if low_swings
+                    else min(s['price'] for s in swings)
+                )
                 return {
-                    'trend': 'BULLISH',
+                    'trend':      'BULLISH',
                     'confidence': int(bullish_ratio * 100),
-                    'reason': f'{hh_count} Higher Highs confirmed',
-                    'swing_high': swings[-1]['price'] if swings[-1]['type'] in ['HH', 'HL'] else swings[-2]['price'],
-                    'swing_low': min(s['price'] for s in swings if s['type'] in ['HL', 'LL'])
+                    'reason':     f'{hh_count} Higher Highs confirmed',
+                    'swing_high': _swing_high,
+                    'swing_low':  _swing_low,
                 }
             elif bearish_ratio >= 0.6:
+                # swing_low must come from LOW direction swings only: LL or HL.
+                # LH is a Lower High — it is a HIGH price, not a LOW price.
+                # Using LH here was putting a peak price into the TP target for SELL.
+                high_swings = [s for s in swings if s['direction'] == 'HIGH']
+                low_swings  = [s for s in swings if s['direction'] == 'LOW']
+                _swing_high = (
+                    max(s['price'] for s in high_swings)
+                    if high_swings
+                    else max(s['price'] for s in swings)
+                )
+                _swing_low = (
+                    low_swings[-1]['price']
+                    if low_swings
+                    else min(s['price'] for s in swings)
+                )
                 return {
-                    'trend': 'BEARISH',
+                    'trend':      'BEARISH',
                     'confidence': int(bearish_ratio * 100),
-                    'reason': f'{ll_count} Lower Lows confirmed',
-                    'swing_high': max(s['price'] for s in swings if s['type'] in ['LH', 'HH']),
-                    'swing_low': swings[-1]['price'] if swings[-1]['type'] in ['LL', 'LH'] else swings[-2]['price']
+                    'reason':     f'{ll_count} Lower Lows confirmed',
+                    'swing_high': _swing_high,
+                    'swing_low':  _swing_low,
                 }
             else:
                 return {
@@ -178,12 +208,24 @@ class SMCStrategy:
         order_blocks = []
         
         try:
-            # Calculate average volume (last 20 candles)
-            avg_volume = data['volume'].tail(20).mean()
-            
+            # Pre-compute a rolling 20-bar average volume aligned to each candle.
+            # Using data.tail(20).mean() for all candles is look-ahead bias:
+            # a candle from 400 bars ago would be compared against future volume.
+            # min_periods=5 ensures we still get a value for early candles.
+            rolling_avg_vol = data['volume'].rolling(20, min_periods=5).mean()
+
             for i in range(10, len(data) - 6):
-                candle = data.iloc[i]
+                candle       = data.iloc[i]
                 next_candles = data.iloc[i+1:i+6]
+
+                # Use the rolling average up to and including this candle.
+                # If still NaN (first few bars), fall back to the candle's own volume.
+                avg_volume = float(rolling_avg_vol.iloc[i])
+                if avg_volume != avg_volume or avg_volume <= 0:
+                    # NaN check: NaN != NaN is True in Python.
+                    # Also guard against zero-volume brokers.
+                    # Use a small positive sentinel so ratios are 1.0 (neutral).
+                    avg_volume = max(float(candle['volume']), 1e-9)
                 
                 # Check for opposite-colored candle before impulse
                 is_bullish_candle = candle['close'] > candle['open']
@@ -213,12 +255,22 @@ class SMCStrategy:
                     continue
                 
                 # REFINEMENT #1: Volume confirmation
-                volume_ratio = candle['volume'] / avg_volume
-                impulse_volume = next_candles['volume'].mean() / avg_volume
-                
+                # Guard against NaN and inf from zero-volume broker feeds.
+                _candle_vol  = float(candle['volume'])
+                _impulse_vol = float(next_candles['volume'].mean()) if len(next_candles) > 0 else 0.0
+                volume_ratio   = _candle_vol  / avg_volume
+                impulse_volume = _impulse_vol / avg_volume
+
+                # NaN check: any comparison with NaN returns False, so we
+                # must explicitly reject invalid ratios before the threshold check.
+                if not (volume_ratio == volume_ratio) or volume_ratio <= 0:
+                    continue
+                if not (impulse_volume == impulse_volume) or impulse_volume <= 0:
+                    continue
+
                 if volume_ratio < config.VOLUME_MULTIPLIER_OB:
                     continue  # OB candle must have 1.5x volume
-                
+
                 if impulse_volume < config.VOLUME_MULTIPLIER_IMPULSE:
                     continue  # Impulse must have 2x volume
                 
@@ -279,11 +331,22 @@ class SMCStrategy:
         breakers = []
         
         try:
+            rolling_avg_vol = data['volume'].rolling(20, min_periods=5).mean()
+
             for i in range(20, len(data) - 5):
-                candle = data.iloc[i]
+                candle       = data.iloc[i]
                 prev_candles = data.iloc[i-10:i]
                 next_candles = data.iloc[i+1:i+5]
-                
+
+                # Minimum volume confirmation for Breaker Blocks.
+                # A BB on near-zero volume is not institutional activity.
+                _avg_vol = float(rolling_avg_vol.iloc[i])
+                if _avg_vol <= 0 or _avg_vol != _avg_vol:
+                    _avg_vol = max(float(candle['volume']), 1e-9)
+                _candle_vol_ratio = float(candle['volume']) / _avg_vol
+                if not (_candle_vol_ratio == _candle_vol_ratio) or _candle_vol_ratio < 1.2:
+                    continue
+
                 if direction == 'BULLISH':
                     # Look for broken resistance becoming support
                     resistance = prev_candles['high'].max()
@@ -1418,15 +1481,15 @@ class SMCStrategy:
             df = data.tail(lookback_bars).copy()
 
             if len(df) < 10:
-                self.logger.debug(
+                # Insufficient bars to confirm a liquidity sweep.
+                # Return None so the scheduler's inducement guard fires correctly
+                # and the setup is deferred to the next scan cycle.
+                # Returning a non-None dict here was bypassing the guard and
+                # broadcasting setups with zero sweep confirmation.
+                self.logger.info(
                     "Insufficient M15 bars (%d) for inducement check. "
-                    "Passing through as UNVERIFIED.", len(df))
-                return {
-                    'type': 'INDUCEMENT', 'direction': direction,
-                    'sweep_level': 0.0, 'sweep_pips': 0.0,
-                    'quality': 'UNVERIFIED', 'timestamp': None,
-                    'sweep_candle': None,
-                }
+                    "Deferring setup until more bars are available.", len(df))
+                return None
 
             is_buy   = direction == 'BULLISH'
             poi_high = float(poi.get('high', 0))
@@ -1446,14 +1509,24 @@ class SMCStrategy:
                 return None
 
             if is_buy:
+                # BUY demand zone is BELOW current price.
+                # Smart money sweeps SELL STOPS sitting below the demand zone
+                # (below poi_low) before reversing up into the zone.
+                # We look for swing LOWS that are BELOW poi_low.
+                # Old code looked for swing lows ABOVE poi_high — completely wrong.
                 candidates = [
                     s for s in internal_swings
-                    if s['direction'] == 'LOW' and s['price'] > poi_high
+                    if s['direction'] == 'LOW' and s['price'] < poi_low
                 ]
             else:
+                # SELL supply zone is ABOVE current price.
+                # Smart money sweeps BUY STOPS sitting above the supply zone
+                # (above poi_high) before reversing down into the zone.
+                # We look for swing HIGHS that are ABOVE poi_high.
+                # Old code looked for swing highs BELOW poi_low — completely wrong.
                 candidates = [
                     s for s in internal_swings
-                    if s['direction'] == 'HIGH' and s['price'] < poi_low
+                    if s['direction'] == 'HIGH' and s['price'] > poi_high
                 ]
 
             if not candidates:
@@ -1462,7 +1535,45 @@ class SMCStrategy:
                     "for %s.", poi_low, poi_high, direction)
                 return None
 
-            target_swing = candidates[-1]
+            # Prefer the NEAREST valid swing to the POI boundary.
+            # Nearest = smallest absolute distance from the zone edge.
+            # This selects the most recently formed liquidity level
+            # which is the most likely target for the stop hunt.
+            _pip_size_for_dist = utils.get_pip_value(symbol)
+            if _pip_size_for_dist <= 0:
+                _pip_size_for_dist = 0.0001
+
+            # Minimum distance: the swing must be at least 3 pips outside the zone.
+            # Anything closer is noise, not a real liquidity pool.
+            _min_dist_pips = 3.0
+
+            if is_buy:
+                # For BUY: valid swing lows must be at least 3 pips BELOW poi_low
+                valid_candidates = [
+                    s for s in candidates
+                    if (poi_low - s['price']) / _pip_size_for_dist >= _min_dist_pips
+                ]
+            else:
+                # For SELL: valid swing highs must be at least 3 pips ABOVE poi_high
+                valid_candidates = [
+                    s for s in candidates
+                    if (s['price'] - poi_high) / _pip_size_for_dist >= _min_dist_pips
+                ]
+
+            if not valid_candidates:
+                self.logger.info(
+                    "No qualifying inducement candidates found outside POI "
+                    "[%.5f - %.5f] for %s with minimum %.1f pip distance. "
+                    "Awaiting formation of a valid liquidity pool.",
+                    poi_low, poi_high, direction, _min_dist_pips)
+                return None
+
+            # Select the nearest valid candidate to the zone boundary.
+            if is_buy:
+                target_swing = max(valid_candidates, key=lambda s: s['price'])
+            else:
+                target_swing = min(valid_candidates, key=lambda s: s['price'])
+
             sweep_level  = target_swing['price']
             swing_idx    = target_swing['index']
 

@@ -48,11 +48,10 @@ def main():
     logger.info("Step 1: Connecting to MT5 worker at %s ...", config.MT5_WORKER_URL)
     mt5 = MT5Connector()
 
-    if not mt5.is_worker_reachable():
+    if not mt5.is_service_reachable_sync():
         logger.error(
-            "MT5 worker is not reachable at %s. "
-            "Please start mt5_worker.py first, then run this script again.",
-            config.MT5_WORKER_URL)
+            "MetaApi is not reachable. "
+            "Check your METAAPI_TOKEN in .env and your internet connection.")
         sys.exit(1)
 
     logger.info("MT5 worker is reachable.")

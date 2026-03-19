@@ -187,8 +187,8 @@ class MLEnsemble:
         if not self.mt5:
             self.logger.error("Cannot train: no mt5_connector provided.")
             return False
-        if not self.mt5.is_worker_reachable():
-            self.logger.error("Cannot train: MT5 worker not reachable.")
+        if not self.mt5.is_service_reachable_sync():
+            self.logger.error("Cannot train: MetaApi not reachable.")
             return False
         if self.smc is None:
             self.logger.error("Cannot train: SMCStrategy failed to load.")
@@ -215,9 +215,9 @@ class MLEnsemble:
         for symbol in symbols:
             self.logger.info("Fetching data for %s ...", symbol)
             try:
-                m15_raw = self.mt5.get_historical_data(symbol, 'M15', bars=m15_bars)
-                h1_raw  = self.mt5.get_historical_data(symbol, 'H1',  bars=h1_bars)
-                d1_raw  = self.mt5.get_historical_data(symbol, 'D1',  bars=d1_bars)
+                m15_raw = self.mt5.get_historical_data_sync(symbol, 'M15', bars=m15_bars)
+                h1_raw  = self.mt5.get_historical_data_sync(symbol, 'H1',  bars=h1_bars)
+                d1_raw  = self.mt5.get_historical_data_sync(symbol, 'D1',  bars=d1_bars)
 
                 if not m15_raw or len(m15_raw) < 500:
                     self.logger.warning(
