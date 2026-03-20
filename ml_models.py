@@ -23,7 +23,7 @@ _META_PATH   = os.path.join(_MODEL_DIR, 'training_metadata.pkl')
 _FEATURE_DIM = 22
 
 # Only train on setups scoring >= this value. Weak setups (~50% win rate) dilute training.
-TRAINING_MIN_QUALITY_SCORE = 55
+TRAINING_MIN_QUALITY_SCORE = 35
 
 
 class MLEnsemble:
@@ -345,18 +345,7 @@ class MLEnsemble:
                 direction  = htf_trend['trend']  # 'BULLISH' or 'BEARISH'
                 smc_dir    = direction            # alias for clarity
 
-                # H4 proxy alignment: require H1 recent structure to agree
-                # with D1 trend. Use last 40 H1 bars as H4 proxy.
-                # This mirrors the live scanner H4 alignment gate.
-                try:
-                    h1_proxy = h1_ctx.tail(40)
-                    if len(h1_proxy) >= 20:
-                        h1_trend = self.smc.determine_htf_trend(h1_proxy)
-                        if (h1_trend.get('trend') not in ('RANGING', direction)):
-                            _cnt_ranging += 1
-                            continue
-                except Exception:
-                    pass
+                
 
                 # --- Phase 2: Structure detection (H1) via real SMC ---
                 setup_type = None
@@ -469,7 +458,7 @@ class MLEnsemble:
                 # (8 hours x 4 bars per hour = 32 bars).
                 # Using 80 bars (20 hours) incorrectly includes price action that
                 # occurs after a real order would have expired, inflating WIN rate.
-                _expiry_bars = 64
+                _expiry_bars = 64  # Non-overlapping windows with forward_bars=32 to avoid label autocorrelation
                 future = m15_df.iloc[i: i + _expiry_bars]
                 if len(future) < 10:
                     continue
@@ -477,7 +466,7 @@ class MLEnsemble:
                 # Use config.MIN_RR_TP2 (3.0) to match the live system exactly.
                 # Training with 2.5 while live uses 3.0 means the model is
                 # calibrated for different price levels than it actually operates on.
-                target_reward = risk * config.MIN_RR_RATIO
+                target_reward = risk * config.MIN_RR_TP2
                 is_buy = direction == 'BULLISH'
 
                 # Chronological bar-by-bar scan. The FIRST level reached determines
