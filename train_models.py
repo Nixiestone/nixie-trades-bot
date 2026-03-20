@@ -49,9 +49,16 @@ def main():
     mt5 = MT5Connector()
 
     if not mt5.is_service_reachable_sync():
-        logger.error(
-            "MetaApi is not reachable. "
-            "Check your METAAPI_TOKEN in .env and your internet connection.")
+        if mt5._use_metaapi:
+            logger.error(
+                "MetaApi is not reachable. "
+                "Check your METAAPI_TOKEN in .env and your internet connection.")
+        else:
+            logger.error(
+                "MT5 worker is not reachable at %s. "
+                "You must start mt5_worker.py before running train_models.py. "
+                "Open a second Command Prompt window and run: python mt5_worker.py",
+                mt5._worker_url)
         sys.exit(1)
 
     logger.info("MT5 worker is reachable.")

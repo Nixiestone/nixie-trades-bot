@@ -23,7 +23,7 @@ _META_PATH   = os.path.join(_MODEL_DIR, 'training_metadata.pkl')
 _FEATURE_DIM = 22
 
 # Only train on setups scoring >= this value. Weak setups (~50% win rate) dilute training.
-TRAINING_MIN_QUALITY_SCORE = 50
+TRAINING_MIN_QUALITY_SCORE = 55
 
 
 class MLEnsemble:
@@ -345,6 +345,19 @@ class MLEnsemble:
                 direction  = htf_trend['trend']  # 'BULLISH' or 'BEARISH'
                 smc_dir    = direction            # alias for clarity
 
+                # H4 proxy alignment: require H1 recent structure to agree
+                # with D1 trend. Use last 40 H1 bars as H4 proxy.
+                # This mirrors the live scanner H4 alignment gate.
+                try:
+                    h1_proxy = h1_ctx.tail(40)
+                    if len(h1_proxy) >= 20:
+                        h1_trend = self.smc.determine_htf_trend(h1_proxy)
+                        if (h1_trend.get('trend') not in ('RANGING', direction)):
+                            _cnt_ranging += 1
+                            continue
+                except Exception:
+                    pass
+
                 # --- Phase 2: Structure detection (H1) via real SMC ---
                 setup_type = None
                 poi        = None
@@ -456,7 +469,7 @@ class MLEnsemble:
                 # (8 hours x 4 bars per hour = 32 bars).
                 # Using 80 bars (20 hours) incorrectly includes price action that
                 # occurs after a real order would have expired, inflating WIN rate.
-                _expiry_bars = 32
+                _expiry_bars = 64
                 future = m15_df.iloc[i: i + _expiry_bars]
                 if len(future) < 10:
                     continue
@@ -464,7 +477,7 @@ class MLEnsemble:
                 # Use config.MIN_RR_TP2 (3.0) to match the live system exactly.
                 # Training with 2.5 while live uses 3.0 means the model is
                 # calibrated for different price levels than it actually operates on.
-                target_reward = risk * config.MIN_RR_TP2
+                target_reward = risk * config.MIN_RR_RATIO
                 is_buy = direction == 'BULLISH'
 
                 # Chronological bar-by-bar scan. The FIRST level reached determines
@@ -556,20 +569,20 @@ class MLEnsemble:
             dtest  = xgb.DMatrix(X_te, label=y_te)
             params = {
                 'objective':        'binary:logistic',
-                'max_depth':        4,      # Reduced from 6. Prevents memorising individual setups.
-                'learning_rate':    0.03,   # Slower learning forces more generalisation.
-                'subsample':        0.7,    # Reduced from 0.8 for more regularisation.
-                'colsample_bytree': 0.7,    # Reduced from 0.8.
-                'min_child_weight': 15,     # Increased from 3. Requires larger node populations.
-                'gamma':            0.3,    # Increased from 0.1. Harder to split nodes.
-                'reg_alpha':        0.1,    # L1 regularisation - new, removes weak features.
-                'reg_lambda':       1.5,    # L2 regularisation - increased penalty on weights.
+                'max_depth':        3,
+                'learning_rate':    0.02,
+                'subsample':        0.6,
+                'colsample_bytree': 0.6,
+                'min_child_weight': 30,
+                'gamma':            0.5,
+                'reg_alpha':        0.5,
+                'reg_lambda':       3.0,
                 'eval_metric':      'auc',
                 'seed':             42,
             }
             self.xgboost_model = xgb.train(
-                params, dtrain, num_boost_round=300,
-                evals=[(dtest, 'test')], early_stopping_rounds=40,
+                params, dtrain, num_boost_round=500,
+                evals=[(dtest, 'test')], early_stopping_rounds=50,
                 verbose_eval=False)
             y_prob = self.xgboost_model.predict(dtest)
             acc = accuracy_score(y_te, (y_prob > 0.5).astype(int))
@@ -608,13 +621,13 @@ class MLEnsemble:
         """GradientBoostingClassifier with different hyperparameters for ensemble diversity."""
         try:
             self.lstm_model = GradientBoostingClassifier(
-                n_estimators=200,         # Reduced from 300.
-                max_depth=3,              # Reduced from 4. Shallower trees generalise better.
-                learning_rate=0.04,       # Reduced from 0.06.
-                subsample=0.65,           # Reduced from 0.75.
-                min_samples_leaf=20,      # Increased from 10. Requires more evidence per leaf.
-                min_samples_split=40,     # New. Requires more evidence to split.
-                max_features='sqrt',      # New. Only considers sqrt(features) per split.
+                n_estimators=300,
+                max_depth=2,
+                learning_rate=0.02,
+                subsample=0.5,
+                min_samples_leaf=40,
+                min_samples_split=80,
+                max_features='sqrt',
                 random_state=99)
             self.lstm_model.fit(X_tr, y_tr)
             y_prob = self.lstm_model.predict_proba(X_te)[:, 1]
@@ -641,10 +654,10 @@ class MLEnsemble:
         try:
             from sklearn.ensemble import RandomForestClassifier
             self.rf_model = RandomForestClassifier(
-                n_estimators=300,
-                max_depth=5,              # Reduced from 8. Prevents deep memorisation.
-                min_samples_leaf=25,      # Increased from 15. Smoother decision boundaries.
-                min_samples_split=50,     # Increased from 30.
+                n_estimators=500,
+                max_depth=4,
+                min_samples_leaf=50,
+                min_samples_split=100,
                 max_features='sqrt',
                 class_weight='balanced',
                 n_jobs=-1,
