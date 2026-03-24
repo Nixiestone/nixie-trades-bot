@@ -48,7 +48,13 @@ python-telegram-bot==21.0
 # ==================== MT5 WORKER SERVICE (Windows VPS only) ====================
 # DO NOT install these on your Linux bot server
 # Only install on Windows VPS where mt5_worker.py runs:
-#   pip install MetaTrader5 flask flask-limiter pywin32
+ 
+MetaTrader5 
+flask 
+flask-limiter 
+pywin32
 
 
 metaapi-cloud-sdk
+stripe==7.10.0
+pillow

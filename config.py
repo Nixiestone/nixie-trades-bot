@@ -139,9 +139,29 @@ MIN_LOT_SIZE         = 0.01
 MAX_LOT_SIZE         = 10.0
 MAX_CURRENCY_EXPOSURE = 3
 
+# ==================== GOOGLE GEMINI LLM ====================
+
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
+
 # ==================== SMC STRATEGY PARAMETERS ====================
 
 VOLUME_THRESHOLD_OB      = 1.5
+
+# ATR-relative thresholds (replace all hardcoded pip counts)
+# OB impulse must be this multiple of ATR to confirm institutional activity
+OB_IMPULSE_ATR_MULTIPLIER   = 0.8    # impulse >= 0.8 * ATR in pips
+OB_IMPULSE_MIN_PIPS_FLOOR   = 5.0    # absolute floor regardless of ATR
+# Unicorn setup: BB and FVG midpoints must overlap within this fraction of ATR
+UNICORN_TOLERANCE_ATR_MULT  = 0.25
+UNICORN_TOLERANCE_MIN_PIPS  = 3.0
+# Touch mitigation: how many pips beyond the zone boundary counts as mitigated
+MITIGATION_TOUCH_BUFFER_PIPS = 1.0
+# Inducement base minimum sweep size in pips (scaled up per timeframe below)
+INDUCEMENT_MIN_PIPS_BASE    = 2.0
+INDUCEMENT_TIMEFRAME_SCALE  = {
+    'M1': 0.5, 'M5': 1.0, 'M15': 1.5,
+    'H1': 3.0, 'H4': 8.0, 'D1': 15.0,
+}
 VOLUME_THRESHOLD_IMPULSE = 2.0
 VOLUME_MULTIPLIER_OB      = VOLUME_THRESHOLD_OB       # Alias used by smc_strategy.py
 VOLUME_MULTIPLIER_IMPULSE = VOLUME_THRESHOLD_IMPULSE  # Alias used by smc_strategy.py
@@ -307,6 +327,65 @@ REQUEST_BACKOFF_FACTOR  = 2
 
 ENCRYPTION_ALGORITHM = 'Fernet'
 
+# ==================== SUBSCRIPTION TIERS ====================
+
+SUBSCRIPTION_TIERS = {
+    'free':  {'account_limit': 0,    'price_usd': 0},
+    'basic': {'account_limit': 1,    'price_usd': 30},
+    'pro':   {'account_limit': 3,    'price_usd': 100},
+    'admin': {'account_limit': 9999, 'price_usd': 0},
+}
+
+# ==================== PAYMENT CONFIGURATION ====================
+
+PAYSTACK_SECRET_KEY   = os.getenv('PAYSTACK_SECRET_KEY', '')
+PAYSTACK_PUBLIC_KEY   = os.getenv('PAYSTACK_PUBLIC_KEY', '')
+STRIPE_SECRET_KEY     = os.getenv('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '')
+STRIPE_PRICE_BASIC    = os.getenv('STRIPE_PRICE_BASIC', '')
+STRIPE_PRICE_PRO      = os.getenv('STRIPE_PRICE_PRO', '')
+BYBIT_API_KEY         = os.getenv('BYBIT_API_KEY', '')
+BYBIT_API_SECRET      = os.getenv('BYBIT_API_SECRET', '')
+PAYMENT_CALLBACK_URL  = os.getenv('PAYMENT_CALLBACK_URL', '')
+PAYMENT_SUCCESS_URL   = os.getenv('PAYMENT_SUCCESS_URL', 'https://t.me/NixieTradesBot')
+PAYMENT_CANCEL_URL    = os.getenv('PAYMENT_CANCEL_URL', 'https://t.me/NixieTradesBot')
+
+# ==================== SUBSCRIPTION TIERS ====================
+
+SUBSCRIPTION_TIERS = {
+    'free':  {'account_limit': 0,    'price_usd': 0},
+    'basic': {'account_limit': 1,    'price_usd': 30},
+    'pro':   {'account_limit': 3,    'price_usd': 100},
+    'admin': {'account_limit': 9999, 'price_usd': 0},
+}
+
+# Feature gating reference (authoritative copy lives in payment_handler.py)
+TIER_FEATURE_MAP = {
+    'setup_alerts_text':     'free',
+    'setup_alerts_chart':    'basic',
+    'mt5_connection':        'basic',
+    'auto_execution':        'basic',
+    'position_monitoring':   'basic',
+    'settings':              'basic',
+    'download':              'basic',
+    'latest_setup':          'basic',
+    'daily_briefing':        'basic',
+    'news_alert':            'basic',
+    'news_reminder':         'basic',
+    'weekly_analysis':       'pro',
+    'multi_account':         'pro',
+    'foreign_currency_acct': 'pro',
+    'admin_commands':        'admin',
+    'ml_csv_download':       'admin',
+}
+
+TIER_ACCOUNT_LIMITS = {
+    'free':  0,
+    'basic': 1,
+    'pro':   3,
+    'admin': 9999,
+}
+
 # ==================== LEGAL DISCLAIMER ====================
 
 LEGAL_DISCLAIMER = (
@@ -399,6 +478,7 @@ HELP_MESSAGE = (
     "/latest - Get most recent automated setup\n"
     "/settings - Customize risk parameters and preferences\n"
     "/download - Download your trading history\n"
+    "/upgrade - View and manage your subscription plan\n"
     "/unsubscribe - Stop receiving alerts\n\n"
     "SETUP QUALITY LEVELS:\n"
     "- Unicorn Setup: Breaker Block plus Fair Value Gap overlap (70%+ ML score)\n"

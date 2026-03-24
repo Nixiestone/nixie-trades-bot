@@ -243,15 +243,26 @@ class SMCStrategy:
                     impulse_move = candle['high'] - next_candles['low'].min()
                 
                 # Convert to pips using the correct pip size for this symbol.
-                # Using 0.0001 for all pairs overstates Gold pips by 1000x and
-                # JPY pips by 100x, causing every OB on those instruments to be
-                # incorrectly scored as having a massive impulse.
-                _ob_pip_size  = utils.get_pip_value(symbol) if symbol else 0.0001
+                _ob_pip_size = utils.get_pip_value(symbol) if symbol else 0.0001
                 if _ob_pip_size <= 0:
                     _ob_pip_size = 0.0001
                 impulse_pips = impulse_move / _ob_pip_size
-                
-                if impulse_pips < min_impulse_pips:
+
+                # ATR-relative impulse threshold.
+                # A "strong" institutional move must be at least
+                # OB_IMPULSE_ATR_MULTIPLIER * ATR in pip terms.
+                # This adapts automatically to instrument volatility:
+                # XAUUSD needs a larger absolute pip count than EURGBP.
+                _atr_val_ob  = float(rolling_avg_vol.iloc[i]) if rolling_avg_vol.iloc[i] > 0 else 0.0
+                # Re-derive ATR in pips from recent true range (not volume avg)
+                _recent_tr   = data['high'].iloc[max(0, i-14):i] - data['low'].iloc[max(0, i-14):i]
+                _atr_price   = float(_recent_tr.mean()) if len(_recent_tr) > 0 else 0.0
+                _atr_pips_ob = (_atr_price / _ob_pip_size) if _ob_pip_size > 0 else 20.0
+                _min_impulse = max(
+                    config.OB_IMPULSE_MIN_PIPS_FLOOR,
+                    _atr_pips_ob * config.OB_IMPULSE_ATR_MULTIPLIER,
+                )
+                if impulse_pips < _min_impulse:
                     continue
                 
                 # REFINEMENT #1: Volume confirmation
@@ -314,7 +325,8 @@ class SMCStrategy:
         data: pd.DataFrame,
         direction: str,
         htf_swing_high: float,
-        htf_swing_low: float
+        htf_swing_low: float,
+        symbol: str = 'EURUSD',
     ) -> List[Dict]:
         """
         Detect Breaker Blocks (failed support/resistance zones).
@@ -357,6 +369,10 @@ class SMCStrategy:
                         pullback_low = next_candles['low'].min()
                         
                         if pullback_low >= candle['low'] * 0.995:  # Within 0.5%
+                            _bb_pip_sz = utils.get_pip_value(symbol)
+                            if _bb_pip_sz <= 0:
+                                _bb_pip_sz = 0.0001
+                            _bb_impulse = max((candle['close'] - resistance) / _bb_pip_sz, 0.0)
                             breakers.append({
                                 'type': 'BB',
                                 'direction': direction,
@@ -365,6 +381,8 @@ class SMCStrategy:
                                 'high': candle['high'],
                                 'low': candle['low'],
                                 'breaker_level': resistance,
+                                'volume_ratio': _candle_vol_ratio,
+                                'impulse_pips': _bb_impulse,
                                 'confidence': 75
                             })
                 
@@ -378,6 +396,10 @@ class SMCStrategy:
                         pullback_high = next_candles['high'].max()
                         
                         if pullback_high <= candle['high'] * 1.005:
+                            _bb_pip_sz = utils.get_pip_value(symbol)
+                            if _bb_pip_sz <= 0:
+                                _bb_pip_sz = 0.0001
+                            _bb_impulse = max((support - candle['close']) / _bb_pip_sz, 0.0)
                             breakers.append({
                                 'type': 'BB',
                                 'direction': direction,
@@ -386,6 +408,8 @@ class SMCStrategy:
                                 'high': candle['high'],
                                 'low': candle['low'],
                                 'breaker_level': support,
+                                'volume_ratio': _candle_vol_ratio,
+                                'impulse_pips': _bb_impulse,
                                 'confidence': 75
                             })
             
@@ -1419,42 +1443,66 @@ class SMCStrategy:
         self,
         breakers: List[Dict],
         fvgs: List[Dict],
-        tolerance_pips: float = 10
+        tolerance_pips: float = 0.0,
+        atr_price: float = 0.0,
+        symbol: str = 'EURUSD',
     ) -> Optional[Dict]:
         """
         Detect Unicorn setup (BB + FVG confluence).
-        
+
+        The overlap tolerance is ATR-relative when atr_price is supplied.
+        This prevents tight instruments from never matching and volatile
+        instruments like XAUUSD from matching zones that are too far apart.
+
         Args:
-            breakers: List of Breaker Blocks
-            fvgs: List of Fair Value Gaps
-            tolerance_pips: Maximum distance for overlap
-            
+            breakers:       List of Breaker Blocks
+            fvgs:           List of Fair Value Gaps
+            tolerance_pips: Override tolerance in pips (0 = use ATR formula)
+            atr_price:      ATR in price units from _calculate_atr()
+            symbol:         Trading symbol for correct pip size
+
         Returns:
-            dict: Unicorn setup if found
+            dict: Unicorn setup if found, None otherwise
         """
+        pip_size = utils.get_pip_value(symbol)
+        if pip_size <= 0:
+            pip_size = 0.0001
+
+        # ATR-relative tolerance
+        if tolerance_pips <= 0.0:
+            if atr_price > 0.0:
+                atr_pips      = atr_price / pip_size
+                tolerance_pips = max(
+                    config.UNICORN_TOLERANCE_MIN_PIPS,
+                    atr_pips * config.UNICORN_TOLERANCE_ATR_MULT,
+                )
+            else:
+                tolerance_pips = 10.0   # safe fallback before ATR data is available
+
         for bb in breakers:
             for fvg in fvgs:
-                # Check if same direction
                 if bb['direction'] != fvg['direction']:
                     continue
-                
-                # Check for overlap
-                bb_mid = (bb['high'] + bb['low']) / 2
-                fvg_mid = (fvg['high'] + fvg['low']) / 2
-                
-                distance = abs(bb_mid - fvg_mid) / 0.0001  # Convert to pips
-                
+
+                bb_mid   = (float(bb['high']) + float(bb['low'])) / 2.0
+                fvg_mid  = (float(fvg['high']) + float(fvg['low'])) / 2.0
+                distance = abs(bb_mid - fvg_mid) / pip_size
+
                 if distance <= tolerance_pips:
                     return {
-                        'type': 'UNICORN',
-                        'breaker': bb,
-                        'fvg': fvg,
-                        'confidence': 95,
-                        'direction': bb['direction'],
-                        'high': max(bb['high'], fvg['high']),
-                        'low': min(bb['low'], fvg['low'])
+                        'type':         'UNICORN',
+                        'breaker':      bb,
+                        'fvg':          fvg,
+                        'confidence':   95,
+                        'direction':    bb['direction'],
+                        'high':         max(float(bb['high']), float(fvg['high'])),
+                        'low':          min(float(bb['low']),  float(fvg['low'])),
+                        'volume_ratio': float(bb.get('volume_ratio', 1.5)),
+                        'impulse_pips': float(bb.get('impulse_pips', 20.0)),
+                        'timestamp':    bb.get('timestamp'),
+                        'index':        bb.get('index', 0),
                     }
-        
+
         return None
     
     def detect_inducement_post_structure(
@@ -1464,6 +1512,7 @@ class SMCStrategy:
         direction: str,
         lookback_bars: int = 40,
         symbol: str = 'EURUSD',
+        timeframe: str = 'M15',
     ) -> Optional[Dict]:
         """
         Verify a liquidity sweep (inducement) has occurred on M15 AFTER
@@ -1543,9 +1592,13 @@ class SMCStrategy:
             if _pip_size_for_dist <= 0:
                 _pip_size_for_dist = 0.0001
 
-            # Minimum distance: the swing must be at least 3 pips outside the zone.
-            # Anything closer is noise, not a real liquidity pool.
-            _min_dist_pips = 3.0
+            # Timeframe-scaled minimum distance.
+            # A 3-pip sweep on M1 is proportionally the same as a 48-pip
+            # sweep on D1. Scale by the timeframe multiplier so the threshold
+            # is always meaningful relative to typical bar ranges.
+            _tf_scale      = config.INDUCEMENT_TIMEFRAME_SCALE.get(
+                timeframe.upper(), 1.5)
+            _min_dist_pips = config.INDUCEMENT_MIN_PIPS_BASE * _tf_scale
 
             if is_buy:
                 # For BUY: valid swing lows must be at least 3 pips BELOW poi_low
@@ -1588,7 +1641,7 @@ class SMCStrategy:
                     if (float(candle['low']) < sweep_level
                             and float(candle['close']) > sweep_level):
                         sweep_pips = (sweep_level - float(candle['low'])) / _pip_size
-                        if sweep_pips >= 3.0:
+                        if sweep_pips >= _min_dist_pips:
                             sweep_candle = {
                                 'index':       j,
                                 'timestamp':   df.index[j],
@@ -1602,7 +1655,7 @@ class SMCStrategy:
                     if (float(candle['high']) > sweep_level
                             and float(candle['close']) < sweep_level):
                         sweep_pips = (float(candle['high']) - sweep_level) / _pip_size
-                        if sweep_pips >= 3.0:
+                        if sweep_pips >= _min_dist_pips:
                             sweep_candle = {
                                 'index':       j,
                                 'timestamp':   df.index[j],
@@ -1656,24 +1709,37 @@ class SMCStrategy:
                 "Error in detect_inducement_post_structure: %s", e)
             return None
         
-    def is_poi_mitigated(self, poi: Dict, data: pd.DataFrame) -> bool:
+    def is_poi_mitigated(
+        self,
+        poi: Dict,
+        data: pd.DataFrame,
+        touch_mitigation: bool = False,
+        symbol: str = 'EURUSD',
+    ) -> bool:
         """
         Check whether a Point of Interest has been invalidated by price action.
 
-        A bullish POI (demand zone) is mitigated when any candle CLOSES
-        below the POI low after the zone was formed. Price returning to the
-        zone and closing inside it means the buyers there were defeated.
+        touch_mitigation=False (default):
+            Any close beyond the zone boundary = mitigated.
+            Use for standard Order Blocks.
 
-        A bearish POI (supply zone) is mitigated when any candle CLOSES
-        above the POI high after the zone was formed.
+        touch_mitigation=True:
+            Zone is only mitigated if price closes MORE than
+            MITIGATION_TOUCH_BUFFER_PIPS beyond the boundary.
+            A wick or tight close that immediately reverses does NOT
+            invalidate the zone.
+            Use for refined Breaker Blocks where a touch-and-reject is
+            itself a confirmation of institutional activity, not a kill.
 
         Args:
-            poi:  The POI dict (must have 'index', 'high', 'low', 'direction').
-            data: The same OHLCV DataFrame used when detecting the POI.
+            poi:               Point of Interest dict.
+            data:              OHLCV DataFrame used when detecting the POI.
+            touch_mitigation:  When True, apply pip buffer before declaring mitigated.
+            symbol:            Trading symbol for correct pip size.
 
         Returns:
-            True  — POI is mitigated (do NOT trade it).
-            False — POI is still fresh and valid.
+            True  = POI is mitigated (do NOT trade it).
+            False = POI is still fresh and valid.
         """
         try:
             poi_index = int(poi.get('index', 0))
@@ -1681,22 +1747,29 @@ class SMCStrategy:
             poi_low   = float(poi.get('low',  0))
             direction = str(poi.get('direction', 'BULLISH')).upper()
 
-            # Only look at candles that formed AFTER the POI
             post_poi = data.iloc[poi_index + 1:]
-
             if post_poi.empty:
-                return False   # No candles after POI yet — still fresh
+                return False
 
-            if direction in ('BULLISH', 'BUY'):
-                # Mitigated if any close is below the demand zone low
-                return bool((post_poi['close'] < poi_low).any())
+            if touch_mitigation:
+                pip_size  = utils.get_pip_value(symbol)
+                if pip_size <= 0:
+                    pip_size = 0.0001
+                buffer    = config.MITIGATION_TOUCH_BUFFER_PIPS * pip_size
+                if direction in ('BULLISH', 'BUY'):
+                    # Mitigated only if a candle closes more than buffer below the low
+                    return bool((post_poi['close'] < (poi_low - buffer)).any())
+                else:
+                    return bool((post_poi['close'] > (poi_high + buffer)).any())
             else:
-                # Mitigated if any close is above the supply zone high
-                return bool((post_poi['close'] > poi_high).any())
+                if direction in ('BULLISH', 'BUY'):
+                    return bool((post_poi['close'] < poi_low).any())
+                else:
+                    return bool((post_poi['close'] > poi_high).any())
 
         except Exception as e:
             self.logger.error("Error in is_poi_mitigated: %s", e)
-            return False   # On error, assume valid (conservative)
+            return False
 
     def get_closest_unmitigated_poi(
         self,

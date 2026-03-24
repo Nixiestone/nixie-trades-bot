@@ -1,9 +1,21 @@
 import asyncio
+import io
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+try:
+    import httpx as _httpx_check
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _HTTPX_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "httpx not installed. LLM weekly analysis will be skipped. "
+        "Run: pip install httpx --break-system-packages"
+    )
+
 import pandas as pd
+from telegram import InputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -54,6 +66,16 @@ class NixTradesScheduler:
         self.scheduler = AsyncIOScheduler()
         self.running   = False
 
+        # Stores the most recent weekly LLM bias per symbol.
+        # Updated by _send_weekly_analysis every Sunday.
+        # Read by _scan_symbol as an advisory confirmation layer.
+        # Format: { 'EURUSD': 'BUY', 'GBPUSD': 'SELL', 'XAUUSD': 'NEUTRAL', ... }
+        self._llm_weekly_bias: dict = {}
+
+        # Stores most recent daily briefing context string (plain text).
+        # Appended to the LLM prompt in weekly analysis for continuity.
+        self._last_daily_context: str = ''
+
         # Tracks which users already received each message today.
         # Format: "YYYY-MM-DD" -> set of telegram_ids
         self._briefing_sent: dict = {}
@@ -69,6 +91,21 @@ class NixTradesScheduler:
         self.news_update_interval_minutes = max(
             5, int(getattr(config, 'NEWS_UPDATE_INTERVAL_MINUTES', 120))
         )
+
+        # Chart generator for setup alert images
+        try:
+            from chart_generator import ChartGenerator
+            self._chart_gen: object = ChartGenerator()
+            self.logger.info("ChartGenerator loaded.")
+        except Exception as _cg_err:
+            self._chart_gen = None
+            self.logger.warning(
+                "ChartGenerator unavailable: %s. "
+                "Setup alerts will be sent as text only.", _cg_err)
+
+        # Tracks which high-impact news events have already had a 30-min reminder sent.
+        # Key: (currency, title_lower[:50], rounded_timestamp_isoformat)
+        self._reminded_events: set = set()
 
         self.logger.info("Scheduler initialised.")
 
@@ -154,6 +191,17 @@ class NixTradesScheduler:
                 name='Open Trade Reconciliation',
                 replace_existing=True,
                 misfire_grace_time=300,
+                coalesce=True,
+                max_instances=1,
+            )
+
+            self.scheduler.add_job(
+                self._check_news_reminders,
+                IntervalTrigger(minutes=5, timezone='UTC'),
+                id='news_reminders',
+                name='30-Minute News Reminders',
+                replace_existing=True,
+                misfire_grace_time=120,
                 coalesce=True,
                 max_instances=1,
             )
@@ -359,6 +407,81 @@ class NixTradesScheduler:
         except Exception as e:
             self.logger.error("News cache refresh failed: %s", e)
 
+    # ==================== 30-MINUTE NEWS REMINDERS ====================
+
+    async def _check_news_reminders(self):
+        """
+        Checks every 5 minutes for HIGH-impact news events that are
+        25-35 minutes away and sends a single advance warning to all
+        subscribed users. Each event is reminded about only once per
+        occurrence (tracked via self._reminded_events).
+        """
+        try:
+            loop   = asyncio.get_running_loop()
+            events = await loop.run_in_executor(
+                None, self.news.get_red_folder_events, 1
+            )
+            if not events:
+                return
+
+            now_utc = datetime.now(timezone.utc)
+
+            for event in events:
+                ev_ts = event.timestamp
+                if ev_ts.tzinfo is None:
+                    ev_ts = ev_ts.replace(tzinfo=timezone.utc)
+                else:
+                    ev_ts = ev_ts.astimezone(timezone.utc)
+
+                minutes_until = (ev_ts - now_utc).total_seconds() / 60.0
+
+                # Only remind when 25-35 minutes remain
+                if not (25.0 <= minutes_until <= 35.0):
+                    continue
+
+                # Deduplication key: currency + title + rounded minute
+                event_key = (
+                    event.currency.upper().strip(),
+                    event.title.strip().lower()[:60],
+                    ev_ts.replace(second=0, microsecond=0).isoformat(),
+                )
+                if event_key in self._reminded_events:
+                    continue
+
+                self._reminded_events.add(event_key)
+
+                # Cap set size to prevent unbounded growth across long uptimes
+                if len(self._reminded_events) > 300:
+                    self._reminded_events = set(list(self._reminded_events)[-200:])
+
+                time_str = utils.calculate_time_until(ev_ts)
+                reminder = utils.validate_user_message(
+                    "HIGH-IMPACT NEWS REMINDER\n\n"
+                    f"Event:    {event.currency} — {event.title}\n"
+                    f"Time:     In approximately {time_str}\n\n"
+                    f"Avoid opening new trades on pairs involving {event.currency} "
+                    "for the next 30 minutes.\n\n"
+                    "The bot pauses automated setups on affected pairs "
+                    "during the blackout window.\n\n"
+                    f"{config.FOOTER}"
+                )
+
+                from payment_handler import get_subscription_manager as _gsm
+                _sub_mgr   = _gsm()
+                subscribed = db.get_subscribed_users()
+                for user in subscribed:
+                    if _sub_mgr.get_tier(user['telegram_id']) in ('basic', 'pro', 'admin'):
+                        await self._safe_send(user['telegram_id'], reminder)
+                        await asyncio.sleep(_TELEGRAM_SEND_DELAY)
+
+                self.logger.info(
+                    "News reminder sent: %s %s in %.0f minutes.",
+                    event.currency, event.title, minutes_until,
+                )
+
+        except Exception as e:
+            self.logger.error("Error in _check_news_reminders: %s", e, exc_info=True)
+
     # ==================== MARKET SCAN ====================
 
     async def scan_markets(self):
@@ -504,7 +627,8 @@ class NixTradesScheduler:
                 breakers   = self.smc.detect_breaker_blocks(
                     h1_df, htf_trend['trend'],
                     htf_trend.get('swing_high', 0),
-                    htf_trend.get('swing_low', 0))
+                    htf_trend.get('swing_low', 0),
+                    symbol=symbol)
                 if breakers:
                     all_candidates = breakers
                     self.logger.debug(
@@ -537,7 +661,8 @@ class NixTradesScheduler:
                     breakers = self.smc.detect_breaker_blocks(
                         h1_df, mss_event['direction'],
                         htf_trend.get('swing_high', 0),
-                        htf_trend.get('swing_low', 0))
+                        htf_trend.get('swing_low', 0),
+                        symbol=symbol)
                     all_candidates = breakers
                     self.logger.info(
                         "%s MSS: No Order Blocks found. "
@@ -571,10 +696,18 @@ class NixTradesScheduler:
             # Filter out any POI that has already been mitigated by price action.
             # A mitigated zone means institutions already filled their orders there;
             # there is no point targeting an empty well.
-            unmitigated = [
-                p for p in all_candidates
-                if not self.smc.is_poi_mitigated(p, h1_df)
-            ]
+            # Breaker Blocks use touch_mitigation=True: a wick into the zone
+            # followed by a rejection does NOT invalidate it.
+            # Order Blocks use the default strict boundary rule.
+            unmitigated = []
+            for _cand in all_candidates:
+                _is_bb = str(_cand.get('type', 'OB')).upper() in ('BB', 'BREAKER')
+                if not self.smc.is_poi_mitigated(
+                    _cand, h1_df,
+                    touch_mitigation=_is_bb,
+                    symbol=symbol,
+                ):
+                    unmitigated.append(_cand)
 
             if not unmitigated:
                 self.logger.info(
@@ -605,6 +738,7 @@ class NixTradesScheduler:
                 trade_direction,
                 lookback_bars=80,
                 symbol=symbol,
+                timeframe='M15',
             )
             if inducement is None:
                 self.logger.info(
@@ -818,9 +952,31 @@ class NixTradesScheduler:
             setup_tier  = 'UNICORN' if tier == 'PREMIUM' else 'STANDARD'
             setup_label = f"{setup_tier} {setup_type}"
 
+            # Advisory LLM context from the Sunday weekly analysis.
+            # If the stored bias conflicts with the SMC direction, flag it
+            # in the alert. Never block a valid setup on LLM alone.
+            _smc_direction_str = 'BUY' if poi['direction'] == 'BULLISH' else 'SELL'
+            _llm_bias          = self._llm_weekly_bias.get(symbol, '')
+            if _llm_bias and _llm_bias not in ('NEUTRAL', ''):
+                if _llm_bias == _smc_direction_str:
+                    _llm_context = f"Weekly outlook confirms {_llm_bias} bias."
+                elif _llm_bias == 'WAIT':
+                    _llm_context = (
+                        "Weekly outlook advises caution — timeframes mixed. "
+                        "Consider reducing size."
+                    )
+                else:
+                    _llm_context = (
+                        f"Note: Weekly macro analysis favours {_llm_bias}. "
+                        f"This {_smc_direction_str} setup is counter to the weekly bias. "
+                        f"Apply extra caution."
+                    )
+            else:
+                _llm_context = ''
+
             setup_data = {
                 'symbol':        symbol,
-                'direction':     'BUY' if poi['direction'] == 'BULLISH' else 'SELL',
+                'direction':     _smc_direction_str,
                 'setup_type':    setup_tier,
                 'setup_label':   setup_label,
                 'entry_price':   entry_cfg['entry_price'],
@@ -846,6 +1002,15 @@ class NixTradesScheduler:
                 ),
                 'ml_features':   ml_result['features'],
                 'news_warning':  news_warn,
+                'llm_context':   _llm_context,
+                # Chart data is not saved to DB — only used for image generation
+                'chart_data': {
+                    'm15_df':          m15_df.tail(80),
+                    'poi':             poi,
+                    'additional_pois': unmitigated[:4],
+                    'fvgs':            self.smc.detect_fair_value_gaps(m15_df.tail(60)),
+                    'bos_events':      bos_events[:3],
+                },
             }
 
             signal_row = db.save_signal(
@@ -1024,6 +1189,64 @@ class NixTradesScheduler:
             signal_num = setup_data.get('signal_number', 0)
             news_warn  = setup_data.get('news_warning', '')
 
+            # Fetch live M15 data for chart generation.
+            # Priority: MetaApi -> MT5 worker -> skip image entirely.
+            # If neither source delivers data, the broadcast continues as
+            # text-only with no error raised to the user.
+            chart_bytes = None
+            chart_data  = setup_data.get('chart_data')
+            _symbol     = setup_data.get('symbol', '')
+
+            if chart_data is not None and self._chart_gen is not None:
+                _live_raw = None
+                try:
+                    _live_raw = await self.mt5.get_historical_data(
+                        _symbol, 'M15', bars=100)
+                except Exception as _live_err:
+                    self.logger.debug(
+                        "Live M15 fetch for chart failed (%s): %s",
+                        _symbol, _live_err)
+
+                if _live_raw and len(_live_raw) >= 20:
+                    try:
+                        _live_df   = self._candles_to_df(_live_raw)
+                        _loop      = asyncio.get_running_loop()
+                        # Capture loop-local variables before passing to executor
+                        _poi       = chart_data.get('poi')
+                        _add_pois  = chart_data.get('additional_pois', [])
+                        _fvgs      = chart_data.get('fvgs', [])
+                        _bos       = chart_data.get('bos_events', [])
+                        _sd        = dict(setup_data)   # shallow copy is safe here
+                        _df_snap   = _live_df.tail(80).copy()
+                        chart_bytes = await _loop.run_in_executor(
+                            None,
+                            lambda: self._chart_gen.generate_setup_chart(
+                                data=_df_snap,
+                                setup_data=_sd,
+                                poi=_poi,
+                                additional_pois=_add_pois,
+                                fvgs=_fvgs,
+                                bos_events=_bos,
+                            )
+                        )
+                        if chart_bytes:
+                            self.logger.info(
+                                "Chart generated for setup #%d with live data "
+                                "(%d KB).",
+                                signal_num, len(chart_bytes) // 1024)
+                        else:
+                            self.logger.info(
+                                "Chart generator returned None for #%d. "
+                                "Text-only broadcast.", signal_num)
+                    except Exception as _chart_err:
+                        self.logger.warning(
+                            "Chart generation failed for setup #%d: %s",
+                            signal_num, _chart_err)
+                else:
+                    self.logger.info(
+                        "Insufficient live M15 data for %s chart. "
+                        "Text-only broadcast.", _symbol)
+
             sent = 0
             for user in subscribed:
                 tid = user['telegram_id']
@@ -1079,8 +1302,29 @@ class NixTradesScheduler:
 
                     if news_warn:
                         message += f"\n\n{news_warn}"
+                    _llm_ctx = setup_data.get('llm_context', '')
+                    if _llm_ctx:
+                        message += f"\n\n{_llm_ctx}"
 
                     try:
+                        # Chart images are a Basic+ feature.
+                        # Free-tier subscribers receive text-only alerts.
+                        from payment_handler import get_subscription_manager as _gsm
+                        _user_tier = _gsm().get_tier(tid)
+                        if chart_bytes and _user_tier in ('basic', 'pro', 'admin'):
+                            try:
+                                await self.bot.send_photo(
+                                    chat_id=tid,
+                                    photo=InputFile(
+                                        io.BytesIO(chart_bytes),
+                                        filename=f'setup_{signal_num}.png',
+                                    ),
+                                )
+                            except Exception as photo_err:
+                                self.logger.warning(
+                                    "Chart photo failed for user %d: %s. "
+                                    "Sending text only.", tid, photo_err)
+
                         await self.bot.send_message(chat_id=tid, text=message)
                         sent += 1
                     except Forbidden:
@@ -1376,8 +1620,13 @@ class NixTradesScheduler:
         """
         06:30 AM per-user timezone: market structure summary for the day ahead.
         Shows HTF trend and confidence for all major pairs.
+        Basic and higher subscribers only.
         """
         try:
+            from payment_handler import get_subscription_manager as _gsm
+            if _gsm().get_tier(telegram_id) == 'free':
+                return   # Daily briefing is a Basic feature — skip silently
+
             date_str = user_now.strftime('%A, %B %d, %Y')
             session  = utils.get_session()
 
@@ -1465,8 +1714,13 @@ class NixTradesScheduler:
         """
         08:00 AM per-user timezone: high-impact news events for today.
         Falls back gracefully if live news fetch fails.
+        Basic and higher subscribers only.
         """
         try:
+            from payment_handler import get_subscription_manager as _gsm
+            if _gsm().get_tier(telegram_id) == 'free':
+                return   # News alerts are a Basic feature — skip silently
+
             date_str = user_now.strftime('%A, %B %d, %Y')
 
             try:
@@ -1529,8 +1783,423 @@ class NixTradesScheduler:
         """
         Sunday 09:00 AM per-user timezone: weekly bias for all pairs
         plus key news events for the coming week.
+        Includes an LLM-generated macro and sentiment overview.
+        Pro and Admin subscribers only.
         """
         try:
+            from payment_handler import get_subscription_manager as _gsm
+            if _gsm().get_tier(telegram_id) not in ('pro', 'admin'):
+                return
+
+            date_str = user_now.strftime('%A, %B %d, %Y')
+
+            # ── Collect technical analysis for all pairs ─────────────────
+            _analysis_symbols = [
+                'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
+                'USDCAD', 'NZDUSD', 'XAUUSD', 'GBPJPY', 'EURJPY',
+            ]
+            pair_results = {}
+
+            try:
+                mt5_ok = await self.mt5.is_worker_reachable()
+            except Exception:
+                mt5_ok = False
+
+            if mt5_ok:
+                for symbol in _analysis_symbols:
+                    try:
+                        raw_mn1 = await self.mt5.get_historical_data(
+                            symbol, 'MN1', bars=24)
+                        raw_w1 = await self.mt5.get_historical_data(
+                            symbol, 'W1', bars=52)
+                        raw_d1 = await self.mt5.get_historical_data(
+                            symbol, 'D1', bars=300)
+
+                        if not raw_d1:
+                            pair_results[symbol] = {
+                                'mn1': 'N/A', 'w1': 'N/A',
+                                'd1': 'UNAVAILABLE', 'd1_conf': 0,
+                                'alignment': 'UNAVAILABLE',
+                                'bias': 'NEUTRAL',
+                            }
+                            continue
+
+                        d1_df  = self._candles_to_df(raw_d1)
+                        d1_htf = self.smc.determine_htf_trend(d1_df)
+                        d1_trend = d1_htf.get('trend', 'UNKNOWN')
+                        d1_conf  = int(d1_htf.get('confidence', 0))
+
+                        mn1_trend = 'N/A'
+                        w1_trend  = 'N/A'
+
+                        if raw_mn1 and len(raw_mn1) >= 10:
+                            mn1_df  = self._candles_to_df(raw_mn1)
+                            mn1_htf = self.smc.determine_htf_trend(mn1_df)
+                            mn1_trend = mn1_htf.get('trend', 'UNKNOWN')
+
+                        if raw_w1 and len(raw_w1) >= 10:
+                            w1_df  = self._candles_to_df(raw_w1)
+                            w1_htf = self.smc.determine_htf_trend(w1_df)
+                            w1_trend = w1_htf.get('trend', 'UNKNOWN')
+
+                        known = [
+                            t for t in [mn1_trend, w1_trend, d1_trend]
+                            if t not in ('UNKNOWN', 'N/A', 'RANGING')
+                        ]
+                        if len(known) >= 2 and len(set(known)) == 1:
+                            alignment = 'ALIGNED'
+                        elif len(known) >= 2 and len(set(known)) > 1:
+                            alignment = 'MIXED'
+                        else:
+                            alignment = 'RANGING'
+
+                        # Derive a plain-English bias from alignment + D1
+                        if alignment == 'ALIGNED' and d1_trend == 'BULLISH':
+                            bias = 'BUY'
+                        elif alignment == 'ALIGNED' and d1_trend == 'BEARISH':
+                            bias = 'SELL'
+                        elif alignment == 'MIXED':
+                            bias = 'WAIT'
+                        else:
+                            bias = 'NEUTRAL'
+
+                        pair_results[symbol] = {
+                            'mn1':       mn1_trend,
+                            'w1':        w1_trend,
+                            'd1':        d1_trend,
+                            'd1_conf':   d1_conf,
+                            'alignment': alignment,
+                            'bias':      bias,
+                        }
+
+                    except Exception as _sym_err:
+                        self.logger.warning(
+                            "Weekly analysis failed for %s: %s",
+                            symbol, _sym_err)
+                        pair_results[symbol] = {
+                            'mn1': 'N/A', 'w1': 'N/A',
+                            'd1': 'ERROR', 'd1_conf': 0,
+                            'alignment': 'UNAVAILABLE',
+                            'bias': 'NEUTRAL',
+                        }
+
+            # ── Fetch upcoming news ───────────────────────────────────────
+            news_lines = []
+            try:
+                events = self.news.get_red_folder_events(hours_ahead=168)
+                user_tz = user_now.tzinfo
+                import pytz
+                for ev in (events or [])[:8]:
+                    try:
+                        ev_utc = ev.timestamp
+                        if ev_utc.tzinfo is None:
+                            ev_utc = pytz.utc.localize(ev_utc)
+                        ev_local  = ev_utc.astimezone(user_tz)
+                        day_str   = ev_local.strftime('%a')
+                        time_str  = ev_local.strftime('%I:%M %p').lstrip('0')
+                        currency  = getattr(ev, 'currency', 'N/A')
+                        title     = getattr(ev, 'title', '')
+                        news_lines.append(
+                            f"  {day_str} {time_str:<8}  {currency:<4}  {title}"
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # ── LLM macro + sentiment + fundamental analysis ──────────────
+            llm_overview    = ''
+            llm_trade_plan  = ''
+            try:
+                llm_overview, llm_trade_plan = await self._get_llm_weekly_analysis(
+                    pair_results, news_lines, date_str)
+            except Exception as _llm_err:
+                self.logger.warning(
+                    "LLM weekly analysis failed for user %d: %s",
+                    telegram_id, _llm_err)
+
+            # Store the SMC bias from pair_results for use in daily scans.
+            # This is the advisory layer: LLM does not override SMC/ML,
+            # it provides a confirmation or conflict flag on each setup.
+            if pair_results:
+                for _sym, _r in pair_results.items():
+                    self._llm_weekly_bias[_sym] = _r.get('bias', 'NEUTRAL')
+                self.logger.info(
+                    "Weekly LLM bias stored for %d symbols.",
+                    len(pair_results))
+
+            # ── Build message ─────────────────────────────────────────────
+            lines = [
+                "WEEKLY MARKET ANALYSIS",
+                date_str,
+                "",
+            ]
+
+            # Macro overview (LLM block)
+            if llm_overview:
+                lines += [
+                    "MACRO AND SENTIMENT OVERVIEW",
+                    "",
+                    llm_overview,
+                    "",
+                ]
+
+            # Technical bias per pair
+            if pair_results:
+                lines += [
+                    "PAIR BIAS THIS WEEK",
+                    "(Monthly | Weekly | Daily — highest confidence timeframe wins)",
+                    "",
+                ]
+
+                # Bias icons for readability
+                _bias_icon = {
+                    'BUY':     'LONG  ',
+                    'SELL':    'SHORT ',
+                    'WAIT':    'WAIT  ',
+                    'NEUTRAL': 'NEUTRAL',
+                }
+                _align_icon = {
+                    'ALIGNED':     'ALIGNED',
+                    'MIXED':       'MIXED  ',
+                    'RANGING':     'RANGING',
+                    'UNAVAILABLE': 'N/A    ',
+                }
+
+                for symbol, r in pair_results.items():
+                    bias_str  = _bias_icon.get(r['bias'], 'NEUTRAL')
+                    align_str = _align_icon.get(r['alignment'], 'N/A    ')
+                    mn1 = r['mn1'][:4] if r['mn1'] not in ('N/A', 'UNKNOWN') else '----'
+                    w1  = r['w1'][:4]  if r['w1']  not in ('N/A', 'UNKNOWN') else '----'
+                    d1  = r['d1'][:4]  if r['d1']  not in ('N/A', 'UNKNOWN', 'ERROR', 'UNAVAILABLE') else '----'
+                    conf = r['d1_conf']
+
+                    lines.append(
+                        f"{symbol:<8}  [{bias_str}]  {align_str}"
+                    )
+                    lines.append(
+                        f"         MN1: {mn1:<4}  W1: {w1:<4}  D1: {d1:<4} ({conf}%)"
+                    )
+                    lines.append("")
+
+                lines += [
+                    "BIAS KEY",
+                    "  LONG    - Aligned bullish. Look for BUY setups on demand zones.",
+                    "  SHORT   - Aligned bearish. Look for SELL setups on supply zones.",
+                    "  WAIT    - Timeframes conflict. Reduce size or wait for clarity.",
+                    "  NEUTRAL - No clear direction. Avoid new positions.",
+                    "",
+                ]
+
+            # High-impact news this week
+            if news_lines:
+                lines += [
+                    "HIGH-IMPACT NEWS THIS WEEK",
+                    "(your local time)",
+                    "",
+                ]
+                lines.extend(news_lines)
+                lines.append("")
+
+            # LLM trade plan
+            if llm_trade_plan:
+                lines += [
+                    "WEEKLY TRADE PLAN",
+                    "",
+                    llm_trade_plan,
+                    "",
+                ]
+
+            lines += [
+                "TRADING GUIDELINES",
+                "",
+                "  - Only trade pairs with a clear LONG or SHORT bias",
+                "  - Avoid entries 30 min before and 15 min after red events",
+                "  - Best sessions: London Open (07:00 UTC) and New York Open (13:00 UTC)",
+                "  - WAIT and NEUTRAL pairs: stand aside until structure clarifies",
+                "",
+                "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.",
+                "Past performance is not indicative of future results.",
+                "",
+                config.FOOTER,
+            ]
+
+            message = utils.validate_user_message("\n".join(lines))
+            await self._safe_send(telegram_id, message)
+
+        except Exception as e:
+            self.logger.error(
+                "Error in _send_weekly_analysis for user %d: %s",
+                telegram_id, e, exc_info=True)
+
+    async def _get_llm_weekly_analysis(
+        self,
+        pair_results: dict,
+        news_lines: list,
+        date_str: str,
+    ) -> tuple:
+        """
+        Call Google Gemini (free tier) to generate a macro + sentiment +
+        fundamental overview and a weekly trade plan grounded in the
+        SMC technical data already collected.
+
+        Model: gemini-2.0-flash (free, 15 req/min, 1M tokens/day)
+        API key: config.GOOGLE_API_KEY from Google AI Studio (free)
+
+        Returns:
+            (overview_text: str, trade_plan_text: str)
+            Returns ('', '') on any failure — technical data still sends.
+        """
+        api_key = getattr(config, 'GOOGLE_API_KEY', '').strip()
+        if not api_key:
+            self.logger.info(
+                "GOOGLE_API_KEY not set. Skipping LLM analysis. "
+                "Add it to .env to enable macro commentary.")
+            return '', ''
+
+        try:
+            import httpx
+
+            # Build technical context string for the model
+            tech_lines = []
+            for symbol, r in pair_results.items():
+                tech_lines.append(
+                    f"{symbol}: Monthly={r['mn1']} Weekly={r['w1']} "
+                    f"Daily={r['d1']} ({r['d1_conf']}% confidence) "
+                    f"SMC_Bias={r['bias']} Alignment={r['alignment']}"
+                )
+            tech_summary = "\n".join(tech_lines) if tech_lines else "No data."
+            news_summary = (
+                "\n".join(news_lines[:8]) if news_lines
+                else "No high-impact events found this week."
+            )
+            daily_ctx = self._last_daily_context[:600] if self._last_daily_context else ''
+
+            system_prompt = (
+                "You are an institutional forex and commodity market analyst "
+                "for Nixie Trades, an algorithmic trading education platform "
+                "that uses Smart Money Concepts (SMC). "
+                "You write concise, professional, factual commentary that "
+                "combines macro fundamentals, central bank policy, market "
+                "sentiment, and SMC technical structure. "
+                "You never guarantee returns, never give direct buy/sell "
+                "instructions as financial advice, and always frame analysis "
+                "as educational content. "
+                "No markdown. No bullet symbols. No asterisks. "
+                "Short paragraphs only. Plain English suitable for Telegram. "
+                "Maximum 120 words per section."
+            )
+
+            user_prompt = (
+                f"Today is {date_str}.\n\n"
+                f"SMC TECHNICAL STRUCTURE (multi-timeframe):\n{tech_summary}\n\n"
+                f"HIGH-IMPACT ECONOMIC EVENTS THIS WEEK:\n{news_summary}\n\n"
+                + (f"RECENT DAILY BRIEFING CONTEXT:\n{daily_ctx}\n\n"
+                   if daily_ctx else "")
+                + "Provide TWO sections:\n\n"
+                "SECTION 1 - MACRO AND SENTIMENT (max 110 words):\n"
+                "Describe the macro and fundamental backdrop this week. "
+                "Cover central bank tone (Fed, ECB, BOE, BOJ), risk sentiment "
+                "(risk-on vs risk-off), USD strength or weakness, and commodity "
+                "drivers for Gold. Explain how the scheduled news events "
+                "could shift institutional order flow. Be specific.\n\n"
+                "SECTION 2 - WEEKLY TRADE PLAN (max 110 words):\n"
+                "Based on SMC alignment and the macro backdrop, describe "
+                "which pairs offer the highest-probability setups, which "
+                "to avoid, and why. Mention session timing (London, New York). "
+                "Do not give specific entry prices. "
+                "Frame as educational analysis only, not financial advice.\n\n"
+                "Format your response EXACTLY as:\n"
+                "MACRO_OVERVIEW: [section 1 text here]\n"
+                "TRADE_PLAN: [section 2 text here]"
+            )
+
+            url     = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-2.0-flash:generateContent?key={api_key}"
+            )
+            payload = {
+                "system_instruction": {
+                    "parts": [{"text": system_prompt}]
+                },
+                "contents": [
+                    {
+                        "role":  "user",
+                        "parts": [{"text": user_prompt}],
+                    }
+                ],
+                "generationConfig": {
+                    "maxOutputTokens": 600,
+                    "temperature":     0.30,
+                    "topP":            0.90,
+                },
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+
+            if resp.status_code != 200:
+                self.logger.warning(
+                    "Gemini API returned %d: %s",
+                    resp.status_code, resp.text[:300])
+                return '', ''
+
+            data      = resp.json()
+            raw_text  = ''
+            try:
+                raw_text = (
+                    data['candidates'][0]['content']['parts'][0]['text']
+                )
+            except (KeyError, IndexError, TypeError) as parse_err:
+                self.logger.warning(
+                    "Gemini response parse error: %s | raw: %s",
+                    parse_err, str(data)[:300])
+                return '', ''
+
+            # Parse the two named sections
+            overview   = ''
+            trade_plan = ''
+
+            if 'MACRO_OVERVIEW:' in raw_text and 'TRADE_PLAN:' in raw_text:
+                parts      = raw_text.split('TRADE_PLAN:', 1)
+                overview   = parts[0].replace('MACRO_OVERVIEW:', '').strip()
+                trade_plan = parts[1].strip()
+            elif 'MACRO_OVERVIEW:' in raw_text:
+                overview = raw_text.replace('MACRO_OVERVIEW:', '').strip()
+            else:
+                overview = raw_text.strip()
+
+            # Strip any markdown the model may emit despite instructions
+            for ch in ('**', '*', '`', '##', '#'):
+                overview   = overview.replace(ch, '')
+                trade_plan = trade_plan.replace(ch, '')
+
+            overview   = overview.strip()
+            trade_plan = trade_plan.strip()
+
+            self.logger.info(
+                "Gemini weekly analysis generated: overview=%d chars, "
+                "trade_plan=%d chars.",
+                len(overview), len(trade_plan))
+            return overview, trade_plan
+
+        except ImportError:
+            self.logger.warning(
+                "httpx not installed. Run: "
+                "pip install httpx --break-system-packages")
+            return '', ''
+        except Exception as exc:
+            self.logger.warning("Gemini API error: %s", exc)
+            return '', ''
+        try:
+            from payment_handler import get_subscription_manager as _gsm
+            if _gsm().get_tier(telegram_id) not in ('pro', 'admin'):
+                return   # Weekly analysis is a Pro feature — skip silently
+
             date_str = user_now.strftime('%A, %B %d, %Y')
 
             lines = [

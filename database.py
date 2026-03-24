@@ -945,3 +945,122 @@ def mark_messages_delivered(telegram_id: int) -> bool:
         'sent_at': datetime.now(timezone.utc).isoformat(),
     }).eq('telegram_id', telegram_id).eq('status', 'PENDING').execute()
     return True
+
+# ==================== SUBSCRIPTION TIER ====================
+
+@_db_retry()
+def get_subscription_tier(telegram_id: int) -> str:
+    """
+    Return the subscription tier string for a user.
+    Defaults to 'free' if the column is absent or null.
+    """
+    result = (
+        _client()
+        .table('telegram_users')
+        .select('subscription_tier')
+        .eq('telegram_id', telegram_id)
+        .execute()
+    )
+    if result.data and result.data[0].get('subscription_tier'):
+        return str(result.data[0]['subscription_tier'])
+    return 'free'
+
+
+@_db_retry()
+def set_subscription_tier(telegram_id: int, tier: str) -> bool:
+    """
+    Persist a subscription tier change after a confirmed payment.
+    Valid values: 'free', 'basic', 'pro'.
+    The 'admin' tier is never set via payment — it is determined at
+    runtime by config.ADMIN_USER_IDS membership.
+    """
+    valid = ('free', 'basic', 'pro')
+    if tier not in valid:
+        logger.error(
+            "Invalid subscription tier '%s' for user %d. "
+            "Must be one of: %s.", tier, telegram_id, valid)
+        return False
+
+    _client().table('telegram_users').update({
+        'subscription_tier': tier,
+        'updated_at':        datetime.now(timezone.utc).isoformat(),
+    }).eq('telegram_id', telegram_id).execute()
+    logger.info(
+        "Subscription tier set: user=%d tier=%s.", telegram_id, tier)
+    return True
+
+
+@_db_retry()
+def get_mt5_account_count(telegram_id: int) -> int:
+    """
+    Return the number of MT5 accounts currently connected for a user.
+    The current schema supports one active account per user at a time.
+    Returns 1 if connected, 0 if not.
+    """
+    result = (
+        _client()
+        .table('telegram_users')
+        .select('mt5_connected')
+        .eq('telegram_id', telegram_id)
+        .execute()
+    )
+    if not result.data:
+        return 0
+    return 1 if result.data[0].get('mt5_connected') else 0
+
+
+# ==================== SUBSCRIPTION TIER ====================
+
+@_db_retry()
+def get_subscription_tier(telegram_id: int) -> str:
+    """
+    Return the subscription tier for a user.
+    Possible values: 'free', 'basic', 'pro'.
+    Admins are identified by config.ADMIN_USER_IDS at the call site.
+    """
+    result = (
+        _client()
+        .table('telegram_users')
+        .select('subscription_tier')
+        .eq('telegram_id', telegram_id)
+        .execute()
+    )
+    if result.data:
+        return result.data[0].get('subscription_tier') or 'free'
+    return 'free'
+
+
+@_db_retry()
+def set_subscription_tier(telegram_id: int, tier: str) -> bool:
+    """
+    Set the subscription tier for a user.
+    Valid tiers: 'free', 'basic', 'pro', 'admin'.
+    """
+    valid = ('free', 'basic', 'pro', 'admin')
+    if tier not in valid:
+        tier = 'free'
+    _client().table('telegram_users').update({
+        'subscription_tier': tier,
+        'updated_at':        datetime.now(timezone.utc).isoformat(),
+    }).eq('telegram_id', telegram_id).execute()
+    logger.info("Subscription tier set to '%s' for user %d.", tier, telegram_id)
+    return True
+
+
+@_db_retry()
+def get_mt5_account_count(telegram_id: int) -> int:
+    """
+    Return the number of MT5 accounts currently connected for a user.
+    In the current single-account schema this is 0 or 1.
+    Multi-account support requires a dedicated mt5_accounts table.
+    """
+    result = (
+        _client()
+        .table('telegram_users')
+        .select('mt5_connected')
+        .eq('telegram_id', telegram_id)
+        .execute()
+    )
+    if result.data:
+        return 1 if result.data[0].get('mt5_connected') else 0
+    return 0

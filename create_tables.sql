@@ -492,3 +492,18 @@ $$;
 
 ALTER TABLE telegram_users
     ADD COLUMN IF NOT EXISTS metaapi_account_id TEXT;
+
+-- ==================== SUBSCRIPTION TIER ====================
+-- Stores which payment plan the user is on.
+-- Values: 'free' (default), 'basic' ($30), 'pro' ($100), 'admin'
+
+ALTER TABLE telegram_users
+    ADD COLUMN IF NOT EXISTS subscription_tier TEXT NOT NULL DEFAULT 'free';
+
+-- Index for fast tier lookups during broadcast
+CREATE INDEX IF NOT EXISTS idx_telegram_users_subscription_tier
+    ON telegram_users (subscription_tier);
+
+ALTER TABLE telegram_users
+    ADD COLUMN IF NOT EXISTS subscription_tier TEXT NOT NULL DEFAULT 'free'
+    CHECK (subscription_tier IN ('free', 'basic', 'pro', 'admin'));

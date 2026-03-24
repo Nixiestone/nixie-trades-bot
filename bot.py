@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import sys
 from typing import Optional
@@ -26,6 +27,12 @@ import config
 import utils
 import database as db
 from mt5_connector import MT5Connector
+from chart_generator import ChartGenerator as _ChartGenerator
+
+# Module-level cache for the sample chart PNG.
+# Generated once on first /start or /help call and reused thereafter.
+_SAMPLE_CHART_BYTES: Optional[bytes] = None
+from payment_handler import get_subscription_manager
 from smc_strategy import SMCStrategy
 from ml_models import MLEnsemble
 from position_monitor import PositionMonitor
@@ -501,7 +508,10 @@ class NixTradesBot:
         app.add_handler(CommandHandler('test_news',     self.cmd_test_news))
         app.add_handler(CommandHandler('test_weekly',   self.cmd_test_weekly))
         app.add_handler(CommandHandler('test_scan',     self.cmd_test_scan))
-   
+        app.add_handler(CommandHandler('upgrade',       self.cmd_upgrade))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_upgrade_plan, pattern=r'^upgrade_(basic|pro)_(paystack|stripe|bybit)$'
+        ))
 
         self.logger.info("All handlers registered.")
 
@@ -637,9 +647,39 @@ class NixTradesBot:
             telegram_id = update.effective_user.id
             self._ensure_user(telegram_id, update)
             await self._reply(update, self._format(config.WELCOME_MESSAGE))
+
+            # Generate and send sample chart image (cached after first call)
+            global _SAMPLE_CHART_BYTES
+            if _SAMPLE_CHART_BYTES is None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    _SAMPLE_CHART_BYTES = await loop.run_in_executor(
+                        None, _ChartGenerator.generate_sample_chart)
+                except Exception as _sc_err:
+                    self.logger.debug("Sample chart generation skipped: %s", _sc_err)
+
+            if _SAMPLE_CHART_BYTES:
+                try:
+                    from telegram import InputFile as _InputFile
+                    await update.effective_message.reply_photo(
+                        photo=_InputFile(
+                            io.BytesIO(_SAMPLE_CHART_BYTES),
+                            filename='sample_setup.png',
+                        ),
+                        caption=(
+                            "Sample chart markup — EURUSD LONG\n"
+                            "Order Block (amber), Entry (blue), "
+                            "Stop Loss (red), TP1 and TP2 (green).\n"
+                            "This is what every setup alert will include."
+                        ),
+                    )
+                except Exception as _photo_err:
+                    self.logger.debug(
+                        "Sample chart photo send failed: %s", _photo_err)
+
             await self._reply(
                 update,
-                "Here is a sample of what an automated setup alert looks like:\n\n"
+                "Here is a sample of what the text alert looks like:\n\n"
                 + SAMPLE_SETUP_ALERT
             )
             await self._deliver_queued_messages(telegram_id)
@@ -654,6 +694,34 @@ class NixTradesBot:
             return
         try:
             telegram_id = update.effective_user.id
+            # Send sample chart so users immediately see what alerts look like
+            global _SAMPLE_CHART_BYTES
+            if _SAMPLE_CHART_BYTES is None:
+                try:
+                    loop = asyncio.get_running_loop()
+                    _SAMPLE_CHART_BYTES = await loop.run_in_executor(
+                        None, _ChartGenerator.generate_sample_chart)
+                except Exception as _sc_err:
+                    self.logger.debug("Sample chart skipped in /help: %s", _sc_err)
+
+            if _SAMPLE_CHART_BYTES:
+                try:
+                    from telegram import InputFile as _InputFile
+                    await update.effective_message.reply_photo(
+                        photo=_InputFile(
+                            io.BytesIO(_SAMPLE_CHART_BYTES),
+                            filename='sample_setup.png',
+                        ),
+                        caption=(
+                            "Sample setup chart — EURUSD LONG\n"
+                            "Basic and Pro subscribers receive a chart "
+                            "like this with every setup alert."
+                        ),
+                    )
+                except Exception as _photo_err:
+                    self.logger.debug(
+                        "Sample chart /help send failed: %s", _photo_err)
+
             await self._reply(update, self._format(config.HELP_MESSAGE))
             await self._deliver_queued_messages(telegram_id)
         except Exception as e:
@@ -907,6 +975,34 @@ class NixTradesBot:
             success, result = await self.mt5.verify_credentials(telegram_id, login, password, raw)
 
             if success and isinstance(result, dict):
+                # ---- Account limit check ----
+                sub_mgr   = get_subscription_manager()
+                can_add, limit_reason = sub_mgr.can_add_account(telegram_id)
+                if not can_add:
+                    await self._reply(
+                        update,
+                        utils.validate_user_message(
+                            "Account connection blocked.\n\n"
+                            f"{limit_reason}\n\n"
+                            f"{config.FOOTER}"
+                        ),
+                    )
+                    return ConversationHandler.END
+
+                # ---- Foreign currency check (Pro and Admin only) ----
+                account_currency = result.get('currency', 'USD')
+                if account_currency != 'USD' and not sub_mgr.can_use_foreign_currency(telegram_id):
+                    await self._reply(
+                        update,
+                        utils.validate_user_message(
+                            f"Non-USD accounts ({account_currency}) require a Pro subscription.\n\n"
+                            "Upgrade to Pro ($100/month) to connect accounts in any currency.\n"
+                            "Use /upgrade to continue.\n\n"
+                            f"{config.FOOTER}"
+                        ),
+                    )
+                    return ConversationHandler.END
+
                 db.save_mt5_credentials(
                     telegram_id=telegram_id,
                     login=login,
@@ -914,7 +1010,7 @@ class NixTradesBot:
                     server=raw,
                     broker_name=result.get('broker', ''),
                     balance=result.get('balance', 0.0),
-                    currency=result.get('currency', 'USD'),
+                    currency=account_currency,
                     metaapi_account_id=result.get('metaapi_account_id', ''),
                 )
                 masked = f"****{str(login)[-4:]}"
@@ -1167,6 +1263,21 @@ class NixTradesBot:
         try:
             telegram_id = update.effective_user.id
             user        = db.get_user(telegram_id)
+
+            from payment_handler import get_subscription_manager as _gsm
+            if _gsm().get_tier(telegram_id) == 'free':
+                await self._reply(
+                    update,
+                    utils.validate_user_message(
+                        "Settings and execution preferences require a Basic "
+                        "or higher subscription.\n\n"
+                        "Use /upgrade to view plans and unlock risk settings, "
+                        "timezone configuration, and automated trade execution.\n\n"
+                        f"{config.FOOTER}"
+                    )
+                )
+                return ConversationHandler.END
+
             current     = (
                 user.get('risk_percent', config.DEFAULT_RISK_PERCENT)
                 if user else config.DEFAULT_RISK_PERCENT
@@ -1832,6 +1943,21 @@ class NixTradesBot:
             )
             return
 
+        from payment_handler import get_subscription_manager as _gsm
+        _tier = _gsm().get_tier(telegram_id)
+        if _tier == 'free':
+            await self._reply(
+                update,
+                utils.validate_user_message(
+                    "Downloading your trading history requires a Basic or "
+                    "higher subscription.\n\n"
+                    "Use /upgrade to unlock trading records, performance "
+                    "analytics, and CSV exports.\n\n"
+                    f"{config.FOOTER}"
+                )
+            )
+            return
+
         is_admin = telegram_id in config.ADMIN_USER_IDS
 
         await self._reply(update, "Generating your CSV files. Please wait...")
@@ -2040,6 +2166,132 @@ class NixTradesBot:
         except Exception as e:
             self.logger.error(
                 "Error sending trade notification to user %d: %s", telegram_id, e
+            )
+
+
+# ==================== UPGRADE / PAYMENT COMMANDS ====================
+
+    async def cmd_upgrade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /upgrade — show subscription plans with payment buttons."""
+        if not self._check_rate_limit(update):
+            await self._reply(update, "You are sending commands too quickly. Please wait a moment.")
+            return
+
+        telegram_id  = update.effective_user.id
+        user         = db.get_user(telegram_id)
+        sub_mgr      = get_subscription_manager()
+        current_tier = sub_mgr.get_tier(telegram_id)
+
+        from payment_handler import TIER_DISPLAY_NAMES
+        tier_name = TIER_DISPLAY_NAMES.get(current_tier, current_tier.capitalize())
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "Basic - $30/month (1 account)",
+                    callback_data='upgrade_basic_paystack',
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Pro - $100/month (3 accounts + any currency)",
+                    callback_data='upgrade_pro_paystack',
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Pay via Stripe (card)",
+                    callback_data='upgrade_basic_stripe',
+                ),
+                InlineKeyboardButton(
+                    "Pay via Bybit (crypto)",
+                    callback_data='upgrade_basic_bybit',
+                ),
+            ],
+        ])
+
+        await self._reply(
+            update,
+            utils.validate_user_message(
+                "NIXIE TRADES SUBSCRIPTION PLANS\n\n"
+                f"Your current plan: {tier_name}\n\n"
+                "BASIC - $30 per month\n"
+                "  - 1 MT5 account connection\n"
+                "  - All automated setup alerts\n"
+                "  - Auto-execution and position management\n\n"
+                "PRO - $100 per month\n"
+                "  - Up to 3 MT5 account connections\n"
+                "  - All Basic features\n"
+                "  - Accounts in any currency (USD, EUR, GBP, NGN, etc.)\n"
+                "  - Priority support\n\n"
+                "ADMIN - Free (staff only)\n"
+                "  - Unlimited accounts\n"
+                "  - All features\n\n"
+                "Select a plan below to generate a secure payment link.\n"
+                "Subscription is activated automatically within minutes of payment.\n\n"
+                f"Questions? Contact {config.SUPPORT_CONTACT}\n\n"
+                f"{config.FOOTER}"
+            ),
+            reply_markup=keyboard,
+        )
+
+    async def callback_upgrade_plan(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle upgrade plan + provider selection from inline keyboard."""
+        query = update.callback_query
+        await query.answer()
+
+        telegram_id = query.from_user.id
+        parts       = query.data.split('_')
+        if len(parts) < 3:
+            await query.edit_message_text("Invalid selection. Please use /upgrade again.")
+            return
+
+        tier     = parts[1]   # 'basic' or 'pro'
+        provider = parts[2]   # 'paystack', 'stripe', 'bybit'
+
+        sub_mgr  = get_subscription_manager()
+        info     = sub_mgr.generate_payment_link(
+            telegram_id=telegram_id,
+            tier=tier,
+            provider=provider,
+        )
+
+        if info and info.get('url'):
+            from payment_handler import TIER_PRICES_USD, TIER_DISPLAY_NAMES
+            amount    = TIER_PRICES_USD.get(tier, 0)
+            plan_name = TIER_DISPLAY_NAMES.get(tier, tier.capitalize())
+            provider_label = {'paystack': 'Paystack', 'stripe': 'Stripe', 'bybit': 'Bybit'}.get(provider, provider)
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"Pay ${amount}/month via {provider_label}",
+                    url=info['url'],
+                ),
+            ]])
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "PAYMENT LINK READY\n\n"
+                    f"Plan:      {plan_name}\n"
+                    f"Amount:    ${amount} per month\n"
+                    f"Provider:  {provider_label}\n\n"
+                    "Tap the button below to complete your payment securely.\n\n"
+                    "Your subscription activates automatically within a few minutes "
+                    "of payment confirmation. You will receive a Telegram notification.\n\n"
+                    f"Reference: {info.get('reference', 'N/A')}\n\n"
+                    f"Support: {config.SUPPORT_CONTACT}\n\n"
+                    f"{config.FOOTER}"
+                ),
+                reply_markup=keyboard,
+            )
+        else:
+            await query.edit_message_text(
+                utils.validate_user_message(
+                    "Payment link could not be generated at this time.\n\n"
+                    f"Please contact {config.SUPPORT_CONTACT} for assistance.\n\n"
+                    f"{config.FOOTER}"
+                )
             )
 
 
