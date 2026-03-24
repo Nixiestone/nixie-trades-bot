@@ -52,3 +52,4 @@ python-telegram-bot==21.0
 
 
 metaapi-cloud-sdk
+stripe==7.10.0

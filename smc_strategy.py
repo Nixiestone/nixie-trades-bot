@@ -314,7 +314,8 @@ class SMCStrategy:
         data: pd.DataFrame,
         direction: str,
         htf_swing_high: float,
-        htf_swing_low: float
+        htf_swing_low: float,
+        symbol: str = 'EURUSD',
     ) -> List[Dict]:
         """
         Detect Breaker Blocks (failed support/resistance zones).
@@ -357,6 +358,10 @@ class SMCStrategy:
                         pullback_low = next_candles['low'].min()
                         
                         if pullback_low >= candle['low'] * 0.995:  # Within 0.5%
+                            _bb_pip_sz = utils.get_pip_value(symbol)
+                            if _bb_pip_sz <= 0:
+                                _bb_pip_sz = 0.0001
+                            _bb_impulse = max((candle['close'] - resistance) / _bb_pip_sz, 0.0)
                             breakers.append({
                                 'type': 'BB',
                                 'direction': direction,
@@ -365,6 +370,8 @@ class SMCStrategy:
                                 'high': candle['high'],
                                 'low': candle['low'],
                                 'breaker_level': resistance,
+                                'volume_ratio': _candle_vol_ratio,
+                                'impulse_pips': _bb_impulse,
                                 'confidence': 75
                             })
                 
@@ -378,6 +385,10 @@ class SMCStrategy:
                         pullback_high = next_candles['high'].max()
                         
                         if pullback_high <= candle['high'] * 1.005:
+                            _bb_pip_sz = utils.get_pip_value(symbol)
+                            if _bb_pip_sz <= 0:
+                                _bb_pip_sz = 0.0001
+                            _bb_impulse = max((support - candle['close']) / _bb_pip_sz, 0.0)
                             breakers.append({
                                 'type': 'BB',
                                 'direction': direction,
@@ -386,6 +397,8 @@ class SMCStrategy:
                                 'high': candle['high'],
                                 'low': candle['low'],
                                 'breaker_level': support,
+                                'volume_ratio': _candle_vol_ratio,
+                                'impulse_pips': _bb_impulse,
                                 'confidence': 75
                             })
             

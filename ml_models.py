@@ -297,7 +297,8 @@ class MLEnsemble:
         _cnt_no_poi      = 0
         _cnt_bad_entry   = 0
         _cnt_low_quality = 0
-        _cnt_no_label    = 0
+        _cnt_unfilled    = 0  # Limit order never reached entry price — no trade in live either
+        _cnt_no_label    = 0  # Order filled but neither TP nor SL reached within expiry
         _cnt_labeled     = 0
 
         # Suppress INFO-level logs from SMC detection functions during training.
@@ -401,7 +402,12 @@ class MLEnsemble:
                 if poi is None or setup_type is None:
                     _cnt_no_poi += 1
                     continue
-                
+
+                # Reject mitigated POIs — live scanner never trades them.
+                if self.smc.is_poi_mitigated(poi, h1_ctx):
+                    _cnt_no_poi += 1
+                    continue
+
                 # --- Phase 3: Entry/SL via real SMC ---
                 try:
                     atr_val    = self.smc._calculate_atr(m15_win.tail(20))
@@ -458,7 +464,7 @@ class MLEnsemble:
                 # (8 hours x 4 bars per hour = 32 bars).
                 # Using 80 bars (20 hours) incorrectly includes price action that
                 # occurs after a real order would have expired, inflating WIN rate.
-                _expiry_bars = 64  # Non-overlapping windows with forward_bars=32 to avoid label autocorrelation
+                _expiry_bars = 32  # Matches live H1 setup expiry of 8 hours on M15 (4 bars per hour)
                 future = m15_df.iloc[i: i + _expiry_bars]
                 if len(future) < 10:
                     continue
@@ -469,13 +475,35 @@ class MLEnsemble:
                 target_reward = risk * config.MIN_RR_TP2
                 is_buy = direction == 'BULLISH'
 
-                # Chronological bar-by-bar scan. The FIRST level reached determines
-                # the label. Checking max/min over the whole window simultaneously
-                # corrupts labels when price eventually touches both levels in any order.
-                label          = None
-                _tp_price      = (entry + target_reward) if is_buy else (entry - target_reward)
+                # Step 1: Verify the limit order would have filled.
+                # In live trading the entry is a limit order placed at the zone
+                # boundary. If price never pulls back to that level, the order
+                # expires unfilled. Labeling those windows as WIN or LOSS would
+                # teach the model that entries execute when they do not.
+                entry_filled_at = None
+                for _fill_idx, _bar in enumerate(future.itertuples()):
+                    if is_buy and float(_bar.low) <= entry:
+                        entry_filled_at = _fill_idx
+                        break
+                    if not is_buy and float(_bar.high) >= entry:
+                        entry_filled_at = _fill_idx
+                        break
 
-                for _bar in future.itertuples():
+                if entry_filled_at is None:
+                    # Price never reached entry zone — limit order expired unfilled.
+                    # This would be a no-trade in live. Discard the window.
+                    _cnt_unfilled += 1
+                    continue
+
+                # Step 2: From the fill bar onward, track TP or SL chronologically.
+                # The FIRST level reached determines the label.
+                # Checking max/min over the whole window simultaneously corrupts
+                # labels when price touches both levels in an unknown sequence.
+                label     = None
+                _tp_price = (entry + target_reward) if is_buy else (entry - target_reward)
+                post_fill = future.iloc[entry_filled_at:]
+
+                for _bar in post_fill.itertuples():
                     if is_buy:
                         if float(_bar.high) >= _tp_price:
                             label = 1.0   # TP reached first
@@ -511,10 +539,10 @@ class MLEnsemble:
         self.logger.info(
             "%s sample generation summary: "
             "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
-            "bad_entry=%d  low_quality=%d  inconclusive=%d  labeled=%d",
+            "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
             symbol,
             _cnt_total, _cnt_asian, _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
-            _cnt_bad_entry, _cnt_low_quality, _cnt_no_label, _cnt_labeled
+            _cnt_bad_entry, _cnt_low_quality, _cnt_unfilled, _cnt_no_label, _cnt_labeled
         )
 
         return feats, labels
@@ -540,7 +568,7 @@ class MLEnsemble:
 
             ok1 = self._fit_xgboost(X_tr_s, y_tr, X_te_s, y_te)
             ok2 = self._fit_lstm_sub(X_tr_s, y_tr, X_te_s, y_te)
-            ok3 = self._fit_random_forest(X_tr_s, y_tr, X_te_s, y_te)
+            self._fit_random_forest(X_tr_s, y_tr, X_te_s, y_te)
 
             if not (ok1 and ok2):
                 return False
@@ -567,8 +595,9 @@ class MLEnsemble:
                 'reg_alpha':        0.5,
                 'reg_lambda':       3.0,
                 'eval_metric':      'auc',
+                'scale_pos_weight': float(np.sum(y_tr == 0)) / max(float(np.sum(y_tr == 1)), 1.0),
                 'seed':             42,
-            }
+                }
             self.xgboost_model = xgb.train(
                 params, dtrain, num_boost_round=500,
                 evals=[(dtest, 'test')], early_stopping_rounds=50,

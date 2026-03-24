@@ -504,7 +504,8 @@ class NixTradesScheduler:
                 breakers   = self.smc.detect_breaker_blocks(
                     h1_df, htf_trend['trend'],
                     htf_trend.get('swing_high', 0),
-                    htf_trend.get('swing_low', 0))
+                    htf_trend.get('swing_low', 0),
+                    symbol=symbol)
                 if breakers:
                     all_candidates = breakers
                     self.logger.debug(
@@ -537,7 +538,8 @@ class NixTradesScheduler:
                     breakers = self.smc.detect_breaker_blocks(
                         h1_df, mss_event['direction'],
                         htf_trend.get('swing_high', 0),
-                        htf_trend.get('swing_low', 0))
+                        htf_trend.get('swing_low', 0),
+                        symbol=symbol)
                     all_candidates = breakers
                     self.logger.info(
                         "%s MSS: No Order Blocks found. "
