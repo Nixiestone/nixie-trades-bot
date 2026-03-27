@@ -1,19 +1,18 @@
 """
-Nixie Trades - Chart Generator
-Role: Quant Software Engineer + Lead Architect
+Nixie Trades - Chart Generator v2
+Role: Quant Software Engineer
 
-Generates annotated M15 candlestick chart images for setup alerts.
-Live OHLCV data is passed in by the scheduler (fetched from MetaApi or MT5 worker).
+TradingView-dark-style annotated M15 candlestick chart for setup alerts.
+Live OHLCV data is passed in by the scheduler (MetaApi or MT5 worker).
 
-Markups drawn (all at exact price coordinates):
-  - Order Blocks        : amber (bullish) / rose-red (bearish)
-  - Breaker Blocks      : emerald (bullish) / violet (bearish)
-  - Fair Value Gaps     : semi-transparent horizontal bands
-  - Break of Structure  : dashed purple horizontal lines
-  - Entry / SL / TP1 / TP2 price level lines
-
-Watermark: "NIXIE TRADES" centred behind candles, TradingView-style.
-Output:    optimised PNG, target <= 250 KB.
+Changes from v1:
+  - 150 DPI (was 80) — eliminates blur on all screen sizes
+  - Full price axis on the right with all levels visible like TradingView
+  - Visible shaded SMC zone boxes with thick coloured borders
+  - Correct zone geometry: zones extend from formation bar to right edge
+  - Entry / SL / TP lines with price labels that never overlap
+  - NIXIE TRADES watermark behind candles at low opacity
+  - PIL post-processing at compress_level=7, RGB output, target <= 300 KB
 """
 
 import io
@@ -23,23 +22,17 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-# Non-interactive backend must be set BEFORE importing pyplot on headless servers.
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
-from matplotlib.collections import LineCollection
 
 try:
     from PIL import Image as _PIL_Image
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
-    logging.getLogger(__name__).info(
-        "Pillow not installed. PNG optimisation will be skipped. "
-        "Run: pip install Pillow --break-system-packages"
-    )
 
 import config
 import utils
@@ -49,64 +42,50 @@ logger = logging.getLogger(__name__)
 
 class ChartGenerator:
     """
-    Renders annotated dark-theme candlestick charts for Nixie Trades setup alerts.
-
-    Design principle: every markup is drawn at its raw float price so that
-    the visual matches the signal numbers exactly — no rounding artefacts.
-
-    Usage (called from scheduler after fetching live data):
-        cg = ChartGenerator()
-        png_bytes = cg.generate_setup_chart(live_df, setup_data, poi, ...)
+    Renders annotated dark-theme candlestick charts for Nixie Trades alerts.
+    Every markup is drawn at its raw float price so that the visual
+    matches the signal numbers exactly.
     """
 
-    # ── Figure dimensions ─────────────────────────────────────────────────────
-    # 11 x 6.5 inches at 80 DPI = 880 x 520 px — ideal for Telegram's 800 px wide display.
-    FIG_W  = 11.0
-    FIG_H  = 6.5
-    DPI    = 80
+    # Figure dimensions: 12 x 7 inches at 150 DPI = 1800 x 1050 px
+    FIG_W = 12.0
+    FIG_H = 7.0
+    DPI   = 150
 
-    # ── TradingView-style dark colour palette ─────────────────────────────────
-    C_BG        = '#131722'
-    C_GRID      = '#1f2533'
-    C_BORDER    = '#2a2e39'
-    C_TEXT      = '#d1d4dc'
-    C_TEXT_DIM  = '#6b7280'
+    # TradingView dark colour palette
+    C_BG       = '#131722'
+    C_GRID     = '#1e2235'
+    C_BORDER   = '#2a2e39'
+    C_TEXT     = '#d1d4dc'
+    C_TEXT_DIM = '#787b86'
 
-    # Candles
-    C_UP    = '#26a69a'   # teal  (bullish)
-    C_DOWN  = '#ef5350'   # red   (bearish)
+    C_UP   = '#26a69a'
+    C_DOWN = '#ef5350'
 
-    # SMC zones
-    C_OB_BULL  = '#f59e0b'   # amber
-    C_OB_BEAR  = '#f43f5e'   # rose-red
-    C_BB_BULL  = '#10b981'   # emerald green
-    C_BB_BEAR  = '#8b5cf6'   # violet
-    C_FVG_BULL = '#22c55e'   # green
-    C_FVG_BEAR = '#ef4444'   # red
-    C_BOS      = '#7c3aed'   # deep purple
+    C_OB_BULL  = '#f59e0b'
+    C_OB_BEAR  = '#f43f5e'
+    C_BB_BULL  = '#10b981'
+    C_BB_BEAR  = '#a855f7'
+    C_FVG_BULL = '#22c55e'
+    C_FVG_BEAR = '#ef4444'
+    C_BOS_LINE = '#7c3aed'
 
-    # Price level lines
-    C_ENTRY = '#60a5fa'   # sky blue
-    C_SL    = '#ef4444'   # red
-    C_TP1   = '#4ade80'   # light green
-    C_TP2   = '#16a34a'   # dark green
+    C_ENTRY = '#60a5fa'
+    C_SL    = '#ef4444'
+    C_TP1   = '#4ade80'
+    C_TP2   = '#16a34a'
 
-    # ── Zone opacity ─────────────────────────────────────────────────────────
-    A_OB_FILL  = 0.14
-    A_BB_FILL  = 0.16
-    A_FVG_FILL = 0.09
-    A_ZONE_EDGE = 0.65
+    ZONE_FILL_ALPHA   = 0.22
+    ZONE_BORDER_ALPHA = 0.92
+    ZONE_BORDER_LW    = 1.8
+    FVG_FILL_ALPHA    = 0.12
 
-    # ── Candle geometry ───────────────────────────────────────────────────────
-    BODY_W = 0.50   # fraction of one bar slot
-    WICK_W = 0.80   # linewidth in points for wicks
+    BODY_W  = 0.52
+    WICK_LW = 1.0
 
-    # ── Right-side label margin (in bar units) ────────────────────────────────
-    # Allows entry/SL/TP labels to be printed without clipping.
-    X_RIGHT_MARGIN = 8
-
-    # ── How many bars to display on the chart ────────────────────────────────
-    DISPLAY_BARS = 75
+    DISPLAY_BARS   = 80
+    LABEL_OFFSET   = 7
+    Y_PAD_FRACTION = 0.06
 
     def generate_setup_chart(
         self,
@@ -122,16 +101,14 @@ class ChartGenerator:
 
         Args:
             data:            Live M15 OHLCV DataFrame with UTC DatetimeIndex.
-                             Passed in fresh from MetaApi or MT5 worker by scheduler.
-            setup_data:      Setup alert dict containing entry, stop_loss,
-                             take_profit_1, take_profit_2, direction, symbol, etc.
-            poi:             Primary Point of Interest (OB or BB) dict.
+            setup_data:      Setup alert dict (entry, stop_loss, tp1, tp2).
+            poi:             Primary Point of Interest dict.
             additional_pois: Up to 4 extra unmitigated zone dicts.
-            fvgs:            Fair Value Gap dicts from detect_fair_value_gaps().
-            bos_events:      BOS event dicts from detect_break_of_structure().
+            fvgs:            FVG dicts from detect_fair_value_gaps().
+            bos_events:      BOS dicts from detect_break_of_structure().
 
         Returns:
-            PNG image as bytes if successful, None if rendering fails.
+            PNG bytes or None on failure.
         """
         if data is None or len(data) < 10:
             logger.warning(
@@ -139,85 +116,61 @@ class ChartGenerator:
                 len(data) if data is not None else 0)
             return None
 
-        if not isinstance(data.index, pd.DatetimeIndex):
-            logger.warning("Chart skipped: data has no DatetimeIndex.")
-            return None
-
         try:
-            plot_df = data.tail(self.DISPLAY_BARS).copy().reset_index(drop=False)
-            # Keep 'time' column for label formatting; reset index to integer positions.
-            if 'time' not in plot_df.columns and isinstance(data.index, pd.DatetimeIndex):
-                plot_df.insert(0, 'time', data.tail(self.DISPLAY_BARS).index)
-
-            n = len(plot_df)
+            tail       = data.tail(self.DISPLAY_BARS).copy()
+            time_index = list(tail.index)
+            tail       = tail.reset_index(drop=True)
+            n          = len(tail)
+            x_right    = n + self.LABEL_OFFSET
+            symbol     = setup_data.get('symbol', 'FOREX')
+            decimals   = self._price_decimals(symbol)
 
             fig, (ax, ax_vol) = plt.subplots(
                 2, 1,
                 figsize=(self.FIG_W, self.FIG_H),
                 dpi=self.DPI,
-                gridspec_kw={'height_ratios': [5, 1], 'hspace': 0},
+                gridspec_kw={'height_ratios': [5.5, 1], 'hspace': 0},
                 facecolor=self.C_BG,
             )
+            fig.subplots_adjust(
+                left=0.005, right=0.84, top=0.915, bottom=0.04)
 
-            # ─ Style axes ──────────────────────────────────────────────────
-            self._style_ax(ax)
-            self._style_ax(ax_vol)
+            y_min, y_max = self._compute_y_range(tail, setup_data)
 
-            # ─ Compute y-range from candles + level lines ─────────────────
-            y_min, y_max = self._compute_y_range(plot_df, setup_data)
-            ax.set_ylim(y_min, y_max)
-            ax.set_xlim(-0.5, n - 0.5 + self.X_RIGHT_MARGIN)
+            self._style_main_ax(ax, y_min, y_max, n, x_right, decimals)
+            self._style_vol_ax(ax_vol, n, x_right)
 
-            ax_vol.set_xlim(-0.5, n - 0.5 + self.X_RIGHT_MARGIN)
+            self._draw_watermark(ax, symbol)
 
-            # ─ Grid ────────────────────────────────────────────────────────
-            self._draw_grid(ax, n, y_min, y_max)
-
-            # ─ Watermark (zorder 2 — behind zones and candles) ───────────
-            self._draw_watermark(ax, setup_data.get('symbol', ''))
-
-            # ─ SMC overlays (zorder 3–4) ──────────────────────────────────
             if fvgs:
-                self._draw_fvgs(ax, plot_df, fvgs, n, y_min, y_max)
+                for fvg in fvgs:
+                    self._draw_fvg(ax, fvg, time_index, n, x_right,
+                                   y_min, y_max)
 
             if bos_events:
-                self._draw_bos(ax, bos_events, n)
+                self._draw_bos_lines(ax, bos_events)
 
-            if additional_pois:
-                for extra in (additional_pois or [])[:4]:
-                    self._draw_zone(ax, plot_df, extra, n, primary=False)
+            for extra in (additional_pois or [])[:4]:
+                self._draw_zone(ax, extra, time_index, n, x_right,
+                                primary=False)
 
             if poi:
-                self._draw_zone(ax, plot_df, poi, n, primary=True)
+                self._draw_zone(ax, poi, time_index, n, x_right,
+                                primary=True)
 
-            # ─ Price level lines (zorder 6) ────────────────────────────────
-            self._draw_levels(ax, setup_data, n)
-
-            # ─ Candles (zorder 5) ─────────────────────────────────────────
-            self._draw_candles(ax, plot_df)
-
-            # ─ Volume sub-panel ───────────────────────────────────────────
-            self._draw_volume(ax_vol, plot_df, n)
-
-            # ─ Time labels on x-axis ──────────────────────────────────────
-            self._draw_time_labels(ax, plot_df, n)
-
-            # ─ Header ─────────────────────────────────────────────────────
+            self._draw_price_levels(ax, setup_data, n, x_right,
+                                    decimals, y_min, y_max)
+            self._draw_candles(ax, tail)
+            self._draw_volume(ax_vol, tail, n)
+            self._draw_time_labels(ax, tail, time_index, n, y_min)
             self._draw_header(fig, setup_data)
 
-            # ─ Render to bytes ────────────────────────────────────────────
             buf = io.BytesIO()
             fig.savefig(
-                buf,
-                format='png',
-                dpi=self.DPI,
-                facecolor=self.C_BG,
-                edgecolor='none',
-                bbox_inches='tight',
-                pad_inches=0.05,
+                buf, format='png', dpi=self.DPI,
+                facecolor=self.C_BG, edgecolor='none',
             )
             plt.close(fig)
-
             return self._optimise_png(buf)
 
         except Exception as exc:
@@ -229,65 +182,117 @@ class ChartGenerator:
             return None
 
     # =========================================================================
+    # AXES SETUP
+    # =========================================================================
+
+    def _style_main_ax(
+        self,
+        ax: plt.Axes,
+        y_min: float,
+        y_max: float,
+        n: int,
+        x_right: int,
+        decimals: int,
+    ):
+        ax.set_facecolor(self.C_BG)
+        ax.set_xlim(-0.5, x_right)
+        ax.set_ylim(y_min, y_max)
+
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.tick_right()
+        ax.yaxis.set_major_formatter(
+            mticker.FormatStrFormatter(f'%.{decimals}f')
+        )
+
+        price_range = y_max - y_min
+        raw_step    = price_range / 9.0
+        if raw_step > 0:
+            magnitude = 10 ** int(np.floor(np.log10(raw_step)))
+            nice_step = round(raw_step / magnitude) * magnitude
+            if nice_step <= 0:
+                nice_step = raw_step
+            ax.yaxis.set_major_locator(mticker.MultipleLocator(nice_step))
+
+        ax.tick_params(
+            axis='y',
+            right=True, left=False,
+            labelright=True, labelleft=False,
+            colors=self.C_TEXT, labelsize=7.5,
+            length=3, width=0.5, pad=4,
+        )
+        ax.tick_params(
+            axis='x', which='both',
+            bottom=False, top=False, labelbottom=False,
+        )
+        ax.yaxis.grid(
+            True, which='major',
+            color=self.C_GRID, linewidth=0.45, alpha=0.85, zorder=0,
+        )
+        ax.xaxis.grid(False)
+
+    def _style_vol_ax(self, ax_vol: plt.Axes, n: int, x_right: int):
+        ax_vol.set_facecolor(self.C_BG)
+        ax_vol.set_xlim(-0.5, x_right)
+        for sp in ax_vol.spines.values():
+            sp.set_visible(False)
+        ax_vol.tick_params(
+            axis='both', which='both',
+            bottom=False, top=False, left=False, right=False,
+            labelbottom=False, labelleft=False, labelright=False,
+        )
+
+    # =========================================================================
     # CANDLES
     # =========================================================================
 
     def _draw_candles(self, ax: plt.Axes, data: pd.DataFrame):
-        """
-        Draw candlesticks as filled rectangles + wicks.
-        x positions are integer bar indices (0..n-1).
-        y positions are raw float prices — no rounding.
-        """
-        for i, row in data.iterrows():
+        for i in range(len(data)):
+            row = data.iloc[i]
             try:
-                o = float(row['open'])
-                h = float(row['high'])
-                l = float(row['low'])
-                c = float(row['close'])
+                o  = float(row['open'])
+                h  = float(row['high'])
+                lo = float(row['low'])
+                c  = float(row['close'])
             except (KeyError, TypeError, ValueError):
                 continue
 
-            bull   = c >= o
-            color  = self.C_UP if bull else self.C_DOWN
-            b_bot  = min(o, c)
-            b_top  = max(o, c)
-            b_h    = max(b_top - b_bot, 1e-12)
+            bull  = c >= o
+            color = self.C_UP if bull else self.C_DOWN
+            b_bot = min(o, c)
+            b_top = max(o, c)
+            b_h   = max(b_top - b_bot, 1e-10)
 
-            # Wick
             ax.plot(
-                [i, i], [l, h],
-                color=color, linewidth=self.WICK_W,
-                solid_capstyle='round', zorder=5,
+                [i, i], [lo, h],
+                color=color, linewidth=self.WICK_LW,
+                solid_capstyle='butt', zorder=7,
             )
-
-            # Body
-            rect = mpatches.Rectangle(
+            ax.add_patch(mpatches.Rectangle(
                 (i - self.BODY_W / 2, b_bot),
                 self.BODY_W, b_h,
-                facecolor=color, edgecolor=color,
-                linewidth=0.2, alpha=0.95, zorder=5,
-            )
-            ax.add_patch(rect)
+                facecolor=color, edgecolor='none',
+                alpha=0.93, zorder=7,
+            ))
 
     # =========================================================================
-    # SMC ZONE DRAWING
+    # SMC ZONE BOXES
     # =========================================================================
 
     def _draw_zone(
         self,
         ax: plt.Axes,
-        data: pd.DataFrame,
         poi: Dict,
+        time_index: list,
         n: int,
+        x_right: int,
         primary: bool = True,
     ):
         """
-        Draw an Order Block or Breaker Block zone at exact price coordinates.
-
-        The zone starts at the bar where the POI was formed (determined by
-        matching the POI timestamp against the live data index).  If no match
-        is found the zone covers the right-half of the chart — still at the
-        correct price levels.
+        Draw a fully shaded zone box from formation bar to the right edge.
+        Top and bottom border lines are drawn separately for maximum visibility.
         """
         high = float(poi.get('high', 0))
         low  = float(poi.get('low',  0))
@@ -301,146 +306,181 @@ class ChartGenerator:
         if p_type in ('BB', 'BREAKER'):
             color = self.C_BB_BULL if is_bull else self.C_BB_BEAR
             label = 'BB'
-            fill_a = self.A_BB_FILL * (1.0 if primary else 0.55)
+        elif p_type == 'UNICORN':
+            color = self.C_BB_BULL if is_bull else self.C_BB_BEAR
+            label = 'UNICORN'
         else:
             color = self.C_OB_BULL if is_bull else self.C_OB_BEAR
             label = 'OB'
-            fill_a = self.A_OB_FILL * (1.0 if primary else 0.55)
 
-        edge_a = self.A_ZONE_EDGE * (1.0 if primary else 0.50)
+        fill_a   = self.ZONE_FILL_ALPHA   * (1.0 if primary else 0.50)
+        border_a = self.ZONE_BORDER_ALPHA * (1.0 if primary else 0.55)
+        border_w = self.ZONE_BORDER_LW    * (1.0 if primary else 0.55)
 
-        # Map formation timestamp to bar index
-        start_bar = self._ts_to_bar(data, poi.get('timestamp'))
-        if start_bar is None:
-            start_bar = max(0, n - 40)
+        start_x = self._ts_to_bar_index(poi.get('timestamp'), time_index)
+        if start_x is None:
+            start_x = max(0, n - 38)
 
-        x0     = float(start_bar) - 0.5
-        width  = float(n) - float(start_bar) + float(self.X_RIGHT_MARGIN)
+        box_left  = float(start_x) - 0.5
+        box_width = float(x_right) - box_left
 
-        # Fill
+        # Filled rectangle
         ax.add_patch(mpatches.Rectangle(
-            (x0, low), width, high - low,
+            (box_left, low), box_width, high - low,
             facecolor=color, edgecolor='none',
-            alpha=fill_a, zorder=3,
+            alpha=fill_a, zorder=5,
         ))
-        # Edge outline
-        ax.add_patch(mpatches.Rectangle(
-            (x0, low), width, high - low,
-            facecolor='none', edgecolor=color,
-            linewidth=0.7 if primary else 0.4,
-            alpha=edge_a, zorder=3,
-        ))
+        # Top border
+        ax.plot(
+            [box_left, x_right], [high, high],
+            color=color, linewidth=border_w,
+            alpha=border_a, zorder=6,
+        )
+        # Bottom border
+        ax.plot(
+            [box_left, x_right], [low, low],
+            color=color, linewidth=border_w,
+            alpha=border_a, zorder=6,
+        )
 
         if primary:
-            mid = (high + low) / 2
             ax.text(
-                n + 0.3, mid,
+                x_right - 0.5, (high + low) / 2.0,
                 f' {label}',
-                color=color, fontsize=7, fontweight='bold',
-                va='center', ha='left', alpha=0.9, zorder=7,
+                color=color, fontsize=8.0,
+                fontweight='bold',
+                va='center', ha='right',
+                alpha=0.95, zorder=8,
             )
 
     # =========================================================================
     # FAIR VALUE GAPS
     # =========================================================================
 
-    def _draw_fvgs(
+    def _draw_fvg(
         self,
         ax: plt.Axes,
-        data: pd.DataFrame,
-        fvgs: List[Dict],
+        fvg: Dict,
+        time_index: list,
         n: int,
+        x_right: int,
         y_min: float,
         y_max: float,
     ):
-        """Draw FVG bands at exact gap price levels."""
-        for fvg in fvgs:
-            high = float(fvg.get('high', 0))
-            low  = float(fvg.get('low',  0))
-            if high <= low or high <= 0:
-                continue
-            # Only draw if the gap is visible in the current y-range
-            if high < y_min or low > y_max:
-                continue
+        high = float(fvg.get('high', 0))
+        low  = float(fvg.get('low',  0))
+        if high <= low or high < y_min or low > y_max:
+            return
 
-            direction = str(fvg.get('direction', 'BULLISH')).upper()
-            color     = self.C_FVG_BULL if direction in ('BULLISH', 'BUY') else self.C_FVG_BEAR
+        direction = str(fvg.get('direction', 'BULLISH')).upper()
+        color     = (self.C_FVG_BULL
+                     if direction in ('BULLISH', 'BUY')
+                     else self.C_FVG_BEAR)
 
-            start_bar = self._ts_to_bar(data, fvg.get('timestamp'))
-            if start_bar is None:
-                continue
-            x0    = float(start_bar) - 0.5
-            width = float(n) - float(start_bar) + float(self.X_RIGHT_MARGIN)
+        start_x = self._ts_to_bar_index(fvg.get('timestamp'), time_index)
+        if start_x is None:
+            return
 
-            ax.add_patch(mpatches.Rectangle(
-                (x0, low), width, high - low,
-                facecolor=color, edgecolor=color,
-                alpha=self.A_FVG_FILL, linewidth=0.3, zorder=3,
-            ))
+        width = float(x_right) - float(start_x) + 0.5
+        ax.add_patch(mpatches.Rectangle(
+            (float(start_x) - 0.5, low), width, high - low,
+            facecolor=color, edgecolor=color,
+            alpha=self.FVG_FILL_ALPHA, linewidth=0.35, zorder=3,
+        ))
 
     # =========================================================================
-    # BREAK OF STRUCTURE LINES
+    # BOS LINES
     # =========================================================================
 
-    def _draw_bos(self, ax: plt.Axes, bos_events: List[Dict], n: int):
-        """Draw BOS as dashed horizontal lines at exact price levels."""
-        seen = set()
+    def _draw_bos_lines(self, ax: plt.Axes, bos_events: List[Dict]):
+        seen: set = set()
         for bos in bos_events[:3]:
             level = float(bos.get('level', 0))
             if level <= 0 or level in seen:
                 continue
             seen.add(level)
-
             ax.axhline(
                 y=level,
-                color=self.C_BOS,
-                linewidth=0.65,
-                linestyle=(0, (5, 5)),
-                alpha=0.55, zorder=4,
+                color=self.C_BOS_LINE,
+                linewidth=0.75,
+                linestyle=(0, (6, 4)),
+                alpha=0.65, zorder=4,
             )
             ax.text(
                 0.5, level,
-                ' BOS ',
-                transform=ax.get_yaxis_transform(),
-                color=self.C_BOS, fontsize=6.5,
-                va='bottom', ha='left', alpha=0.75, zorder=7,
+                ' BOS',
+                color=self.C_BOS_LINE, fontsize=6.5,
+                va='bottom', ha='left',
+                alpha=0.80, zorder=8,
             )
 
     # =========================================================================
-    # PRICE LEVEL LINES (Entry / SL / TP)
+    # PRICE LEVEL LINES
     # =========================================================================
 
-    def _draw_levels(self, ax: plt.Axes, setup_data: Dict, n: int):
-        """Draw Entry, SL, TP1, TP2 as labelled horizontal lines."""
-        symbol = setup_data.get('symbol', '')
+    def _draw_price_levels(
+        self,
+        ax: plt.Axes,
+        setup_data: Dict,
+        n: int,
+        x_right: int,
+        decimals: int,
+        y_min: float,
+        y_max: float,
+    ):
+        """
+        Draw Entry, SL, TP1, TP2 as full-width horizontal lines.
+        Price labels are placed outside the chart on the right.
+        Vertical positions are staggered to prevent label overlap.
+        """
+        y_range = max(y_max - y_min, 1e-10)
+        min_sep = y_range * 0.024
 
         levels = [
-            # (dict_key,       colour,      label,   linewidth, linestyle)
-            ('entry_price',   self.C_ENTRY, 'ENTRY', 1.1, 'solid'),
-            ('stop_loss',     self.C_SL,    'SL',    0.85, (0, (6, 3))),
-            ('take_profit_1', self.C_TP1,   'TP1',   0.85, (0, (3, 2))),
-            ('take_profit_2', self.C_TP2,   'TP2',   0.85, (0, (3, 2))),
+            ('entry_price',   self.C_ENTRY, 'ENTRY', 1.5, 'solid'),
+            ('stop_loss',     self.C_SL,    'SL',    1.0, (0, (5, 3))),
+            ('take_profit_1', self.C_TP1,   'TP1',   1.0, (0, (3, 2))),
+            ('take_profit_2', self.C_TP2,   'TP2',   1.0, (0, (3, 2))),
         ]
+
+        rendered: List[float] = []
 
         for key, color, tag, lw, ls in levels:
             price = setup_data.get(key)
-            if price is None or float(price) <= 0:
+            if price is None:
                 continue
             price = float(price)
+            if price <= 0:
+                continue
 
-            ax.axhline(
-                y=price, color=color, linewidth=lw,
-                linestyle=ls, alpha=0.88, zorder=6,
+            ax.plot(
+                [-0.5, x_right],
+                [price, price],
+                color=color, linewidth=lw,
+                linestyle=ls, alpha=0.90, zorder=6,
+            )
+            ax.plot(
+                x_right - 0.2, price,
+                marker='<', color=color,
+                markersize=5, alpha=0.90, zorder=6,
             )
 
-            price_str = utils.format_price(symbol, price)
+            label_y = price
+            for prev_y in rendered:
+                if abs(label_y - prev_y) < min_sep:
+                    label_y = prev_y + min_sep * (
+                        1 if label_y >= prev_y else -1)
+            rendered.append(label_y)
+
+            price_fmt = f'%.{decimals}f' % price
             ax.text(
-                n + self.X_RIGHT_MARGIN - 0.3, price,
-                f'{tag}  {price_str}',
-                color=color, fontsize=7.5,
-                va='center', ha='right',
+                x_right + 0.25, label_y,
+                f'{tag}  {price_fmt}',
+                color=color,
+                fontsize=7.5,
                 fontweight='bold' if tag == 'ENTRY' else 'normal',
-                alpha=0.95, zorder=7,
+                va='center', ha='left',
+                alpha=0.96, zorder=8,
             )
 
     # =========================================================================
@@ -448,346 +488,273 @@ class ChartGenerator:
     # =========================================================================
 
     def _draw_volume(self, ax_vol: plt.Axes, data: pd.DataFrame, n: int):
-        """Draw volume bars in the lower sub-panel."""
-        ax_vol.set_facecolor(self.C_BG)
-        for sp in ax_vol.spines.values():
-            sp.set_color(self.C_BORDER)
-            sp.set_linewidth(0.4)
-
         if 'volume' not in data.columns:
             ax_vol.set_visible(False)
             return
-
-        vols   = data['volume'].fillna(0).values
+        vols   = data['volume'].fillna(0).values.astype(float)
         closes = data['close'].values
         opens  = data['open'].values
         if vols.max() <= 0:
             ax_vol.set_visible(False)
             return
-
         colors = [self.C_UP if c >= o else self.C_DOWN
                   for c, o in zip(closes, opens)]
-
         for i, (v, c) in enumerate(zip(vols, colors)):
-            ax_vol.bar(i, v, color=c, alpha=0.45, width=0.55, zorder=2)
-
-        ax_vol.set_xlim(-0.5, n - 0.5 + self.X_RIGHT_MARGIN)
-        ax_vol.set_ylim(0, vols.max() * 1.3)
-        ax_vol.tick_params(
-            axis='both', which='both',
-            bottom=False, top=False, left=False, right=False,
-            labelbottom=False, labelleft=False, labelright=False,
+            ax_vol.bar(i, v, color=c, alpha=0.40, width=0.52, zorder=2)
+        ax_vol.set_ylim(0, vols.max() * 1.6)
+        ax_vol.text(
+            0.5, 0.85, 'Volume',
+            transform=ax_vol.transAxes,
+            color=self.C_TEXT_DIM, fontsize=6.5,
+            ha='left', va='top', alpha=0.55,
         )
-        ax_vol.set_ylabel('Vol', color=self.C_TEXT_DIM,
-                          fontsize=6.5, labelpad=2)
 
     # =========================================================================
-    # WATERMARK (TradingView style — behind candles)
+    # WATERMARK
     # =========================================================================
 
     def _draw_watermark(self, ax: plt.Axes, symbol: str = ''):
-        """
-        Render 'NIXIE TRADES' centred behind all price data, zorder=2.
-        Uses axes-fraction coordinates so it never shifts with price scale.
-        """
-        lines = ['NIXIE TRADES']
-        if symbol:
-            lines.append(f'M15  {symbol}')
-
+        text = f'NIXIE TRADES\nM15  {symbol}' if symbol else 'NIXIE TRADES'
         ax.text(
-            0.5, 0.5,
-            '\n'.join(lines),
+            0.5, 0.50, text,
             transform=ax.transAxes,
-            color=self.C_TEXT,
-            fontsize=26,
-            fontweight='bold',
+            color=self.C_TEXT, fontsize=28, fontweight='bold',
             ha='center', va='center',
-            alpha=0.04,        # very faint — identical to TradingView watermark
-            zorder=2,
-            linespacing=1.6,
+            alpha=0.045, linespacing=1.55, zorder=2,
         )
 
     # =========================================================================
     # TIME LABELS
     # =========================================================================
 
-    def _draw_time_labels(self, ax: plt.Axes, data: pd.DataFrame, n: int):
-        """Print compact M15 time labels beneath the candles."""
-        interval  = max(1, n // 7)
-        y_label   = ax.get_ylim()[0]
-
+    def _draw_time_labels(
+        self,
+        ax: plt.Axes,
+        data: pd.DataFrame,
+        time_index: list,
+        n: int,
+        y_min: float,
+    ):
+        interval = max(1, n // 8)
         for i in range(0, n, interval):
             try:
-                ts  = data.iloc[i]['time'] if 'time' in data.columns else None
-                if ts is None:
-                    continue
+                ts  = time_index[i]
                 lbl = pd.Timestamp(ts).strftime('%d %b\n%H:%M')
             except Exception:
                 continue
             ax.text(
-                i, y_label,
+                i, y_min,
                 lbl,
-                color=self.C_TEXT_DIM, fontsize=6,
-                ha='center', va='top', alpha=0.7, zorder=7,
+                color=self.C_TEXT_DIM, fontsize=6.0,
+                ha='center', va='top',
+                alpha=0.75, zorder=8,
             )
 
     # =========================================================================
-    # HEADER BANNER
+    # HEADER
     # =========================================================================
 
     def _draw_header(self, fig: plt.Figure, setup_data: Dict):
-        """Draw a one-line branding + setup summary above the chart area."""
         symbol    = setup_data.get('symbol', 'N/A')
-        direction = 'LONG' if setup_data.get('direction', 'BUY') == 'BUY' else 'SHORT'
-        tier_lbl  = ('UNICORN SETUP'
-                     if 'UNICORN' in str(setup_data.get('setup_type', '')).upper()
-                     else 'STANDARD SETUP')
+        direction = ('LONG'
+                     if setup_data.get('direction', 'BUY') == 'BUY'
+                     else 'SHORT')
+        tier_lbl  = (
+            'UNICORN SETUP'
+            if 'UNICORN' in str(setup_data.get('setup_type', '')).upper()
+            else 'STANDARD SETUP'
+        )
         sig_num   = setup_data.get('signal_number', 0)
         ml_score  = setup_data.get('ml_score', 0)
         session   = setup_data.get('session', 'N/A')
         dir_color = self.C_UP if direction == 'LONG' else self.C_DOWN
 
         fig.text(
-            0.012, 0.985,
-            f'NIXIE TRADES  |  SETUP #{sig_num}  —  {tier_lbl}',
-            color=self.C_TEXT, fontsize=9, fontweight='bold',
+            0.010, 0.984,
+            f'NIXIE TRADES  |  SETUP #{sig_num}  -  {tier_lbl}',
+            color=self.C_TEXT, fontsize=9.5, fontweight='bold',
             ha='left', va='top', transform=fig.transFigure,
         )
         fig.text(
-            0.012, 0.970,
+            0.010, 0.966,
             f'{symbol}   M15   {direction}   '
             f'AI Score: {ml_score}%   Session: {session}',
-            color=dir_color, fontsize=8,
+            color=dir_color, fontsize=8.5,
             ha='left', va='top', transform=fig.transFigure,
         )
 
     # =========================================================================
-    # AXES STYLE
-    # =========================================================================
-
-    def _style_ax(self, ax: plt.Axes):
-        """Apply dark theme to an axes object."""
-        ax.set_facecolor(self.C_BG)
-        for sp in ax.spines.values():
-            sp.set_color(self.C_BORDER)
-            sp.set_linewidth(0.4)
-        ax.yaxis.set_label_position('right')
-        ax.yaxis.tick_right()
-        ax.tick_params(
-            axis='y', which='both',
-            right=True, left=False,
-            labelright=True, labelleft=False,
-            colors=self.C_TEXT_DIM, labelsize=7,
-        )
-        ax.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
-
-    def _draw_grid(
-        self,
-        ax: plt.Axes,
-        n: int,
-        y_min: float,
-        y_max: float,
-    ):
-        """Draw subtle horizontal grid lines."""
-        ax.yaxis.set_minor_locator(mticker.AutoMinorLocator(2))
-        ax.grid(
-            axis='y', which='major',
-            color=self.C_GRID, linewidth=0.35, alpha=0.7, zorder=0,
-        )
-
-    # =========================================================================
-    # Y-RANGE HELPER
+    # HELPERS
     # =========================================================================
 
     def _compute_y_range(
         self, data: pd.DataFrame, setup_data: Dict
     ) -> tuple:
-        """
-        Compute y-axis min/max that includes all candle prices and level lines.
-        Adds 8% padding so labels are not clipped.
-        """
-        prices: List[float] = []
-
+        prices: list = []
         for col in ('high', 'low', 'close', 'open'):
             if col in data.columns:
-                prices.extend(data[col].dropna().tolist())
-
-        for key in ('entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2'):
+                prices.extend([
+                    float(v) for v in data[col].dropna()
+                    if float(v) > 0
+                ])
+        for key in ('entry_price', 'stop_loss',
+                    'take_profit_1', 'take_profit_2'):
             v = setup_data.get(key)
             if v:
                 try:
                     prices.append(float(v))
                 except (TypeError, ValueError):
                     pass
-
         if not prices:
             return 1.0, 2.0
-
         p_min = min(prices)
         p_max = max(prices)
-        pad   = (p_max - p_min) * 0.08
+        pad   = (p_max - p_min) * self.Y_PAD_FRACTION
         return p_min - pad, p_max + pad
 
-    # =========================================================================
-    # TIMESTAMP-TO-BAR MAPPING
-    # =========================================================================
-
-    def _ts_to_bar(
-        self, data: pd.DataFrame, ts
+    def _ts_to_bar_index(
+        self, ts, time_index: list
     ) -> Optional[int]:
-        """
-        Map a timestamp to the nearest integer bar index in `data`.
-        Uses the 'time' column (reset index copy) if present.
-
-        Returns None if the timestamp is absent, unparseable, or falls
-        outside the chart's time range.
-        """
-        if ts is None:
+        if ts is None or not time_index:
             return None
-
-        time_col = 'time' if 'time' in data.columns else None
-        if time_col is None:
-            return None
-
         try:
             ts_pd = pd.Timestamp(ts)
             if ts_pd.tzinfo is None:
-                ts_pd = ts_pd.tz_localize('UTC')
+                import pytz
+                ts_pd = pytz.utc.localize(ts_pd)
             else:
                 ts_pd = ts_pd.tz_convert('UTC')
 
-            times = pd.to_datetime(data[time_col], utc=True, errors='coerce')
-            diffs = (times - ts_pd).abs()
-            idx   = int(diffs.idxmin())
-            return idx
+            best_i    = None
+            best_diff = None
+            for i, t in enumerate(time_index):
+                try:
+                    t_pd = pd.Timestamp(t)
+                    if t_pd.tzinfo is None:
+                        import pytz
+                        t_pd = pytz.utc.localize(t_pd)
+                    else:
+                        t_pd = t_pd.tz_convert('UTC')
+                    diff = abs((t_pd - ts_pd).total_seconds())
+                    if best_diff is None or diff < best_diff:
+                        best_diff = diff
+                        best_i    = i
+                except Exception:
+                    continue
+            return best_i
         except Exception:
             return None
 
-    # =========================================================================
-    # PNG OPTIMISATION
-    # =========================================================================
+    def _price_decimals(self, symbol: str) -> int:
+        s = symbol.upper()
+        if 'XAU' in s or 'XAG' in s:
+            return 2
+        if 'JPY' in s:
+            return 3
+        if 'BTC' in s:
+            return 1
+        return 5
 
     def _optimise_png(self, raw_buf: io.BytesIO) -> bytes:
-        """
-        Post-process the matplotlib output with PIL to reduce file size.
-        Converts to RGB (drops alpha), then saves with compress_level=7.
-        Falls back to raw bytes if PIL is unavailable.
-
-        Typical output: 80–200 KB for an 880 x 520 px chart.
-        """
         raw_buf.seek(0)
-
         if not _PIL_AVAILABLE:
             return raw_buf.read()
-
         try:
             img     = _PIL_Image.open(raw_buf).convert('RGB')
             out_buf = io.BytesIO()
             img.save(out_buf, 'PNG', optimize=True, compress_level=7)
             out_buf.seek(0)
             result = out_buf.read()
-            logger.debug("PNG optimised: %d KB", len(result) // 1024)
+            logger.debug("Chart PNG: %d KB", len(result) // 1024)
             return result
         except Exception as exc:
-            logger.warning("PIL optimisation failed (%s). Using raw PNG.", exc)
+            logger.warning("PIL optimisation failed: %s. Using raw PNG.", exc)
             raw_buf.seek(0)
             return raw_buf.read()
-        
+
+    # =========================================================================
+    # SAMPLE CHART
+    # =========================================================================
+
     @staticmethod
     def generate_sample_chart() -> Optional[bytes]:
         """
-        Generate a pre-rendered sample M15 EURUSD bullish OB setup chart
-        for use in /start and /help command responses.
-        Uses purely synthetic data — no live feed required.
-        This is a one-time generation cached at module level after first call.
+        Generate a synthetic XAUUSD M15 Breaker Block LONG sample chart.
+        No live data required. Called once and cached in bot.py.
         """
         try:
-            import numpy as _np
-            import pandas as _pd
+            rng  = np.random.default_rng(42)
+            n    = 80
+            base = 2485.0
 
-            _np.random.seed(42)
-            n    = 75
-            base = 1.08200
             prices = [base]
-
             for i in range(1, n):
                 if i < 20:
-                    # Asian session: tight ranging
-                    move = _np.random.normal(0.0000, 0.00015)
-                elif i < 32:
-                    # London open: bullish impulse creating the OB
-                    move = _np.random.normal(0.00038, 0.00014)
-                elif i < 48:
-                    # Pullback to OB zone (inducement sweep)
-                    move = _np.random.normal(-0.00020, 0.00011)
-                elif i < 58:
-                    # Consolidation above demand zone
-                    move = _np.random.normal(0.00006, 0.00009)
+                    move = rng.normal(0.0,  0.25)
+                elif i < 35:
+                    move = rng.normal(-1.5, 0.60)
+                elif i < 42:
+                    move = rng.normal(-0.5, 0.35)
+                elif i < 52:
+                    move = rng.normal(3.8,  0.80)
+                elif i < 62:
+                    move = rng.normal(-1.2, 0.45)
                 else:
-                    # New bullish leg beginning
-                    move = _np.random.normal(0.00028, 0.00013)
-                prices.append(max(prices[-1] + move, base * 0.994))
+                    move = rng.normal(1.8,  0.55)
+                prices.append(max(prices[-1] + move, base * 0.985))
 
-            rows  = []
-            times = _pd.date_range(
-                '2026-03-27 00:00', periods=n, freq='15min', tz='UTC')
-
+            times = pd.date_range(
+                '2026-03-27 07:00', periods=n, freq='15min', tz='UTC')
+            rows = []
             for i in range(n):
-                c = prices[i]
-                o = prices[i - 1] if i > 0 else c
-                spread_h = abs(_np.random.normal(0.00014, 0.00007))
-                spread_l = abs(_np.random.normal(0.00014, 0.00007))
-                h = max(o, c) + spread_h
-                l = min(o, c) - spread_l
-                base_vol = 1800 if 20 <= i < 32 else 700
-                v = max(100, int(abs(_np.random.normal(base_vol, base_vol * 0.35))))
+                c  = prices[i]
+                o  = prices[i - 1] if i > 0 else c
+                h  = max(o, c) + abs(rng.normal(0, 0.45))
+                lo = min(o, c) - abs(rng.normal(0, 0.45))
+                mul = 2200 if 42 <= i < 52 else 900
+                v   = max(100, int(abs(rng.normal(mul, mul * 0.35))))
                 rows.append({
-                    'open': round(o, 5), 'high': round(h, 5),
-                    'low':  round(l, 5), 'close': round(c, 5),
+                    'open': round(o, 2), 'high': round(h, 2),
+                    'low':  round(lo, 2), 'close': round(c, 2),
                     'volume': v,
                 })
 
-            df = _pd.DataFrame(rows, index=times)
+            df = pd.DataFrame(rows, index=times)
             df.index.name = 'time'
 
-            # Build OB at the last down-candle before the London impulse (bar 19)
-            ob_high = round(prices[19] + 0.00012, 5)
-            ob_low  = round(prices[19] - 0.00018, 5)
+            bb_high = round(prices[40] + 1.8, 2)
+            bb_low  = round(prices[40] - 2.5, 2)
+            bos_lvl = round(max(prices[20:42]) + 0.8, 2)
+            entry   = bb_high
+            sl      = round(bb_low - 3.5, 2)
+            risk    = entry - sl
+            tp1     = round(entry + risk * 2.5, 2)
+            tp2     = round(entry + risk * 5.0, 2)
 
             sample_poi = {
-                'type':         'OB',
+                'type':         'BB',
                 'direction':    'BULLISH',
-                'high':         ob_high,
-                'low':          ob_low,
-                'timestamp':    times[19],
-                'index':        19,
-                'volume_ratio': 2.3,
-                'impulse_pips': 38.0,
-                'confidence':   78,
+                'high':         bb_high,
+                'low':          bb_low,
+                'timestamp':    times[41],
+                'index':        41,
+                'volume_ratio': 2.6,
+                'impulse_pips': 52.0,
+                'confidence':   82,
             }
-
-            # Entry at top of OB (limit order at zone boundary)
-            entry = ob_high
-            sl    = round(ob_low - 0.00035, 5)
-            risk  = entry - sl
-            tp1   = round(entry + risk * 2.5, 5)
-            tp2   = round(entry + risk * 5.0, 5)
-
             sample_setup = {
-                'symbol':        'EURUSD',
+                'symbol':        'XAUUSD',
                 'direction':     'BUY',
-                'setup_type':    'UNICORN SETUP',
-                'signal_number': 7,
+                'setup_type':    'STANDARD SETUP',
+                'signal_number': 11,
                 'session':       'London',
-                'ml_score':      79,
+                'ml_score':      62,
                 'entry_price':   entry,
                 'stop_loss':     sl,
                 'take_profit_1': tp1,
                 'take_profit_2': tp2,
             }
-
-            bos_level    = round(max(prices[10:20]) + 0.00006, 5)
-            sample_bos   = [{'level': bos_level, 'direction': 'BULLISH'}]
+            sample_bos = [{'level': bos_lvl, 'direction': 'BULLISH'}]
 
             cg = ChartGenerator()
             return cg.generate_setup_chart(

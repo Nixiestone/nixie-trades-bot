@@ -2039,80 +2039,165 @@ class NixTradesScheduler:
         date_str: str,
     ) -> tuple:
         """
-        Call Google Gemini (free tier) to generate a macro + sentiment +
-        fundamental overview and a weekly trade plan grounded in the
-        SMC technical data already collected.
+        Generate macro + sentiment + fundamental weekly analysis using an LLM.
 
-        Model: gemini-2.0-flash (free, 15 req/min, 1M tokens/day)
-        API key: config.GOOGLE_API_KEY from Google AI Studio (free)
+        Provider priority:
+          1. Groq (Llama 3.3 70B) — free, 30 req/min, 14400/day
+          2. Gemini 2.0 Flash     — free fallback, 15 req/min, 1500/day
 
         Returns:
             (overview_text: str, trade_plan_text: str)
             Returns ('', '') on any failure — technical data still sends.
         """
-        api_key = getattr(config, 'GOOGLE_API_KEY', '').strip()
-        if not api_key:
+        groq_key   = getattr(config, 'GROQ_API_KEY',   '').strip()
+        gemini_key = getattr(config, 'GOOGLE_API_KEY', '').strip()
+
+        if not groq_key and not gemini_key:
             self.logger.info(
-                "GOOGLE_API_KEY not set. Skipping LLM analysis. "
-                "Add it to .env to enable macro commentary.")
+                "No LLM API key configured. Add GROQ_API_KEY or "
+                "GOOGLE_API_KEY to .env to enable macro commentary.")
             return '', ''
 
+        # Build shared prompt content
+        tech_lines = []
+        for symbol, r in pair_results.items():
+            tech_lines.append(
+                f"{symbol}: Monthly={r['mn1']} Weekly={r['w1']} "
+                f"Daily={r['d1']} ({r['d1_conf']}% confidence) "
+                f"SMC_Bias={r['bias']} Alignment={r['alignment']}"
+            )
+        tech_summary = "\n".join(tech_lines) if tech_lines else "No data."
+        news_summary = (
+            "\n".join(news_lines[:8]) if news_lines
+            else "No high-impact events found this week."
+        )
+        daily_ctx = self._last_daily_context[:600] if self._last_daily_context else ''
+
+        system_prompt = (
+            "You are an institutional forex and commodity market analyst "
+            "for Nixie Trades, an algorithmic trading education platform "
+            "that uses Smart Money Concepts (SMC). "
+            "You combine macro fundamentals, central bank policy, market "
+            "sentiment, and SMC technical structure in your commentary. "
+            "Never guarantee returns or give direct financial advice. "
+            "Frame everything as educational analysis only. "
+            "No markdown. No bullet symbols. No asterisks. "
+            "Short paragraphs. Plain English for Telegram. "
+            "Maximum 110 words per section."
+        )
+        user_prompt = (
+            f"Today is {date_str}.\n\n"
+            f"SMC TECHNICAL STRUCTURE (multi-timeframe):\n{tech_summary}\n\n"
+            f"HIGH-IMPACT ECONOMIC EVENTS THIS WEEK:\n{news_summary}\n\n"
+            + (f"RECENT DAILY BRIEFING CONTEXT:\n{daily_ctx}\n\n"
+               if daily_ctx else "")
+            + "Provide TWO sections:\n\n"
+            "SECTION 1 - MACRO AND SENTIMENT (max 110 words):\n"
+            "Describe the macro backdrop, central bank tone (Fed, ECB, BOE, BOJ), "
+            "risk sentiment, USD direction, and commodity drivers for Gold. "
+            "Explain how scheduled news could shift institutional order flow.\n\n"
+            "SECTION 2 - WEEKLY TRADE PLAN (max 110 words):\n"
+            "Based on SMC alignment and the macro backdrop, describe the "
+            "highest-probability setups, which pairs to avoid, and why. "
+            "Mention London and New York session timing. "
+            "Do not give specific entry prices. Educational analysis only.\n\n"
+            "Format EXACTLY as:\n"
+            "MACRO_OVERVIEW: [section 1 text]\n"
+            "TRADE_PLAN: [section 2 text]"
+        )
+
+        # ── Try Groq first ────────────────────────────────────────────────
+        if groq_key:
+            result = await self._call_groq(
+                groq_key, system_prompt, user_prompt)
+            if result != ('', ''):
+                return result
+            self.logger.info(
+                "Groq call returned empty. Falling back to Gemini.")
+
+        # ── Fallback to Gemini ────────────────────────────────────────────
+        if gemini_key:
+            result = await self._call_gemini(
+                gemini_key, system_prompt, user_prompt)
+            return result
+
+        return '', ''
+
+    async def _call_groq(
+        self,
+        api_key: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple:
+        """
+        Call Groq API (Llama 3.3 70B Versatile — free tier).
+        Endpoint mirrors OpenAI chat completions format exactly.
+        Free limits: 30 req/min, 14400 req/day, 6000 tokens/min.
+        """
         try:
             import httpx
 
-            # Build technical context string for the model
-            tech_lines = []
-            for symbol, r in pair_results.items():
-                tech_lines.append(
-                    f"{symbol}: Monthly={r['mn1']} Weekly={r['w1']} "
-                    f"Daily={r['d1']} ({r['d1_conf']}% confidence) "
-                    f"SMC_Bias={r['bias']} Alignment={r['alignment']}"
+            payload = {
+                "model":       "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "max_tokens":  600,
+                "temperature": 0.30,
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type":  "application/json",
+                    },
+                    json=payload,
                 )
-            tech_summary = "\n".join(tech_lines) if tech_lines else "No data."
-            news_summary = (
-                "\n".join(news_lines[:8]) if news_lines
-                else "No high-impact events found this week."
-            )
-            daily_ctx = self._last_daily_context[:600] if self._last_daily_context else ''
 
-            system_prompt = (
-                "You are an institutional forex and commodity market analyst "
-                "for Nixie Trades, an algorithmic trading education platform "
-                "that uses Smart Money Concepts (SMC). "
-                "You write concise, professional, factual commentary that "
-                "combines macro fundamentals, central bank policy, market "
-                "sentiment, and SMC technical structure. "
-                "You never guarantee returns, never give direct buy/sell "
-                "instructions as financial advice, and always frame analysis "
-                "as educational content. "
-                "No markdown. No bullet symbols. No asterisks. "
-                "Short paragraphs only. Plain English suitable for Telegram. "
-                "Maximum 120 words per section."
-            )
+            if resp.status_code == 429:
+                self.logger.warning(
+                    "Groq rate limit hit. Will try Gemini fallback.")
+                return '', ''
 
-            user_prompt = (
-                f"Today is {date_str}.\n\n"
-                f"SMC TECHNICAL STRUCTURE (multi-timeframe):\n{tech_summary}\n\n"
-                f"HIGH-IMPACT ECONOMIC EVENTS THIS WEEK:\n{news_summary}\n\n"
-                + (f"RECENT DAILY BRIEFING CONTEXT:\n{daily_ctx}\n\n"
-                   if daily_ctx else "")
-                + "Provide TWO sections:\n\n"
-                "SECTION 1 - MACRO AND SENTIMENT (max 110 words):\n"
-                "Describe the macro and fundamental backdrop this week. "
-                "Cover central bank tone (Fed, ECB, BOE, BOJ), risk sentiment "
-                "(risk-on vs risk-off), USD strength or weakness, and commodity "
-                "drivers for Gold. Explain how the scheduled news events "
-                "could shift institutional order flow. Be specific.\n\n"
-                "SECTION 2 - WEEKLY TRADE PLAN (max 110 words):\n"
-                "Based on SMC alignment and the macro backdrop, describe "
-                "which pairs offer the highest-probability setups, which "
-                "to avoid, and why. Mention session timing (London, New York). "
-                "Do not give specific entry prices. "
-                "Frame as educational analysis only, not financial advice.\n\n"
-                "Format your response EXACTLY as:\n"
-                "MACRO_OVERVIEW: [section 1 text here]\n"
-                "TRADE_PLAN: [section 2 text here]"
+            if resp.status_code != 200:
+                self.logger.warning(
+                    "Groq returned %d: %s",
+                    resp.status_code, resp.text[:200])
+                return '', ''
+
+            data     = resp.json()
+            raw_text = (
+                data.get('choices', [{}])[0]
+                    .get('message', {})
+                    .get('content', '')
             )
+            return self._parse_llm_response(raw_text, provider='Groq')
+
+        except ImportError:
+            self.logger.warning(
+                "httpx not installed. "
+                "Run: pip install httpx --break-system-packages")
+            return '', ''
+        except Exception as exc:
+            self.logger.warning("Groq API error: %s", exc)
+            return '', ''
+
+    async def _call_gemini(
+        self,
+        api_key: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple:
+        """
+        Call Google Gemini 2.0 Flash (free tier).
+        Free limits: 15 req/min, 1500 req/day.
+        Used as fallback when Groq is unavailable.
+        """
+        try:
+            import httpx
 
             url     = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -2123,10 +2208,7 @@ class NixTradesScheduler:
                     "parts": [{"text": system_prompt}]
                 },
                 "contents": [
-                    {
-                        "role":  "user",
-                        "parts": [{"text": user_prompt}],
-                    }
+                    {"role": "user", "parts": [{"text": user_prompt}]}
                 ],
                 "generationConfig": {
                     "maxOutputTokens": 600,
@@ -2138,207 +2220,71 @@ class NixTradesScheduler:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
                     url,
-                    json=payload,
                     headers={"Content-Type": "application/json"},
+                    json=payload,
                 )
+
+            if resp.status_code == 429:
+                self.logger.warning(
+                    "Gemini rate limit hit (429). Both providers exhausted.")
+                return '', ''
 
             if resp.status_code != 200:
                 self.logger.warning(
-                    "Gemini API returned %d: %s",
-                    resp.status_code, resp.text[:300])
+                    "Gemini returned %d: %s",
+                    resp.status_code, resp.text[:200])
                 return '', ''
 
-            data      = resp.json()
-            raw_text  = ''
+            data     = resp.json()
+            raw_text = ''
             try:
                 raw_text = (
                     data['candidates'][0]['content']['parts'][0]['text']
                 )
-            except (KeyError, IndexError, TypeError) as parse_err:
-                self.logger.warning(
-                    "Gemini response parse error: %s | raw: %s",
-                    parse_err, str(data)[:300])
-                return '', ''
+            except (KeyError, IndexError, TypeError):
+                pass
 
-            # Parse the two named sections
-            overview   = ''
-            trade_plan = ''
+            return self._parse_llm_response(raw_text, provider='Gemini')
 
-            if 'MACRO_OVERVIEW:' in raw_text and 'TRADE_PLAN:' in raw_text:
-                parts      = raw_text.split('TRADE_PLAN:', 1)
-                overview   = parts[0].replace('MACRO_OVERVIEW:', '').strip()
-                trade_plan = parts[1].strip()
-            elif 'MACRO_OVERVIEW:' in raw_text:
-                overview = raw_text.replace('MACRO_OVERVIEW:', '').strip()
-            else:
-                overview = raw_text.strip()
-
-            # Strip any markdown the model may emit despite instructions
-            for ch in ('**', '*', '`', '##', '#'):
-                overview   = overview.replace(ch, '')
-                trade_plan = trade_plan.replace(ch, '')
-
-            overview   = overview.strip()
-            trade_plan = trade_plan.strip()
-
-            self.logger.info(
-                "Gemini weekly analysis generated: overview=%d chars, "
-                "trade_plan=%d chars.",
-                len(overview), len(trade_plan))
-            return overview, trade_plan
-
-        except ImportError:
-            self.logger.warning(
-                "httpx not installed. Run: "
-                "pip install httpx --break-system-packages")
-            return '', ''
         except Exception as exc:
             self.logger.warning("Gemini API error: %s", exc)
             return '', ''
-        try:
-            from payment_handler import get_subscription_manager as _gsm
-            if _gsm().get_tier(telegram_id) not in ('pro', 'admin'):
-                return   # Weekly analysis is a Pro feature — skip silently
 
-            date_str = user_now.strftime('%A, %B %d, %Y')
+    def _parse_llm_response(self, raw_text: str, provider: str = '') -> tuple:
+        """
+        Parse the structured LLM response into (overview, trade_plan).
+        Handles partial or malformed responses gracefully.
+        """
+        if not raw_text.strip():
+            return '', ''
 
-            lines = [
-                "WEEKLY MARKET ANALYSIS",
-                date_str,
-                "",
-                "Good morning. Here is your weekly outlook for the week ahead.",
-                "",
-            ]
+        overview   = ''
+        trade_plan = ''
 
-            try:
-                mt5_ok = await self.mt5.is_worker_reachable()
-            except Exception:
-                mt5_ok = False
+        if 'MACRO_OVERVIEW:' in raw_text and 'TRADE_PLAN:' in raw_text:
+            parts      = raw_text.split('TRADE_PLAN:', 1)
+            overview   = parts[0].replace('MACRO_OVERVIEW:', '').strip()
+            trade_plan = parts[1].strip()
+        elif 'MACRO_OVERVIEW:' in raw_text:
+            overview = raw_text.replace('MACRO_OVERVIEW:', '').strip()
+        else:
+            overview = raw_text.strip()
 
-            if mt5_ok:
-                lines += [
-                    "TOP-DOWN MARKET STRUCTURE ANALYSIS",
-                    "",
-                    "Reading: Monthly sets the macro bias. Weekly confirms the intermediate",
-                    "structure. Daily identifies the entry-level trend. A setup is highest",
-                    "quality when all three timeframes agree on direction.",
-                    "",
-                ]
-                _analysis_symbols = [
-                    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
-                    'USDCAD', 'NZDUSD', 'XAUUSD', 'GBPJPY', 'EURJPY',
-                ]
-                for symbol in _analysis_symbols:
-                    try:
-                        # Fetch all three timeframes
-                        raw_mn1 = await self.mt5.get_historical_data(symbol, 'MN1', bars=24)
-                        raw_w1  = await self.mt5.get_historical_data(symbol, 'W1',  bars=52)
-                        raw_d1  = await self.mt5.get_historical_data(symbol, 'D1',  bars=300)
+        # Strip markdown artifacts
+        for ch in ('**', '*', '`', '##', '#', '__'):
+            overview   = overview.replace(ch, '')
+            trade_plan = trade_plan.replace(ch, '')
 
-                        if not raw_d1:
-                            lines.append(f"  {symbol:<10} Data unavailable")
-                            continue
+        overview   = overview.strip()
+        trade_plan = trade_plan.strip()
 
-                        d1_df = self._candles_to_df(raw_d1)
-                        d1_htf = self.smc.determine_htf_trend(d1_df)
-                        d1_trend = d1_htf.get('trend', 'UNKNOWN')
-                        d1_conf  = d1_htf.get('confidence', 0)
+        if overview:
+            self.logger.info(
+                "LLM analysis generated via %s: overview=%d chars, "
+                "trade_plan=%d chars.",
+                provider, len(overview), len(trade_plan))
 
-                        mn1_trend = 'N/A'
-                        w1_trend  = 'N/A'
-
-                        if raw_mn1 and len(raw_mn1) >= 10:
-                            mn1_df    = self._candles_to_df(raw_mn1)
-                            mn1_htf   = self.smc.determine_htf_trend(mn1_df)
-                            mn1_trend = mn1_htf.get('trend', 'UNKNOWN')
-
-                        if raw_w1 and len(raw_w1) >= 10:
-                            w1_df    = self._candles_to_df(raw_w1)
-                            w1_htf   = self.smc.determine_htf_trend(w1_df)
-                            w1_trend = w1_htf.get('trend', 'UNKNOWN')
-
-                        # Determine alignment quality
-                        trends_known = [
-                            t for t in [mn1_trend, w1_trend, d1_trend]
-                            if t not in ('UNKNOWN', 'N/A', 'RANGING')
-                        ]
-                        if len(trends_known) >= 2 and len(set(trends_known)) == 1:
-                            alignment = 'ALIGNED'
-                        elif len(trends_known) >= 2 and len(set(trends_known)) > 1:
-                            alignment = 'MIXED'
-                        else:
-                            alignment = 'RANGING'
-
-                        lines.append(
-                            f"  {symbol:<10}  "
-                            f"MN1: {mn1_trend:<8}  "
-                            f"W1: {w1_trend:<8}  "
-                            f"D1: {d1_trend:<8} ({d1_conf}%)  "
-                            f"[{alignment}]"
-                        )
-                    except Exception as _sym_err:
-                        self.logger.warning(
-                            "Weekly analysis failed for %s: %s", symbol, _sym_err)
-                        lines.append(f"  {symbol:<10} Analysis unavailable")
-
-                lines += [
-                    "",
-                    "ALIGNMENT KEY:",
-                    "  ALIGNED  - All timeframes agree. Highest probability setups.",
-                    "  MIXED    - Timeframes disagree. Trade with reduced size or wait.",
-                    "  RANGING  - No clear direction. Avoid until structure forms.",
-                    "",
-                ]
-            else:
-                lines.append("  Weekly bias unavailable. MT5 worker is offline.")
-
-            # Upcoming week news
-            try:
-                events = self.news.get_red_folder_events(hours_ahead=168)
-                if events:
-                    news_lines = []
-                    user_tz = user_now.tzinfo
-                    for ev in events[:8]:
-                        try:
-                            import pytz
-                            ev_utc = ev.timestamp
-                            if ev_utc.tzinfo is None:
-                                ev_utc = pytz.utc.localize(ev_utc)
-                            ev_local  = ev_utc.astimezone(user_tz)
-                            day_str   = ev_local.strftime('%a')
-                            time_str  = ev_local.strftime('%I:%M %p').lstrip('0')
-                            local_str = f"{day_str} {time_str} (your time)"
-                        except Exception:
-                            local_str = 'Unknown'
-                        currency = getattr(ev, 'currency', 'N/A')
-                        title    = getattr(ev, 'title', str(ev))
-                        news_lines.append(f"  {local_str}  {currency:<4}  {title}")
-                    news_body = "\n".join(news_lines)
-                else:
-                    news_body = "  Check Forex Factory for the week ahead."
-            except Exception:
-                news_body = "  News data unavailable."
-
-            lines += [
-                "",
-                "KEY NEWS EVENTS THIS WEEK:",
-                "",
-                news_body,
-                "",
-                "TRADING GUIDELINES:",
-                "",
-                "  - Only trade in the direction of the weekly bias",
-                "  - Avoid entries 30 min before and 15 min after red events",
-                "  - Best sessions: London Open and New York Open are highest volume",
-                "",
-                config.FOOTER,
-            ]
-
-            message = utils.validate_user_message("\n".join(lines))
-            await self._safe_send(telegram_id, message)
-
-        except Exception as e:
-            self.logger.error("Error in _send_weekly_analysis for user %d: %s", telegram_id, e)
+        return overview, trade_plan
 
     # ==================== SAFE SEND ====================
 

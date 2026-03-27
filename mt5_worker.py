@@ -486,13 +486,21 @@ def _calculate_lot_size(
     # Silver (XAGUSD):                   point=0.001,   pip=0.01   (10 points).
     # Index CFDs and Crypto may differ; fall back to 10 points as a safe default.
     symbol_upper = symbol.upper()
-    if 'XAU' in symbol_upper:
+    if 'XAU' in symbol_upper or 'GOLD' in symbol_upper:
+        # Gold: point = 0.01; pip = $1.00 = point * 100
+        # Consistent with config.PIP_SIZES['XAUUSD'] = 1.0
         pip_size = point * 100
-    elif 'XAG' in symbol_upper:
+    elif 'XAG' in symbol_upper or 'SILVER' in symbol_upper:
+        # Silver: point = 0.001; pip = $0.01 = point * 10
         pip_size = point * 10
-    elif 'BTC' in symbol_upper or 'ETH' in symbol_upper:
+    elif 'BTC' in symbol_upper:
+        # Bitcoin: point = 0.01; pip = $1.00 = point * 100
+        pip_size = point * 100
+    elif 'ETH' in symbol_upper:
+        # Ethereum: point = 0.01; pip = $0.10 = point * 10
         pip_size = point * 10
     else:
+        # Standard FX: point = 0.00001; pip = 0.0001 = point * 10
         pip_size = point * 10
 
     # price_distance in price units
@@ -786,8 +794,11 @@ def get_tick():
     if not acquired:
         return jsonify({'success': False, 'error': 'Service busy. Please retry in 30 seconds.'}), 503
     try:
-        if not mt5.initialize():
-            return jsonify({'success': False, 'error': 'MT5 initialisation failed.'})
+        _init_kwargs: dict = {'timeout': 10000}
+        if _RESOLVED_TERMINAL_PATH:
+            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
+        if not mt5.initialize(**_init_kwargs):
+            return jsonify({'success': False, 'error': 'MT5 terminal is not available.'})
 
         broker_symbol = _normalise_symbol(symbol)
         if broker_symbol is None:
@@ -822,8 +833,11 @@ def get_exchange_rates():
     if not acquired:
         return jsonify({'success': False, 'error': 'Service busy. Please retry in 30 seconds.'}), 503
     try:
-        if not mt5.initialize():
-            return jsonify({'success': False, 'error': 'MT5 initialise failed.'})
+        _init_kwargs: dict = {'timeout': 10000}
+        if _RESOLVED_TERMINAL_PATH:
+            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
+        if not mt5.initialize(**_init_kwargs):
+            return jsonify({'success': False, 'error': 'MT5 terminal is not available.'})
 
         rate_symbols = ['USDJPY', 'EURUSD', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF']
         rates = {}
@@ -1144,8 +1158,24 @@ def get_candles():
         }), 503
 
     try:
-        if not mt5.initialize():
-            return jsonify({'success': False, 'error': 'MT5 initialise failed'})
+        _init_kwargs: dict = {'timeout': 10000}
+        if _RESOLVED_TERMINAL_PATH:
+            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
+        if not mt5.initialize(**_init_kwargs):
+            _err_detail = mt5.last_error()
+            logger.warning(
+                "MT5 initialize failed in /candles: %s. "
+                "Ensure MetaTrader 5 is open and logged in on this machine.",
+                _err_detail,
+            )
+            return jsonify({
+                'success': False,
+                'error': (
+                    'MT5 terminal is not available. '
+                    'Ensure MetaTrader 5 is open and logged in on the '
+                    'Windows machine running this worker.'
+                ),
+            })
 
         symbol = _normalise_symbol(symbol_raw)
         if symbol is None:
@@ -1450,8 +1480,11 @@ def ticket_status(ticket: int):
         }), 503
 
     try:
-        if not mt5.initialize():
-            return jsonify({'success': False, 'error': 'MT5 initialise failed.'})
+        _init_kwargs: dict = {'timeout': 10000}
+        if _RESOLVED_TERMINAL_PATH:
+            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
+        if not mt5.initialize(**_init_kwargs):
+            return jsonify({'success': False, 'error': 'MT5 terminal is not available.'})
 
         # 1. Check open positions
         positions = mt5.positions_get(ticket=ticket)

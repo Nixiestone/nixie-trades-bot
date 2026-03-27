@@ -97,7 +97,15 @@ PIP_SIZES = {
     'EURUSD': 0.0001, 'GBPUSD': 0.0001, 'AUDUSD': 0.0001,
     'NZDUSD': 0.0001, 'USDCAD': 0.0001, 'EURGBP': 0.0001,
     'USDJPY': 0.01,   'EURJPY': 0.01,   'GBPJPY': 0.01,
-    'USDCHF': 0.0001, 'XAUUSD': 0.10,   'XAGUSD': 0.01
+    'USDCHF': 0.0001,
+    # Gold: 1 pip = $1.00  (industry standard for MT5 Gold trading)
+    # A 50-pip SL on Gold means a $50 price move — easily understood by traders.
+    # This matches mt5_worker.py which uses point * 100 = 0.01 * 100 = 1.0.
+    'XAUUSD': 1.0,
+    # Silver: 1 pip = $0.01
+    'XAGUSD': 0.01,
+    # Bitcoin: 1 pip = $1.00
+    'BTCUSD': 1.0,
 }
 
 SYMBOL_VARIATIONS = {
@@ -142,6 +150,7 @@ MAX_CURRENCY_EXPOSURE = 3
 # ==================== GOOGLE GEMINI LLM ====================
 
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
+GROQ_API_KEY   = os.getenv('GROQ_API_KEY', '')
 
 # ==================== SMC STRATEGY PARAMETERS ====================
 

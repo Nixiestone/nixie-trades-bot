@@ -78,14 +78,41 @@ def get_pip_value(symbol: str) -> float:
     """
     Return the pip size for a given symbol.
 
+    Handles broker variants:
+      'XAUUSD', 'GOLD', 'XAU/USD', 'XAUUSDm', 'XAUUSD.pro' → 1.0
+      'XAGUSD', 'SILVER', 'XAGUSD.pro'                       → 0.01
+      'BTCUSD', 'BTC/USD', 'BTCUSDT'                         → 1.0
+      Standard FX pairs                                        → 0.0001 or 0.01 (JPY)
+
     Args:
         symbol: Standard or broker-specific symbol name
 
     Returns:
-        float: Pip size (e.g. 0.0001 for EURUSD, 0.01 for USDJPY, 0.10 for XAUUSD)
+        float: Pip size
     """
     clean = _clean_symbol(symbol)
-    return config.PIP_SIZES.get(clean, 0.0001)
+
+    # Check canonical names first
+    if clean in config.PIP_SIZES:
+        return config.PIP_SIZES[clean]
+
+    # Commodity and crypto broker variants not caught by _clean_symbol
+    upper = clean.upper()
+    if 'XAU' in upper or upper.startswith('GOLD'):
+        return 1.0
+    if 'XAG' in upper or upper.startswith('SILVER'):
+        return 0.01
+    if 'BTC' in upper:
+        return 1.0
+    if 'ETH' in upper:
+        return 0.01
+
+    # JPY cross catch-all
+    if upper.endswith('JPY'):
+        return 0.01
+
+    # Default standard FX
+    return 0.0001
 
 
 def calculate_pips(symbol: str, price1: float, price2: float) -> float:
@@ -628,9 +655,11 @@ def calculate_lot_size(
         clean       = _clean_symbol(symbol).upper()
 
         # ---- Commodity contracts ----
-        if clean.startswith('XAU'):
-            # Gold: 1 standard lot = 100 oz; pip = $0.10; pip value = $10 per lot
-            pip_val_usd       = 10.0
+        if clean.startswith('XAU') or clean.upper().startswith('GOLD'):
+            # Gold: 1 standard lot = 100 oz; pip = $1.00; pip value = $100 per lot
+            # Convention: 1 pip = $1 move for XAUUSD (consistent with mt5_worker.py)
+            # 100 oz * $1.00/pip = $100 per pip per standard lot
+            pip_val_usd       = 100.0
             pip_value_per_lot = pip_val_usd * _usd_to_account(account_currency, rates)
 
         elif clean.startswith('XAG'):
@@ -749,9 +778,10 @@ def calculate_lot_size(
             # 1 lot = 100,000 units; pip = 0.01; pip_value = 1000 JPY / rate
             rate = (exchange_rates or {}).get('USDJPY', 150.0)
             pip_value_per_lot = 1000.0 / rate
-        elif symbol.startswith('XAU'):
-            # Gold: 1 lot = 100 oz; pip = 0.10; pip_value = $10
-            pip_value_per_lot = 10.0
+        elif symbol.startswith('XAU') or 'GOLD' in symbol.upper():
+            # Gold: 1 lot = 100 oz; pip = 1.0 ($1 per pip); pip_value = $100 per lot
+            # 100 oz * $1.00/pip = $100 per pip per standard lot
+            pip_value_per_lot = 100.0
         elif symbol.startswith('XAG'):
             # Silver: 1 lot = 5000 oz; pip = 0.01; pip_value = $50
             pip_value_per_lot = 50.0

@@ -679,8 +679,13 @@ class NixTradesBot:
 
             await self._reply(
                 update,
-                "Here is a sample of what the text alert looks like:\n\n"
-                + SAMPLE_SETUP_ALERT
+                "The chart above shows a sample setup alert with SMC markups.\n"
+                "Every alert you receive as a paid subscriber will include a "
+                "live chart like this with your entry, stop loss, and take "
+                "profit levels drawn at the exact prices.\n\n"
+                "Use /subscribe to activate alerts.\n"
+                "Use /help to see all available commands.\n\n"
+                f"{config.FOOTER}"
             )
             await self._deliver_queued_messages(telegram_id)
         except Exception as e:
