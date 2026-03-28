@@ -27,6 +27,8 @@ _TF_MINUTES = {
 # ==================== HTTP RETRY (Worker mode) ====================
 
 _RETRY_DELAYS = (0, 1, 3, 9)
+_WORKER_DEGRADED_COOLDOWN_SECONDS = 90
+_WORKER_DEGRADED_LOG_INTERVAL_SECONDS = 60
 
 
 class MT5Connector:
@@ -61,6 +63,10 @@ class MT5Connector:
             config, 'MT5_WORKER_URL', 'http://127.0.0.1:8000').rstrip('/')
         self._worker_api_key = getattr(config, 'MT5_WORKER_API_KEY', '')
         self._worker_timeout = getattr(config, 'MT5_TIMEOUT', 30)
+        self._worker_degraded_until = 0.0
+        self._worker_degraded_reason = ''
+        self._last_worker_degraded_log_at = 0.0
+        self._market_data_telegram_id: Optional[int] = None
 
         if self._use_metaapi:
             self.logger.info(
@@ -80,6 +86,59 @@ class MT5Connector:
             'Content-Type': 'application/json',
             'X-API-Key':    self._worker_api_key,
         }
+
+    def service_label(self) -> str:
+        """Human-readable label for the active MT5 connectivity backend."""
+        return 'MetaApi' if self._use_metaapi else 'MT5 worker'
+
+    def _is_worker_terminal_unavailable(self, detail: Any) -> bool:
+        text = str(detail or '').lower()
+        return any(marker in text for marker in (
+            'mt5 terminal is not available',
+            'mt5 terminal is not ready',
+            'no trading account is logged in',
+            'terminal not found',
+        ))
+
+    def _is_worker_degraded(self) -> bool:
+        return (not self._use_metaapi) and (time.time() < self._worker_degraded_until)
+
+    def _mark_worker_degraded(
+        self,
+        reason: Any,
+        cooldown_seconds: int = _WORKER_DEGRADED_COOLDOWN_SECONDS,
+    ) -> None:
+        if self._use_metaapi:
+            return
+        message = str(reason or 'MT5 worker unavailable.').strip()
+        now = time.time()
+        was_degraded = self._is_worker_degraded()
+        self._worker_degraded_until = now + max(5, int(cooldown_seconds))
+        self._worker_degraded_reason = message
+        if (
+            not was_degraded
+            or (now - self._last_worker_degraded_log_at) >= _WORKER_DEGRADED_LOG_INTERVAL_SECONDS
+        ):
+            self.logger.warning(
+                "MT5 worker marked unavailable for %ds: %s",
+                int(cooldown_seconds),
+                message,
+            )
+            self._last_worker_degraded_log_at = now
+
+    def _clear_worker_degraded(self) -> None:
+        if self._use_metaapi:
+            return
+        self._worker_degraded_until = 0.0
+        self._worker_degraded_reason = ''
+
+    def last_unreachable_reason(self) -> str:
+        """Best-effort explanation for why market data is currently unavailable."""
+        if self._use_metaapi:
+            return 'MetaApi is not reachable.'
+        if self._is_worker_degraded() and self._worker_degraded_reason:
+            return self._worker_degraded_reason
+        return 'MT5 worker is not reachable.'
 
     def _worker_post(self, endpoint: str, payload: dict) -> Tuple[bool, Any]:
         url = f"{self._worker_url}{endpoint}"
@@ -102,8 +161,12 @@ class MT5Connector:
                     continue
                 data = resp.json()
                 if data.get('success'):
+                    self._clear_worker_degraded()
                     return True, data
-                return False, data.get('error', 'Unknown worker error.')
+                error = data.get('error', 'Unknown worker error.')
+                if self._is_worker_terminal_unavailable(error):
+                    self._mark_worker_degraded(error)
+                return False, error
             except requests.exceptions.ConnectionError:
                 self.logger.warning(
                     "Worker unreachable at %s (attempt %d/4)", url, attempt + 1)
@@ -132,8 +195,12 @@ class MT5Connector:
                     continue
                 data = resp.json()
                 if data.get('success'):
+                    self._clear_worker_degraded()
                     return True, data
-                return False, data.get('error', 'Unknown error.')
+                error = data.get('error', 'Unknown error.')
+                if self._is_worker_terminal_unavailable(error):
+                    self._mark_worker_degraded(error)
+                return False, error
             except requests.exceptions.ConnectionError:
                 self.logger.warning(
                     "Worker unreachable (GET) %s (attempt %d/4)",
@@ -150,6 +217,100 @@ class MT5Connector:
         if not creds:
             self.logger.warning("No MT5 credentials for user %d", telegram_id)
         return creds
+
+    def _get_market_data_worker_creds(self) -> Optional[dict]:
+        """
+        Reuse an already-connected MT5 account for shared market-data calls.
+        Prefer admin accounts first, then any active subscriber with MT5 linked.
+        """
+        candidate_ids: List[int] = []
+
+        if self._market_data_telegram_id is not None:
+            candidate_ids.append(self._market_data_telegram_id)
+
+        try:
+            users = db.get_subscribed_users()
+        except Exception as e:
+            self.logger.warning("Could not load subscribed users for market data: %s", e)
+            users = []
+
+        connected_ids = [
+            int(user['telegram_id'])
+            for user in users
+            if user.get('mt5_connected') and user.get('telegram_id') is not None
+        ]
+
+        for admin_id in getattr(config, 'ADMIN_USER_IDS', []):
+            candidate_ids.append(admin_id)
+        candidate_ids.extend(connected_ids)
+
+        seen: set[int] = set()
+        for telegram_id in candidate_ids:
+            if telegram_id in seen:
+                continue
+            seen.add(telegram_id)
+            creds = db.get_mt5_credentials(telegram_id)
+            if creds:
+                self._market_data_telegram_id = telegram_id
+                return creds
+        return None
+
+    def _probe_worker_health_sync(self) -> Tuple[bool, str]:
+        """
+        Health-check the HTTP worker with a short-lived circuit breaker.
+        This prevents one MT5 outage from triggering a fan-out of candle calls.
+        """
+        if self._is_worker_degraded():
+            return False, self.last_unreachable_reason()
+
+        creds = self._get_market_data_worker_creds()
+        if creds:
+            symbol = (getattr(config, 'MONITORED_SYMBOLS', None) or ['EURUSD'])[0]
+            payload = {
+                'login': creds['login'],
+                'password': creds['password'],
+                'server': creds['server'],
+                'symbol': symbol,
+                'timeframe': 'M5',
+                'bars': 2,
+            }
+            ok, res = self._worker_post('/candles', payload)
+            if ok:
+                self._clear_worker_degraded()
+                return True, 'Credentialed MT5 market-data probe succeeded.'
+            reason = str(res or 'MT5 worker market-data probe failed.')
+            self._mark_worker_degraded(reason)
+            return False, reason
+
+        try:
+            resp = requests.get(
+                f"{self._worker_url}/health",
+                headers=self._worker_headers(),
+                timeout=5,
+            )
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+
+            status = str(payload.get('status', '')).lower()
+            message = (
+                payload.get('message')
+                or payload.get('error')
+                or f"Health check returned HTTP {resp.status_code}."
+            )
+
+            if resp.status_code == 200 and status in {'online', 'busy', 'ok', 'healthy'}:
+                self._clear_worker_degraded()
+                return True, message
+
+            cooldown = 15 if status == 'busy' else _WORKER_DEGRADED_COOLDOWN_SECONDS
+            self._mark_worker_degraded(message, cooldown_seconds=cooldown)
+            return False, message
+        except Exception as e:
+            reason = f"MT5 worker health check failed: {e}"
+            self._mark_worker_degraded(reason, cooldown_seconds=30)
+            return False, reason
 
     # ================================================================
     # METAAPI HELPERS
@@ -241,15 +402,11 @@ class MT5Connector:
         else:
             try:
                 loop = asyncio.get_running_loop()
-                resp = await loop.run_in_executor(
+                ok, _reason = await loop.run_in_executor(
                     None,
-                    lambda: requests.get(
-                        f"{self._worker_url}/health",
-                        headers=self._worker_headers(),
-                        timeout=5,
-                    )
+                    self._probe_worker_health_sync,
                 )
-                return resp.status_code == 200
+                return ok
             except Exception:
                 return False
 
@@ -262,12 +419,8 @@ class MT5Connector:
                 return False
         else:
             try:
-                resp = requests.get(
-                    f"{self._worker_url}/health",
-                    headers=self._worker_headers(),
-                    timeout=5,
-                )
-                return resp.status_code == 200
+                ok, _reason = self._probe_worker_health_sync()
+                return ok
             except Exception:
                 return False
 
@@ -374,8 +527,19 @@ class MT5Connector:
             return None, None
         else:
             loop    = asyncio.get_running_loop()
-            ok, res = await loop.run_in_executor(
-                None, lambda: self._worker_get('/tick', params={'symbol': symbol}))
+            creds = self._get_market_data_worker_creds()
+            if creds:
+                payload = {
+                    'login': creds['login'],
+                    'password': creds['password'],
+                    'server': creds['server'],
+                    'symbol': symbol,
+                }
+                ok, res = await loop.run_in_executor(
+                    None, lambda: self._worker_post('/tick', payload))
+            else:
+                ok, res = await loop.run_in_executor(
+                    None, lambda: self._worker_get('/tick', params={'symbol': symbol}))
             if ok and isinstance(res, dict):
                 return res.get('bid'), res.get('ask')
             return None, None
@@ -389,12 +553,25 @@ class MT5Connector:
         if self._use_metaapi:
             return await self._candles_metaapi(symbol, timeframe, bars)
         else:
+            if self._is_worker_degraded():
+                return None
             loop    = asyncio.get_running_loop()
             payload = {'symbol': symbol, 'timeframe': timeframe, 'bars': bars}
+            creds = self._get_market_data_worker_creds()
+            if creds:
+                payload.update({
+                    'login': creds['login'],
+                    'password': creds['password'],
+                    'server': creds['server'],
+                })
             ok, res = await loop.run_in_executor(
                 None, lambda: self._worker_post('/candles', payload))
             if ok and isinstance(res, dict):
+                self._clear_worker_degraded()
                 return res.get('candles')
+            if self._is_worker_terminal_unavailable(res):
+                self._mark_worker_degraded(res)
+                return None
             self.logger.warning(
                 "Worker candles failed %s %s: %s", symbol, timeframe, res)
             return None
@@ -450,6 +627,13 @@ class MT5Connector:
                 return None
         else:
             payload = {'symbol': symbol, 'timeframe': timeframe, 'bars': bars}
+            creds = self._get_market_data_worker_creds()
+            if creds:
+                payload.update({
+                    'login': creds['login'],
+                    'password': creds['password'],
+                    'server': creds['server'],
+                })
             ok, res = self._worker_post('/candles', payload)
             if ok and isinstance(res, dict):
                 return res.get('candles')
@@ -469,8 +653,18 @@ class MT5Connector:
                 return {}
         else:
             loop    = asyncio.get_running_loop()
-            ok, res = await loop.run_in_executor(
-                None, lambda: self._worker_get('/exchange_rates'))
+            creds = self._get_market_data_worker_creds()
+            if creds:
+                payload = {
+                    'login': creds['login'],
+                    'password': creds['password'],
+                    'server': creds['server'],
+                }
+                ok, res = await loop.run_in_executor(
+                    None, lambda: self._worker_post('/exchange_rates', payload))
+            else:
+                ok, res = await loop.run_in_executor(
+                    None, lambda: self._worker_get('/exchange_rates'))
             if ok and isinstance(res, dict):
                 return res.get('rates', {})
             return {}
@@ -821,12 +1015,22 @@ class MT5Connector:
         if self._use_metaapi:
             return await self._ticket_status_metaapi(telegram_id, ticket)
         else:
-            return await self._ticket_status_worker(ticket)
+            return await self._ticket_status_worker(telegram_id, ticket)
 
-    async def _ticket_status_worker(self, ticket: int):
-        loop    = asyncio.get_running_loop()
-        ok, res = await loop.run_in_executor(
-            None, lambda: self._worker_get('/ticket_status/%d' % ticket))
+    async def _ticket_status_worker(self, telegram_id: int, ticket: int):
+        creds = self._get_worker_creds(telegram_id)
+        loop = asyncio.get_running_loop()
+        if creds:
+            payload = {
+                'login': creds['login'],
+                'password': creds['password'],
+                'server': creds['server'],
+            }
+            ok, res = await loop.run_in_executor(
+                None, lambda: self._worker_post('/ticket_status/%d' % ticket, payload))
+        else:
+            ok, res = await loop.run_in_executor(
+                None, lambda: self._worker_get('/ticket_status/%d' % ticket))
         if ok and isinstance(res, dict):
             return {
                 'status':       res.get('status', 'UNKNOWN'),

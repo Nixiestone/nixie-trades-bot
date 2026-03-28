@@ -45,13 +45,11 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONVERSATION STATES ====================
 
-DISCLAIMER_SHOWN           = 0
 MT5_WAITING_LOGIN          = 0
 MT5_WAITING_PASSWORD       = 1
 MT5_WAITING_SERVER         = 2
 SETTINGS_WAITING_RISK      = 0
 SETTINGS_WAITING_TZ        = 1
-AUTO_MGMT_DISCLAIMER_SHOWN = 0
 
 # ==================== RATE LIMITER ====================
 
@@ -378,31 +376,11 @@ class NixTradesBot:
         app.add_handler(CommandHandler('help',           self.cmd_help))
         app.add_handler(CommandHandler('status',         self.cmd_status))
         app.add_handler(CommandHandler('latest',         self.cmd_latest))
+        app.add_handler(CommandHandler('subscribe',      self.cmd_subscribe))
+        app.add_handler(CommandHandler('settings',       self.cmd_settings))
         app.add_handler(CommandHandler('unsubscribe',    self.cmd_unsubscribe))
         app.add_handler(CommandHandler('disconnect_mt5', self.cmd_disconnect_mt5))
-        app.add_handler(CommandHandler('download',      self.cmd_download))
-
-        # ---- Subscribe conversation ----
-        # per_message=True is required when CallbackQueryHandler is inside a
-        # ConversationHandler to suppress the PTBUserWarning.
-        subscribe_conv = ConversationHandler(
-            entry_points=[CommandHandler('subscribe', self.cmd_subscribe)],
-            states={
-                DISCLAIMER_SHOWN: [
-                    CallbackQueryHandler(
-                        self.callback_disclaimer_accept, pattern='^disclaimer_accept$'
-                    ),
-                    CallbackQueryHandler(
-                        self.callback_disclaimer_decline, pattern='^disclaimer_decline$'
-                    ),
-                ],
-            },
-            fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
-            per_user=True,
-            per_chat=True,
-            per_message=False,
-        )
-        app.add_handler(subscribe_conv)
+        app.add_handler(CommandHandler('download',       self.cmd_download))
 
         # ---- MT5 connection conversation (step by step, no raw credential message) ----
         mt5_conv = ConversationHandler(
@@ -424,25 +402,13 @@ class NixTradesBot:
         )
         app.add_handler(mt5_conv)
 
-        # ---- Settings conversation ----
-        # entry_points has TWO triggers:
-        #   1. /settings command -> shows keyboard
-        #   2. "Set Timezone" button press -> opens TZ text input state
-        settings_conv = ConversationHandler(
-            entry_points=[
-                CommandHandler('settings', self.cmd_settings),
-                CallbackQueryHandler(
-                    self.callback_settings_tz_prompt, pattern='^settings_tz_prompt$'),
-            ],
-            states={},
-            fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
-            per_user=True,
-            per_chat=True,
-            per_message=False,
-        )
-        app.add_handler(settings_conv)
-
         # ---- Standalone callback buttons ----
+        app.add_handler(CallbackQueryHandler(
+            self.callback_disclaimer_accept, pattern='^disclaimer_accept$'
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_disclaimer_decline, pattern='^disclaimer_decline$'
+        ))
         app.add_handler(CallbackQueryHandler(
             self.callback_unsubscribe_confirm, pattern='^unsub_confirm$'
         ))
@@ -468,7 +434,19 @@ class NixTradesBot:
             self.callback_settings_done, pattern='^settings_done$'
         ))
         app.add_handler(CallbackQueryHandler(
+            self.callback_settings_tz_prompt, pattern='^settings_tz_prompt$'
+        ))
+        app.add_handler(CallbackQueryHandler(
             self.callback_settings_tz_select, pattern=r'^tz_sel_'
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_auto_mgmt_prompt, pattern='^settings_auto_mgmt_prompt$'
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_auto_mgmt_enable, pattern='^auto_mgmt_enable$'
+        ))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_auto_mgmt_cancel, pattern='^auto_mgmt_cancel$'
         ))
         app.add_handler(CallbackQueryHandler(
             self.callback_partial_close,
@@ -478,29 +456,6 @@ class NixTradesBot:
             self.callback_breakeven_decision,
             pattern=r'^breakeven_(yes|no)_\d+$'
         ))
-        # ---- Auto position management disclaimer conversation ----
-        auto_mgmt_conv = ConversationHandler(
-            entry_points=[
-                CallbackQueryHandler(
-                    self.callback_auto_mgmt_prompt,
-                    pattern='^settings_auto_mgmt_prompt$'),
-            ],
-            states={
-                AUTO_MGMT_DISCLAIMER_SHOWN: [
-                    CallbackQueryHandler(
-                        self.callback_auto_mgmt_enable,
-                        pattern='^auto_mgmt_enable$'),
-                    CallbackQueryHandler(
-                        self.callback_auto_mgmt_cancel,
-                        pattern='^auto_mgmt_cancel$'),
-                ],
-            },
-            fallbacks=[CommandHandler('cancel', self.cmd_cancel)],
-            per_user=True,
-            per_chat=True,
-            per_message=False,
-        )
-        app.add_handler(auto_mgmt_conv)
         app.add_handler(CallbackQueryHandler(
             self.callback_auto_mgmt_disable, pattern='^auto_mgmt_disable$'
         ))
@@ -581,6 +536,43 @@ class NixTradesBot:
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for chunk in chunks:
             await update.effective_message.reply_text(chunk, **kwargs)
+
+    @staticmethod
+    def _prompt_message_key(name: str) -> str:
+        """Namespace prompt message IDs stored in PTB's per-user context."""
+        return f"prompt_message_id::{name}"
+
+    def _remember_prompt_message(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        name: str,
+        message_id: Optional[int],
+    ) -> None:
+        """Track the latest one-shot inline prompt for a user."""
+        key = self._prompt_message_key(name)
+        if message_id is None:
+            context.user_data.pop(key, None)
+            return
+        context.user_data[key] = int(message_id)
+
+    async def _consume_prompt_message(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        query,
+        name: str,
+        expired_text: str,
+    ) -> bool:
+        """
+        Allow a one-shot callback only for the latest prompt message we issued.
+        This prevents stale inline keyboards from remaining actionable forever.
+        """
+        key = self._prompt_message_key(name)
+        expected_id = context.user_data.pop(key, None)
+        current_id = getattr(getattr(query, 'message', None), 'message_id', None)
+        if expected_id is None or current_id != expected_id:
+            await query.answer(expired_text, show_alert=True)
+            return False
+        return True
 
     async def _send_with_retry(self, chat_id: int, text: str) -> bool:
         """
@@ -754,12 +746,14 @@ class NixTradesBot:
                 ),
                 InlineKeyboardButton("Decline", callback_data='disclaimer_decline'),
             ]])
-            await self._reply(
-                update,
+            sent = await update.effective_message.reply_text(
                 utils.validate_user_message(config.LEGAL_DISCLAIMER),
                 reply_markup=keyboard,
             )
-            return DISCLAIMER_SHOWN
+            self._remember_prompt_message(
+                context, 'subscribe_disclaimer', getattr(sent, 'message_id', None)
+            )
+            return ConversationHandler.END
 
         except Exception as e:
             self.logger.error("Error in /subscribe: %s", e)
@@ -771,6 +765,13 @@ class NixTradesBot:
     ) -> int:
         """User accepted disclaimer - activate subscription."""
         query = update.callback_query
+        if not await self._consume_prompt_message(
+            context,
+            query,
+            'subscribe_disclaimer',
+            "This subscription prompt has expired. Use /subscribe again.",
+        ):
+            return ConversationHandler.END
         await query.answer()
         try:
             telegram_id = update.effective_user.id
@@ -786,6 +787,13 @@ class NixTradesBot:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
         query = update.callback_query
+        if not await self._consume_prompt_message(
+            context,
+            query,
+            'subscribe_disclaimer',
+            "This subscription prompt has expired. Use /subscribe again.",
+        ):
+            return ConversationHandler.END
         await query.answer()
         await query.edit_message_text(
             utils.validate_user_message(
@@ -1260,7 +1268,7 @@ class NixTradesBot:
         """
         Handle /settings.
         Shows risk percentage as inline keyboard buttons.
-        Timezone is set by pressing the timezone button (separate conversation entry).
+        Timezone is set by pressing the inline timezone prompt button.
         """
         if not self._check_rate_limit(update):
             await self._reply(update, "You are sending commands too quickly. Please wait a moment.")
@@ -1588,13 +1596,23 @@ class NixTradesBot:
             utils.validate_user_message(AUTO_MGMT_DISCLAIMER),
             reply_markup=keyboard,
         )
-        return AUTO_MGMT_DISCLAIMER_SHOWN
+        self._remember_prompt_message(
+            context, 'auto_mgmt_disclaimer', getattr(query.message, 'message_id', None)
+        )
+        return ConversationHandler.END
 
     async def callback_auto_mgmt_enable(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> int:
         """User accepted the autonomous management disclaimer. Enable the feature."""
         query = update.callback_query
+        if not await self._consume_prompt_message(
+            context,
+            query,
+            'auto_mgmt_disclaimer',
+            "This auto-management prompt has expired. Use /settings to open it again.",
+        ):
+            return ConversationHandler.END
         await query.answer()
         telegram_id = query.from_user.id
         try:
@@ -1622,6 +1640,13 @@ class NixTradesBot:
     ) -> int:
         """User cancelled the autonomous management disclaimer. No change."""
         query = update.callback_query
+        if not await self._consume_prompt_message(
+            context,
+            query,
+            'auto_mgmt_disclaimer',
+            "This auto-management prompt has expired. Use /settings to open it again.",
+        ):
+            return ConversationHandler.END
         await query.answer()
         await query.edit_message_text(
             utils.validate_user_message(

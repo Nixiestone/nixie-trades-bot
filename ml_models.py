@@ -188,7 +188,10 @@ class MLEnsemble:
             self.logger.error("Cannot train: no mt5_connector provided.")
             return False
         if not self.mt5.is_service_reachable_sync():
-            self.logger.error("Cannot train: MetaApi not reachable.")
+            self.logger.error(
+                "Cannot train: %s not reachable.",
+                self.mt5.service_label(),
+            )
             return False
         if self.smc is None:
             self.logger.error("Cannot train: SMCStrategy failed to load.")

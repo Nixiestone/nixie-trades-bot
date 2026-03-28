@@ -329,7 +329,10 @@ class NixTradesScheduler:
         """APScheduler entry point for the reconciliation job."""
         if not await self.mt5.is_worker_reachable():
             self.logger.debug(
-                "Reconciliation skipped: MetaApi not reachable.")
+                "Reconciliation skipped: %s not reachable (%s).",
+                self.mt5.service_label(),
+                self.mt5.last_unreachable_reason(),
+            )
             return
         await self._reconcile_open_trades()
 
@@ -490,12 +493,21 @@ class NixTradesScheduler:
             self.logger.info("Starting market scan.")
             if not await self.mt5.is_worker_reachable():
                 self.logger.warning(
-                    "MetaApi not reachable. Skipping market scan. "
-                    "Check Windows VPS worker is running.")
+                    "%s not reachable. Skipping market scan. %s",
+                    self.mt5.service_label(),
+                    self.mt5.last_unreachable_reason(),
+                )
                 return
 
             for symbol in config.MONITORED_SYMBOLS:
                 try:
+                    if not await self.mt5.is_worker_reachable():
+                        self.logger.warning(
+                            "%s became unavailable mid-scan. Stopping remaining symbols. %s",
+                            self.mt5.service_label(),
+                            self.mt5.last_unreachable_reason(),
+                        )
+                        break
                     await self._scan_symbol(symbol)
                     await asyncio.sleep(0.5)   # Brief pause between symbols
                 except Exception as e:
@@ -514,12 +526,16 @@ class NixTradesScheduler:
         Phase 4: Entry/SL/TP calculation and broadcast
         """
         try:
-            # Bail immediately if the MT5 worker is offline.
+            # Bail immediately if the active market-data backend is offline.
             # Without this, the scan blocks for 10+ minutes per symbol
             # retrying 4 times per timeframe with no worker available.
             if not await self.mt5.is_worker_reachable():
                 self.logger.info(
-                    "MetaApi not reachable. Skipping %s.", symbol)
+                    "%s not reachable. Skipping %s. %s",
+                    self.mt5.service_label(),
+                    symbol,
+                    self.mt5.last_unreachable_reason(),
+                )
                 return
 
             # Check news blackout window before doing any analysis
@@ -1512,7 +1528,7 @@ class NixTradesScheduler:
         """
         try:
             if not await self.mt5.is_worker_reachable():
-                return "Market data unavailable (MetaApi not connected)."
+                return "Market data unavailable (%s)." % self.mt5.last_unreachable_reason()
 
             lines = ["MARKET STRUCTURE:"]
             major_pairs = ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD']
@@ -1659,7 +1675,9 @@ class NixTradesScheduler:
                     except Exception:
                         lines.append(f"  {symbol:<10} Data unavailable")
             else:
-                lines.append("  Market data unavailable. MT5 worker is offline.")
+                lines.append(
+                    "  Market data unavailable. %s" % self.mt5.last_unreachable_reason()
+                )
 
             # Convert session windows from UTC to user's local time
             try:

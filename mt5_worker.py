@@ -92,6 +92,12 @@ WORKER_API_KEY     = os.getenv('MT5_WORKER_API_KEY', '').strip()
 WORKER_HOST        = os.getenv('MT5_WORKER_HOST', '0.0.0.0')
 WORKER_PORT        = int(os.getenv('MT5_WORKER_PORT', '8000'))
 MT5_TERMINAL_PATH  = os.getenv('MT5_TERMINAL_PATH', '').strip()
+MT5_MARKETDATA_LOGIN = os.getenv('MT5_MARKETDATA_LOGIN', '').strip()
+MT5_MARKETDATA_PASSWORD = os.getenv('MT5_MARKETDATA_PASSWORD', '').strip()
+MT5_MARKETDATA_SERVER = os.getenv('MT5_MARKETDATA_SERVER', '').strip()
+MT5_TERMINAL_PORTABLE = os.getenv('MT5_TERMINAL_PORTABLE', '').strip().lower() in (
+    '1', 'true', 'yes', 'on'
+)
 MAGIC_NUMBER       = 234567
 
 # Lock timeout: if a thread cannot acquire the MT5 lock within 30 seconds,
@@ -156,6 +162,16 @@ def _find_mt5_terminal() -> str:
 
 # Resolved terminal path (auto-detected or from .env)
 _RESOLVED_TERMINAL_PATH = _find_mt5_terminal()
+
+_MARKETDATA_CREDS_PRESENT = bool(
+    MT5_MARKETDATA_LOGIN and MT5_MARKETDATA_PASSWORD and MT5_MARKETDATA_SERVER
+)
+if any((MT5_MARKETDATA_LOGIN, MT5_MARKETDATA_PASSWORD, MT5_MARKETDATA_SERVER)) and not _MARKETDATA_CREDS_PRESENT:
+    logger.warning(
+        "MT5_MARKETDATA_LOGIN, MT5_MARKETDATA_PASSWORD, and MT5_MARKETDATA_SERVER "
+        "must all be set together. Shared market-data login is disabled until "
+        "the full set is provided."
+    )
 
 if not WORKER_API_KEY:
     raise ValueError(
@@ -279,6 +295,73 @@ def _shutdown_safe():
         mt5.shutdown()
     except Exception:
         pass
+
+
+def _shared_init_kwargs(timeout_ms: int = 10000) -> Dict[str, Any]:
+    """
+    Build MT5.initialize kwargs for shared worker endpoints like /candles.
+    Prefer explicit worker credentials when configured; otherwise fall back to
+    the currently logged-in terminal session.
+    """
+    kwargs: Dict[str, Any] = {'timeout': timeout_ms}
+    if _RESOLVED_TERMINAL_PATH:
+        kwargs['path'] = _RESOLVED_TERMINAL_PATH
+    if MT5_TERMINAL_PORTABLE:
+        kwargs['portable'] = True
+    if _MARKETDATA_CREDS_PRESENT:
+        try:
+            kwargs['login'] = int(MT5_MARKETDATA_LOGIN)
+        except ValueError:
+            logger.warning(
+                "Invalid MT5_MARKETDATA_LOGIN value. It must be numeric."
+            )
+        else:
+            kwargs['password'] = MT5_MARKETDATA_PASSWORD
+            kwargs['server'] = MT5_MARKETDATA_SERVER
+    return kwargs
+
+
+def _initialise_shared_terminal(timeout_ms: int = 10000) -> Tuple[bool, str]:
+    """
+    Initialise MT5 for shared market-data endpoints.
+    This supports a dedicated worker account via MT5_MARKETDATA_* env vars.
+    """
+    init_kwargs = _shared_init_kwargs(timeout_ms)
+    if not mt5.initialize(**init_kwargs):
+        error = mt5.last_error()
+        logger.warning("MT5 shared initialise failed: %s", error)
+        if _MARKETDATA_CREDS_PRESENT:
+            return (
+                False,
+                "MT5 market-data account login failed. "
+                "Check MT5_MARKETDATA_LOGIN, MT5_MARKETDATA_PASSWORD, and "
+                "MT5_MARKETDATA_SERVER in .env.",
+            )
+        return (
+            False,
+            "MT5 terminal is not available. Ensure MetaTrader 5 is open and "
+            "logged in on this machine, or configure MT5_MARKETDATA_LOGIN, "
+            "MT5_MARKETDATA_PASSWORD, and MT5_MARKETDATA_SERVER in .env.",
+        )
+    return True, ''
+
+
+def _initialise_market_data_request(
+    data: Optional[dict] = None,
+    timeout_ms: int = 10000,
+) -> Tuple[bool, str]:
+    """
+    Initialise MT5 for shared market-data endpoints.
+    If explicit login credentials are supplied in the request, reuse the same
+    per-user MT5 credentials already stored for auto-execution.
+    """
+    data = data or {}
+    if all(k in data for k in ('login', 'password', 'server')):
+        valid, err_msg, login = _validate_login(data['login'])
+        if not valid:
+            return False, err_msg
+        return _initialise_headless(login, data['password'], data['server'])
+    return _initialise_shared_terminal(timeout_ms=timeout_ms)
 
 
 # ==================== VALIDATION HELPERS ====================
@@ -670,28 +753,61 @@ def _translate_retcode(retcode: int, raw_comment: str) -> str:
 def health():
     """
     Health check endpoint.
-    Returns HTTP 503 if the MT5 terminal cannot be found so that
-    load balancers remove this instance from rotation automatically.
+    Returns HTTP 503 when the MT5 terminal is unavailable or not logged in.
+    This allows the bot scheduler to skip scans before it fans out into
+    dozens of candle requests that are guaranteed to fail.
     """
-    terminal_ok = bool(_RESOLVED_TERMINAL_PATH)
-
-    if not terminal_ok:
+    if not _RESOLVED_TERMINAL_PATH:
         return jsonify({
             'status':    'degraded',
             'service':   'Nix Trades Execution Service',
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'message':   (
-                'MT5 terminal not found. '
-                'Set MT5_TERMINAL_PATH in your .env file. '
-                'Example: MT5_TERMINAL_PATH=C:\\Program Files\\MetaTrader 5 EXNESS\\terminal64.exe'
+                'MT5 terminal not found. Configure MT5_TERMINAL_PATH and '
+                'ensure MetaTrader 5 is installed on this Windows host.'
             ),
         }), 503
 
-    return jsonify({
-        'status':    'online',
-        'service':   'Nix Trades Execution Service',
-        'timestamp': datetime.now(timezone.utc).isoformat(),
-    })
+    acquired = _mt5_lock.acquire(timeout=0)
+    if not acquired:
+        return jsonify({
+            'status':    'busy',
+            'service':   'Nix Trades Execution Service',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'message':   'MT5 worker is processing another request.',
+        }), 200
+
+    try:
+        ok, err = _initialise_shared_terminal(timeout_ms=5000)
+        if not ok:
+            return jsonify({
+                'status':    'degraded',
+                'service':   'Nix Trades Execution Service',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'message':   err,
+            }), 503
+
+        if mt5.account_info() is None:
+            return jsonify({
+                'status':    'degraded',
+                'service':   'Nix Trades Execution Service',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'message':   (
+                    'MT5 terminal is running but no trading account is logged in. '
+                    'Log in to MetaTrader 5 on this machine, or configure '
+                    'MT5_MARKETDATA_LOGIN, MT5_MARKETDATA_PASSWORD, and '
+                    'MT5_MARKETDATA_SERVER in .env.'
+                ),
+            }), 503
+
+        return jsonify({
+            'status':    'online',
+            'service':   'Nix Trades Execution Service',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
+    finally:
+        _shutdown_safe()
+        _mt5_lock.release()
 
 
 @app.route('/lot_size', methods=['POST'])
@@ -774,7 +890,7 @@ def calculate_lot_size_endpoint():
         _mt5_lock.release()
 
 
-@app.route('/tick', methods=['GET'])
+@app.route('/tick', methods=['GET', 'POST'])
 @require_api_key
 def get_tick():
     """
@@ -786,7 +902,8 @@ def get_tick():
     if size_error:
         return size_error
 
-    symbol = request.args.get('symbol', '').upper().strip()
+    raw = request.get_json(force=True, silent=True) or {}
+    symbol = str(raw.get('symbol') or request.args.get('symbol', '')).upper().strip()
     if not symbol:
         return jsonify({'success': False, 'error': 'symbol parameter required'}), 400
 
@@ -794,11 +911,9 @@ def get_tick():
     if not acquired:
         return jsonify({'success': False, 'error': 'Service busy. Please retry in 30 seconds.'}), 503
     try:
-        _init_kwargs: dict = {'timeout': 10000}
-        if _RESOLVED_TERMINAL_PATH:
-            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
-        if not mt5.initialize(**_init_kwargs):
-            return jsonify({'success': False, 'error': 'MT5 terminal is not available.'})
+        ok, err = _initialise_market_data_request(raw, timeout_ms=10000)
+        if not ok:
+            return jsonify({'success': False, 'error': err})
 
         broker_symbol = _normalise_symbol(symbol)
         if broker_symbol is None:
@@ -821,7 +936,7 @@ def get_tick():
         _mt5_lock.release()
 
 
-@app.route('/exchange_rates', methods=['GET'])
+@app.route('/exchange_rates', methods=['GET', 'POST'])
 @require_api_key
 def get_exchange_rates():
     """
@@ -829,15 +944,15 @@ def get_exchange_rates():
     Used by the connector's lot-size calculation when the account currency
     is not USD. Returns the mid-price (bid + ask) / 2 for each pair.
     """
+    raw = request.get_json(force=True, silent=True) or {}
+
     acquired = _mt5_lock.acquire(timeout=_MT5_LOCK_TIMEOUT)
     if not acquired:
         return jsonify({'success': False, 'error': 'Service busy. Please retry in 30 seconds.'}), 503
     try:
-        _init_kwargs: dict = {'timeout': 10000}
-        if _RESOLVED_TERMINAL_PATH:
-            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
-        if not mt5.initialize(**_init_kwargs):
-            return jsonify({'success': False, 'error': 'MT5 terminal is not available.'})
+        ok, err = _initialise_market_data_request(raw, timeout_ms=10000)
+        if not ok:
+            return jsonify({'success': False, 'error': err})
 
         rate_symbols = ['USDJPY', 'EURUSD', 'GBPUSD', 'AUDUSD', 'USDCAD', 'USDCHF']
         rates = {}
@@ -1103,8 +1218,8 @@ def account():
 def get_candles():
     """
     Return OHLCV bars for a symbol.
-    Does not require MT5 account login credentials.
-    Uses the terminal's existing session for data access only.
+    Uses the worker's shared MT5 session by default, but can also accept the
+    same login/password/server credentials used for auto-execution.
     """
     # All parameter extraction happens here, BEFORE acquiring any lock.
     # If any of these fail, Flask returns JSON immediately without touching MT5.
@@ -1158,23 +1273,11 @@ def get_candles():
         }), 503
 
     try:
-        _init_kwargs: dict = {'timeout': 10000}
-        if _RESOLVED_TERMINAL_PATH:
-            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
-        if not mt5.initialize(**_init_kwargs):
-            _err_detail = mt5.last_error()
-            logger.warning(
-                "MT5 initialize failed in /candles: %s. "
-                "Ensure MetaTrader 5 is open and logged in on this machine.",
-                _err_detail,
-            )
+        ok, err = _initialise_market_data_request(raw, timeout_ms=10000)
+        if not ok:
             return jsonify({
                 'success': False,
-                'error': (
-                    'MT5 terminal is not available. '
-                    'Ensure MetaTrader 5 is open and logged in on the '
-                    'Windows machine running this worker.'
-                ),
+                'error': err,
             })
 
         symbol = _normalise_symbol(symbol_raw)
@@ -1456,7 +1559,7 @@ def modify_sl():
         _shutdown_safe()
         _mt5_lock.release()
         
-@app.route('/ticket_status/<int:ticket>', methods=['GET'])
+@app.route('/ticket_status/<int:ticket>', methods=['GET', 'POST'])
 @require_api_key
 def ticket_status(ticket: int):
     """
@@ -1480,11 +1583,10 @@ def ticket_status(ticket: int):
         }), 503
 
     try:
-        _init_kwargs: dict = {'timeout': 10000}
-        if _RESOLVED_TERMINAL_PATH:
-            _init_kwargs['path'] = _RESOLVED_TERMINAL_PATH
-        if not mt5.initialize(**_init_kwargs):
-            return jsonify({'success': False, 'error': 'MT5 terminal is not available.'})
+        data = request.get_json(force=True, silent=True) or {}
+        ok, err = _initialise_market_data_request(data, timeout_ms=10000)
+        if not ok:
+            return jsonify({'success': False, 'error': err})
 
         # 1. Check open positions
         positions = mt5.positions_get(ticket=ticket)
