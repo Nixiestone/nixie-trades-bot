@@ -17,6 +17,7 @@ logging_config.setup_logging(log_level='INFO')
 logger = logging.getLogger('train_models')
 
 import config
+import database as db
 from mt5_connector import MT5Connector
 from ml_models import MLEnsemble
 
@@ -43,6 +44,18 @@ def main():
     logger.info("NIXIE TRADES - ML MODEL TRAINING")
     logger.info("Training on MT5 historical data from %s to %s", start_date, end_date)
     logger.info("=" * 60)
+
+    # ---- Step 0: Initialise database so encrypted MT5 credentials can be reused ----
+    logger.info("Step 0: Initialising database for encrypted MT5 credential access ...")
+    try:
+        db.init_supabase()
+    except Exception as e:
+        logger.error(
+            "Could not initialise database. train_models.py now reuses the same "
+            "encrypted MT5 credentials used for auto-execution, so Supabase must be available: %s",
+            e,
+        )
+        sys.exit(1)
 
     # ---- Step 1: Connect to MT5 worker ----
     logger.info("Step 1: Connecting to MT5 worker at %s ...", config.MT5_WORKER_URL)

@@ -223,6 +223,9 @@ class MT5Connector:
         Reuse an already-connected MT5 account for shared market-data calls.
         Prefer admin accounts first, then any active subscriber with MT5 linked.
         """
+        if getattr(db, 'supabase_client', None) is None or getattr(db, '_fernet', None) is None:
+            return None
+
         candidate_ids: List[int] = []
 
         if self._market_data_telegram_id is not None:
