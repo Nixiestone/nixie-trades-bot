@@ -61,12 +61,12 @@ MAX_RISK_PERCENT      = 5.0
 MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios
-MIN_RR_RATIO   = 2.5   # Minimum acceptable risk-reward ratio for any setup
-MIN_RR_TP2     = 3.0   # Minimum R:R for TP2. If structure cannot offer this, TP2 collapses to TP1
+MIN_RR_RATIO   = 1.5   # Minimum acceptable risk-reward ratio for TP1
+MIN_RR_TP2     = 2.0   # Minimum R:R for TP2 and training outcome targets
 MIN_SETUP_QUALITY_SCORE = 55   # Setups scoring below this are rejected by _check_filters
 
 # Maximum RR caps — prevent unreachable TP targets derived from D1 swing levels.
-# H1 setups must target levels achievable within the 8-hour expiry window.
+# H1 setups must target levels achievable within the 12-hour expiry window.
 # Without these caps, a 12-pip SL produces 660-pip TPs (RR 1:53) that never fill.
 MAX_RR_TP1 = 5.0    # TP1 never more than 5x risk from entry
 MAX_RR_TP2 = 10.0   # TP2 never more than 10x risk from entry
@@ -82,13 +82,16 @@ BREAKEVEN_BUFFER_PIPS = 5
 DEFAULT_ORDER_EXPIRY_HOURS   = 1
 LIMIT_ORDER_EXPIRY_MINUTES   = 60
 STOP_ORDER_EXPIRY_MINUTES    = 60
+H1_SETUP_EXPIRY_HOURS        = 12
+H1_SETUP_EXPIRY_MINUTES      = H1_SETUP_EXPIRY_HOURS * 60
+H1_SETUP_EXPIRY_BARS_M15     = H1_SETUP_EXPIRY_HOURS * 4
 
 # ==================== MONITORED SYMBOLS ====================
 
 MONITORED_SYMBOLS = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD',
     'NZDUSD', 'USDCHF', 'EURGBP', 'EURJPY', 'GBPJPY',
-    'XAUUSD', 'XAGUSD'
+    'XAUUSD', 'XAGUSD', 'BTCUSD'
 ]
 
 CURRENCY_PAIRS = MONITORED_SYMBOLS
@@ -120,7 +123,8 @@ SYMBOL_VARIATIONS = {
     'EURJPY': ['EURJPY', 'EURJPY.pro', 'EURJPY.raw', 'EURJPY-a', 'EURJPYm', 'EUR/JPY'],
     'GBPJPY': ['GBPJPY', 'GBPJPY.pro', 'GBPJPY.raw', 'GBPJPY-a', 'GBPJPYm', 'GBP/JPY'],
     'XAUUSD': ['XAUUSD', 'XAUUSDm', 'XAUUSD.pro', 'GOLD', 'GOLD.pro', 'GOLD-a', 'GOLDm'],
-    'XAGUSD': ['XAGUSD', 'XAGUSDm', 'XAGUSD.pro', 'SILVER', 'SILVER.pro', 'SILVER-a']
+    'XAGUSD': ['XAGUSD', 'XAGUSDm', 'XAGUSD.pro', 'SILVER', 'SILVER.pro', 'SILVER-a'],
+    'BTCUSD': ['BTCUSD', 'BTCUSDm', 'BTCUSD.pro', 'BTCUSD.raw', 'BTCUSD-a', 'BTC/USD', 'BTCUSDT']
 }
 
 # ==================== ML CONFIGURATION ====================
@@ -139,6 +143,12 @@ ML_TIER_DISCRETIONARY  = 55   # 55-59% = Discretionary (optional, lower confiden
 
 # Auto-execution threshold: only execute trades when ML agrees this strongly
 ML_AUTO_EXECUTE_THRESHOLD = 60
+
+# Training sample density:
+# Labels run for the full 12-hour H1 setup lifetime (48 M15 bars), but we keep
+# a tighter 32-bar sampling stride so the trainer still sees enough candidate
+# windows after the longer expiry change.
+TRAINING_WINDOW_STEP_M15 = 32
 
 # ==================== RISK MANAGEMENT ====================
 

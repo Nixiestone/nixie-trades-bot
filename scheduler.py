@@ -550,7 +550,7 @@ class NixTradesScheduler:
 
             # 15-minute guard: prevents reprocessing the exact same pair
             # on back-to-back scan cycles before any new structure can form.
-            # The 480-minute per-direction guard is applied later after the
+            # The H1-expiry per-direction guard is applied later after the
             # trade direction is determined from the POI.
             if db.recent_signal_exists(symbol, minutes=15):
                 self.logger.debug(
@@ -769,13 +769,21 @@ class NixTradesScheduler:
             sweep_level = float(inducement.get('sweep_level', 0))
 
             # Direction is now confirmed from the anchor POI.
-            # Apply the 480-minute per-direction cooldown here so that a SELL
-            # can fire on a pair that already had a BUY in the last 8 hours.
+            # Apply the H1-expiry per-direction cooldown here so that a SELL
+            # can fire on a pair that already had a BUY in the last 12 hours.
             _dir_str = 'BUY' if trade_direction == 'BULLISH' else 'SELL'
-            if db.recent_signal_exists(symbol, minutes=480, direction=_dir_str):
+            if db.recent_signal_exists(
+                symbol,
+                minutes=config.H1_SETUP_EXPIRY_MINUTES,
+                direction=_dir_str,
+            ):
                 self.logger.info(
-                    "COOLDOWN | %s %s | same direction sent within 480 minutes. "
-                    "Skipping.", symbol, _dir_str)
+                    "COOLDOWN | %s %s | same direction sent within %d minutes. "
+                    "Skipping.",
+                    symbol,
+                    _dir_str,
+                    config.H1_SETUP_EXPIRY_MINUTES,
+                )
                 return
 
             # Now that the sweep is confirmed, pick the CLOSEST unmitigated POI
@@ -954,7 +962,7 @@ class NixTradesScheduler:
                 else:
                     event_ts = event_ts.astimezone(timezone.utc)
                 mins = int((event_ts - datetime.now(timezone.utc)).total_seconds() / 60)
-                if 0 < mins <= 480:
+                if 0 < mins <= config.H1_SETUP_EXPIRY_MINUTES:
                     _time_str = utils.calculate_time_until(event_ts)
                     news_warn = (
                         "Note: %s %s in approximately %s. "
@@ -1010,7 +1018,7 @@ class NixTradesScheduler:
                 'xgboost_score': ml_result['xgboost_score'],
                 'session':       utils.get_session(),
                 'timeframe':     'H1',
-                'expiry_hours':  8,      # H1 expires in 8 hours; M15=2h; H4=24h
+                'expiry_hours':  config.H1_SETUP_EXPIRY_HOURS,
                 'order_type':    await self._determine_order_type(
                     symbol,
                     'BUY' if poi['direction'] == 'BULLISH' else 'SELL',
@@ -1048,7 +1056,10 @@ class NixTradesScheduler:
                 session=setup_data['session'],
                 order_type=setup_data.get('order_type', 'LIMIT'),
                 timeframe=setup_data.get('timeframe', 'H1'),
-                expiry_hours=setup_data.get('expiry_hours', 8),
+                expiry_hours=setup_data.get(
+                    'expiry_hours',
+                    config.H1_SETUP_EXPIRY_HOURS,
+                ),
             )
 
             if signal_row:
@@ -1313,7 +1324,9 @@ class NixTradesScheduler:
                         session=setup_data.get('session', 'N/A'),
                         order_type=setup_data.get('order_type', 'LIMIT'),
                         lot_size=lot_size,
-                        expiry_hours=int(setup_data.get('expiry_hours', 8)),
+                        expiry_hours=int(
+                            setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
+                        ),
                     )
 
                     if news_warn:
@@ -1445,7 +1458,9 @@ class NixTradesScheduler:
             else:
                 order_type = 'MARKET' if (current is not None and current >= entry) else 'LIMIT'
 
-            expiry_minutes = int(setup_data.get('expiry_hours', 8)) * 60
+            expiry_minutes = int(
+                setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
+            ) * 60
 
             success, ticket, actual_lot, message = await self.mt5.place_order(
                 telegram_id=tid,

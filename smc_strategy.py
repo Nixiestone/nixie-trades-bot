@@ -799,7 +799,7 @@ class SMCStrategy:
             #
             # Old code placed entry at the OPPOSITE end (deep inside zone).
             # That required price to travel through the entire zone before filling,
-            # which almost never happens within the 8-hour expiry window.
+            # which rarely happens even within the 12-hour expiry window.
             if direction in ('BULLISH', 'BUY'):
                 entry = poi_high - (poi_range * zone)
             else:

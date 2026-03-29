@@ -277,7 +277,7 @@ class MLEnsemble:
           2. Detect BOS/MSS on H1
           3. Identify the POI (Order Block or Breaker Block)
           4. Extract 22-element feature vector
-          5. Label WIN/LOSS by looking 40 bars forward for 1:2 RR
+          5. Label WIN/LOSS across the live expiry window using the live TP2 RR
 
         Inconclusive windows (neither target nor SL reached) are discarded.
         This means training data is a realistic sample of real setups.
@@ -285,12 +285,12 @@ class MLEnsemble:
         feats:  List[np.ndarray] = []
         labels: List[float]      = []
         window_size  = 100
-        forward_bars = 32     # 8 hours on M15 (4 bars/hour) - matches live H1 expiry
-        # Step must be >= forward_bars to ensure non-overlapping labeling windows.
-        # Using step=40 with forward_bars=32 means adjacent windows share future bars,
-        # creating autocorrelation between labels that inflates test accuracy to 98%.
-        # step=64 gives non-overlapping future windows and independent labels.
-        step         = 64
+        forward_bars = int(getattr(config, 'H1_SETUP_EXPIRY_BARS_M15', 48))
+        # Keep sampling stride independent from label expiry.
+        # If we force step >= forward_bars after moving expiry to 12 hours, the
+        # stride widens to 48 bars and sample density drops.
+        configured_step = int(getattr(config, 'TRAINING_WINDOW_STEP_M15', 32))
+        step = max(1, configured_step)
 
         # Diagnostic counters - logged at end so you know where samples are lost
         _cnt_total       = 0
@@ -463,18 +463,15 @@ class MLEnsemble:
                     continue
 
                 # --- Phase 5: Label WIN/LOSS from future bars (chronological) ---
-                # forward_bars matches live H1 setup expiry of 8 hours on M15
-                # (8 hours x 4 bars per hour = 32 bars).
-                # Using 80 bars (20 hours) incorrectly includes price action that
+                # forward_bars matches the live H1 setup expiry on M15.
+                # Using a longer horizon incorrectly includes price action that
                 # occurs after a real order would have expired, inflating WIN rate.
-                _expiry_bars = 32  # Matches live H1 setup expiry of 8 hours on M15 (4 bars per hour)
+                _expiry_bars = forward_bars
                 future = m15_df.iloc[i: i + _expiry_bars]
                 if len(future) < 10:
                     continue
 
-                # Use config.MIN_RR_TP2 (3.0) to match the live system exactly.
-                # Training with 2.5 while live uses 3.0 means the model is
-                # calibrated for different price levels than it actually operates on.
+                # Use config.MIN_RR_TP2 to match the live system exactly.
                 target_reward = risk * config.MIN_RR_TP2
                 is_buy = direction == 'BULLISH'
 
@@ -541,9 +538,11 @@ class MLEnsemble:
 
         self.logger.info(
             "%s sample generation summary: "
+            "step=%d  expiry=%d  target_rr=%.1f  "
             "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
             "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
             symbol,
+            step, forward_bars, config.MIN_RR_TP2,
             _cnt_total, _cnt_asian, _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
             _cnt_bad_entry, _cnt_low_quality, _cnt_unfilled, _cnt_no_label, _cnt_labeled
         )

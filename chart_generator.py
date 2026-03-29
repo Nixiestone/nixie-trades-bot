@@ -728,8 +728,8 @@ class ChartGenerator:
             entry   = bb_high
             sl      = round(bb_low - 3.5, 2)
             risk    = entry - sl
-            tp1     = round(entry + risk * 2.5, 2)
-            tp2     = round(entry + risk * 5.0, 2)
+            tp1     = round(entry + risk * 1.5, 2)
+            tp2     = round(entry + risk * 2.0, 2)
 
             sample_poi = {
                 'type':         'BB',
