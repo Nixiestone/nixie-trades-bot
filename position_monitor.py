@@ -939,8 +939,10 @@ class PositionMonitor:
                 position.ticket, outcome, pips, profit, rr,
             )
 
-            # Store ML outcome for auto-retraining
-            if position.ml_features is not None:
+            # Store ML outcome for auto-retraining.
+            # Breakeven is neither a clean win nor a clean loss, so skip it
+            # instead of mislabeling it as 0.0 and biasing the model downward.
+            if position.ml_features is not None and outcome in ('WIN', 'LOSS'):
                 try:
                     db.save_trade_outcome_for_ml(
                         ticket=position.ticket,
@@ -956,6 +958,12 @@ class PositionMonitor:
                         "Could not save ML training data for ticket %d: %s",
                         position.ticket, ml_err,
                     )
+            elif position.ml_features is not None:
+                self.logger.info(
+                    "Skipping ML outcome save for ticket %d because outcome=%s.",
+                    position.ticket,
+                    outcome,
+                )
 
         except Exception as e:
             self.logger.error(

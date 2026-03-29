@@ -95,11 +95,11 @@ Session:       London
 Entry Price:   1.08450  (Limit Order - price must pull back to this level)
 Stop Loss:     1.08150  (-30.0 pips)
 Take Profit 1: 1.08900  (+45.0 pips, R:R 1:1.5)
-Take Profit 2: 1.09200  (+75.0 pips, R:R 1:2.5)
+Take Profit 2: 1.09050  (+60.0 pips, R:R 1:2.0)
 
 Order Type: LIMIT ORDER
 Price needs to pull back to the entry zone before the order fills.
-The order will expire in 8 hours if not filled.
+The order will expire in 12 hours if not filled.
 
 Position Management (Automatic if MT5 connected):
   - At TP1: 50% of position closed, stop loss moved to breakeven
@@ -659,10 +659,8 @@ class NixTradesBot:
                             filename='sample_setup.png',
                         ),
                         caption=(
-                            "Sample chart markup — EURUSD LONG\n"
-                            "Order Block (amber), Entry (blue), "
-                            "Stop Loss (red), TP1 and TP2 (green).\n"
-                            "This is what every setup alert will include."
+                            "Sample setup chart\n"
+                            "Same chart style and markup layout used for live alerts."
                         ),
                     )
                 except Exception as _photo_err:
@@ -710,9 +708,9 @@ class NixTradesBot:
                             filename='sample_setup.png',
                         ),
                         caption=(
-                            "Sample setup chart — EURUSD LONG\n"
-                            "Basic and Pro subscribers receive a chart "
-                            "like this with every setup alert."
+                            "Sample setup chart\n"
+                            "Basic and Pro subscribers receive a live chart like this "
+                            "with every setup alert."
                         ),
                     )
                 except Exception as _photo_err:
@@ -1245,7 +1243,9 @@ class NixTradesBot:
                     session=signal.get('session', 'N/A'),
                     order_type=signal.get('order_type', 'LIMIT'),
                     lot_size=None,
-                    expiry_hours=int(signal.get('expiry_hours', 8)),
+                    expiry_hours=int(
+                        signal.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
+                    ),
                 )
                 await self._reply(update, msg)
             else:
@@ -2163,7 +2163,9 @@ class NixTradesBot:
                 session=setup_data.get('session', 'N/A'),
                 order_type=setup_data.get('order_type', 'LIMIT'),
                 lot_size=lot_size,
-                expiry_hours=int(setup_data.get('expiry_hours', 8)),
+                expiry_hours=int(
+                    setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
+                ),
             )
             sent = await self._send_with_retry(telegram_id, message)
             if not sent:

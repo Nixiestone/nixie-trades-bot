@@ -439,7 +439,7 @@ def format_setup_message(
     session:        str,
     order_type:     str,
     lot_size:       Optional[float] = None,
-    expiry_hours:   int = 8,
+    expiry_hours:   int = config.H1_SETUP_EXPIRY_HOURS,
 ) -> str:
     """
     Format a standardised automated setup alert message for Telegram.

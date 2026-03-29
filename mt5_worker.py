@@ -655,7 +655,7 @@ def _place_order(
 
     Supports MARKET, LIMIT, and STOP order types.
     Filling mode is negotiated from broker capabilities.
-    Expiry is set per the signal's timeframe: 4H=24h, 1H=8h, 15m=2h.
+    Expiry is set per the signal's timeframe: 4H=24h, 1H=12h, 15m=2h.
 
     Returns:
         (True, result_dict) on success

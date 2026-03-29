@@ -47,10 +47,11 @@ class ChartGenerator:
     matches the signal numbers exactly.
     """
 
-    # Figure dimensions: 12 x 7 inches at 150 DPI = 1800 x 1050 px
-    FIG_W = 12.0
-    FIG_H = 7.0
-    DPI   = 150
+    # Wide-format chart canvas so Telegram users effectively see a full-screen
+    # chart with minimal empty margins while preserving room for right-side labels.
+    FIG_W = 15.5
+    FIG_H = 8.7
+    DPI   = 180
 
     # TradingView dark colour palette
     C_BG       = '#131722'
@@ -84,14 +85,16 @@ class ChartGenerator:
     WICK_LW = 1.0
 
     DISPLAY_BARS   = 80
-    LABEL_OFFSET   = 7
+    LABEL_OFFSET   = 10
     Y_PAD_FRACTION = 0.06
+    POSITION_MIN_WIDTH = 18
 
     def generate_setup_chart(
         self,
         data: pd.DataFrame,
         setup_data: Dict,
         poi: Dict,
+        refined_pois: Optional[List[Dict]] = None,
         additional_pois: Optional[List[Dict]] = None,
         fvgs: Optional[List[Dict]] = None,
         bos_events: Optional[List[Dict]] = None,
@@ -133,7 +136,7 @@ class ChartGenerator:
                 facecolor=self.C_BG,
             )
             fig.subplots_adjust(
-                left=0.005, right=0.84, top=0.915, bottom=0.04)
+                left=0.004, right=0.90, top=0.95, bottom=0.04)
 
             y_min, y_max = self._compute_y_range(tail, setup_data)
 
@@ -158,8 +161,17 @@ class ChartGenerator:
                 self._draw_zone(ax, poi, time_index, n, x_right,
                                 primary=True)
 
+            for refined in (refined_pois or [])[:3]:
+                self._draw_zone(ax, refined, time_index, n, x_right,
+                                primary=False)
+
+            position_anchor = self._resolve_position_anchor(
+                poi, refined_pois or [], time_index, n)
             self._draw_price_levels(ax, setup_data, n, x_right,
-                                    decimals, y_min, y_max)
+                                    decimals, y_min, y_max,
+                                    anchor_x=position_anchor,
+                                    last_close=float(tail.iloc[-1]['close']),
+                                    last_open=float(tail.iloc[-1]['open']))
             self._draw_candles(ax, tail)
             self._draw_volume(ax_vol, tail, n)
             self._draw_time_labels(ax, tail, time_index, n, y_min)
@@ -215,6 +227,7 @@ class ChartGenerator:
             if nice_step <= 0:
                 nice_step = raw_step
             ax.yaxis.set_major_locator(mticker.MultipleLocator(nice_step))
+            ax.yaxis.set_minor_locator(mticker.MultipleLocator(nice_step / 2.0))
 
         ax.tick_params(
             axis='y',
@@ -227,9 +240,19 @@ class ChartGenerator:
             axis='x', which='both',
             bottom=False, top=False, labelbottom=False,
         )
+        ax.tick_params(
+            axis='y', which='minor',
+            right=True, left=False,
+            colors=self.C_TEXT_DIM,
+            length=2, width=0.3,
+        )
         ax.yaxis.grid(
             True, which='major',
             color=self.C_GRID, linewidth=0.45, alpha=0.85, zorder=0,
+        )
+        ax.yaxis.grid(
+            True, which='minor',
+            color=self.C_GRID, linewidth=0.22, alpha=0.32, zorder=0,
         )
         ax.xaxis.grid(False)
 
@@ -301,7 +324,10 @@ class ChartGenerator:
 
         p_type    = str(poi.get('type', 'OB')).upper()
         direction = str(poi.get('direction', 'BULLISH')).upper()
+        timeframe = str(poi.get('timeframe', '')).upper()
+        role      = str(poi.get('role', '')).upper()
         is_bull   = direction in ('BULLISH', 'BUY')
+        is_refined = role == 'REFINEMENT'
 
         if p_type in ('BB', 'BREAKER'):
             color = self.C_BB_BULL if is_bull else self.C_BB_BEAR
@@ -313,9 +339,14 @@ class ChartGenerator:
             color = self.C_OB_BULL if is_bull else self.C_OB_BEAR
             label = 'OB'
 
-        fill_a   = self.ZONE_FILL_ALPHA   * (1.0 if primary else 0.50)
-        border_a = self.ZONE_BORDER_ALPHA * (1.0 if primary else 0.55)
-        border_w = self.ZONE_BORDER_LW    * (1.0 if primary else 0.55)
+        tf_scale = {
+            'H1': 1.00,
+            'M15': 0.78,
+            'M5': 0.62,
+        }.get(timeframe, 0.72 if is_refined else 1.0)
+        fill_a   = self.ZONE_FILL_ALPHA   * (1.0 if primary else (0.78 if is_refined else 0.50))
+        border_a = self.ZONE_BORDER_ALPHA * (1.0 if primary else (0.90 if is_refined else 0.55))
+        border_w = self.ZONE_BORDER_LW    * tf_scale * (1.0 if primary else (0.95 if is_refined else 0.55))
 
         start_x = self._ts_to_bar_index(poi.get('timestamp'), time_index)
         if start_x is None:
@@ -343,12 +374,14 @@ class ChartGenerator:
             alpha=border_a, zorder=6,
         )
 
-        if primary:
+        show_label = primary or is_refined
+        if show_label:
+            label_prefix = f'{timeframe} ' if timeframe else ''
             ax.text(
                 x_right - 0.5, (high + low) / 2.0,
-                f' {label}',
+                f' {label_prefix}{label}',
                 color=color, fontsize=8.0,
-                fontweight='bold',
+                fontweight='bold' if primary else 'normal',
                 va='center', ha='right',
                 alpha=0.95, zorder=8,
             )
@@ -427,61 +460,132 @@ class ChartGenerator:
         decimals: int,
         y_min: float,
         y_max: float,
+        anchor_x: int,
+        last_close: float,
+        last_open: float,
     ):
         """
-        Draw Entry, SL, TP1, TP2 as full-width horizontal lines.
-        Price labels are placed outside the chart on the right.
-        Vertical positions are staggered to prevent label overlap.
+        Draw a TradingView-style position tool plus right-side price markers.
         """
         y_range = max(y_max - y_min, 1e-10)
         min_sep = y_range * 0.024
 
-        levels = [
-            ('entry_price',   self.C_ENTRY, 'ENTRY', 1.5, 'solid'),
-            ('stop_loss',     self.C_SL,    'SL',    1.0, (0, (5, 3))),
-            ('take_profit_1', self.C_TP1,   'TP1',   1.0, (0, (3, 2))),
-            ('take_profit_2', self.C_TP2,   'TP2',   1.0, (0, (3, 2))),
-        ]
+        try:
+            entry = float(setup_data.get('entry_price', 0))
+            stop  = float(setup_data.get('stop_loss', 0))
+            tp1   = float(setup_data.get('take_profit_1', 0))
+            tp2   = float(setup_data.get('take_profit_2', 0))
+        except (TypeError, ValueError):
+            return
 
-        rendered: List[float] = []
+        if min(entry, stop, tp1, tp2) <= 0:
+            return
 
-        for key, color, tag, lw, ls in levels:
-            price = setup_data.get(key)
-            if price is None:
-                continue
-            price = float(price)
-            if price <= 0:
-                continue
+        is_long = str(setup_data.get('direction', 'BUY')).upper() == 'BUY'
+        max_left = max(0.5, float(n) - self.POSITION_MIN_WIDTH - 0.7)
+        pos_left = max(0.5, min(float(anchor_x), max_left))
+        pos_right = pos_left + self.POSITION_MIN_WIDTH
 
+        reward_low = min(entry, tp2)
+        reward_high = max(entry, tp2)
+        risk_low = min(entry, stop)
+        risk_high = max(entry, stop)
+
+        ax.add_patch(mpatches.Rectangle(
+            (pos_left, reward_low),
+            pos_right - pos_left,
+            reward_high - reward_low,
+            facecolor=self.C_TP2,
+            edgecolor=self.C_TP2,
+            linewidth=1.2,
+            alpha=0.16,
+            zorder=5.35,
+        ))
+        ax.add_patch(mpatches.Rectangle(
+            (pos_left, risk_low),
+            pos_right - pos_left,
+            risk_high - risk_low,
+            facecolor=self.C_SL,
+            edgecolor=self.C_SL,
+            linewidth=1.2,
+            alpha=0.14,
+            zorder=5.34,
+        ))
+
+        for y_val, color, lw, ls in (
+            (entry, self.C_ENTRY, 1.6, 'solid'),
+            (stop, self.C_SL, 1.1, (0, (5, 3))),
+            (tp2, self.C_TP2, 1.1, (0, (5, 3))),
+        ):
             ax.plot(
-                [-0.5, x_right],
-                [price, price],
-                color=color, linewidth=lw,
-                linestyle=ls, alpha=0.90, zorder=6,
-            )
-            ax.plot(
-                x_right - 0.2, price,
-                marker='<', color=color,
-                markersize=5, alpha=0.90, zorder=6,
-            )
-
-            label_y = price
-            for prev_y in rendered:
-                if abs(label_y - prev_y) < min_sep:
-                    label_y = prev_y + min_sep * (
-                        1 if label_y >= prev_y else -1)
-            rendered.append(label_y)
-
-            price_fmt = f'%.{decimals}f' % price
-            ax.text(
-                x_right + 0.25, label_y,
-                f'{tag}  {price_fmt}',
+                [pos_left, pos_right],
+                [y_val, y_val],
                 color=color,
-                fontsize=7.5,
-                fontweight='bold' if tag == 'ENTRY' else 'normal',
-                va='center', ha='left',
-                alpha=0.96, zorder=8,
+                linewidth=lw,
+                linestyle=ls,
+                alpha=0.95,
+                zorder=6.2,
             )
+
+        ax.plot(
+            [-0.5, x_right],
+            [tp1, tp1],
+            color=self.C_TP1,
+            linewidth=1.0,
+            linestyle=(0, (1.2, 2.2)),
+            alpha=0.95,
+            zorder=6.1,
+        )
+
+        live_color = self.C_UP if last_close >= last_open else self.C_DOWN
+        ax.plot(
+            [-0.5, x_right],
+            [last_close, last_close],
+            color=live_color,
+            linewidth=0.9,
+            linestyle=(0, (3, 2)),
+            alpha=0.75,
+            zorder=6.0,
+        )
+
+        rr = abs(tp2 - entry) / max(abs(entry - stop), 1e-10)
+        pos_label = 'LONG POSITION' if is_long else 'SHORT POSITION'
+        reward_center = reward_high - (reward_high - reward_low) * 0.18
+        risk_center = risk_low + (risk_high - risk_low) * 0.18
+
+        ax.text(
+            pos_left + 0.7,
+            reward_center,
+            f'{pos_label}   {rr:.2f}R',
+            color=self.C_TEXT,
+            fontsize=7.8,
+            fontweight='bold',
+            ha='left',
+            va='center',
+            alpha=0.96,
+            zorder=6.5,
+        )
+        ax.text(
+            pos_left + 0.7,
+            risk_center,
+            'RISK',
+            color=self.C_TEXT,
+            fontsize=7.2,
+            ha='left',
+            va='center',
+            alpha=0.90,
+            zorder=6.5,
+        )
+
+        levels = [
+            {'price': stop, 'color': self.C_SL, 'tag': 'SL'},
+            {'price': entry, 'color': self.C_ENTRY, 'tag': 'ENTRY'},
+            {'price': tp1, 'color': self.C_TP1, 'tag': 'TP1'},
+            {'price': tp2, 'color': self.C_TP2, 'tag': 'TP2'},
+            {'price': last_close, 'color': live_color, 'tag': 'LIVE'},
+        ]
+        self._draw_right_price_markers(
+            ax, levels, x_right, decimals, y_min, y_max, min_sep)
 
     # =========================================================================
     # VOLUME
@@ -612,6 +716,98 @@ class ChartGenerator:
         pad   = (p_max - p_min) * self.Y_PAD_FRACTION
         return p_min - pad, p_max + pad
 
+    def _resolve_position_anchor(
+        self,
+        poi: Optional[Dict],
+        refined_pois: List[Dict],
+        time_index: list,
+        n: int,
+    ) -> int:
+        candidates = list(refined_pois or [])
+        if poi:
+            candidates.append(poi)
+
+        for candidate in reversed(candidates):
+            idx = self._ts_to_bar_index(candidate.get('timestamp'), time_index)
+            if idx is not None:
+                return max(1, min(idx, n - self.POSITION_MIN_WIDTH))
+
+        return max(1, n - 28)
+
+    def _draw_right_price_markers(
+        self,
+        ax: plt.Axes,
+        levels: List[Dict],
+        x_right: int,
+        decimals: int,
+        y_min: float,
+        y_max: float,
+        min_sep: float,
+    ):
+        valid_levels = []
+        for level in levels:
+            try:
+                price = float(level.get('price', 0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            valid_levels.append({
+                'price': price,
+                'color': level.get('color', self.C_TEXT),
+                'tag': str(level.get('tag', 'PRICE')).upper(),
+            })
+
+        if not valid_levels:
+            return
+
+        valid_levels.sort(key=lambda item: item['price'])
+        label_positions: List[float] = []
+        for item in valid_levels:
+            label_y = item['price']
+            if label_positions and (label_y - label_positions[-1]) < min_sep:
+                label_y = label_positions[-1] + min_sep
+            label_positions.append(label_y)
+
+        overflow = label_positions[-1] - (y_max - min_sep * 0.35)
+        if overflow > 0:
+            label_positions = [y - overflow for y in label_positions]
+
+        underflow = (y_min + min_sep * 0.35) - label_positions[0]
+        if underflow > 0:
+            label_positions = [y + underflow for y in label_positions]
+
+        for item, label_y in zip(valid_levels, label_positions):
+            price_fmt = f'%.{decimals}f' % item['price']
+            ax.plot(
+                [x_right - 0.65, x_right + 0.15],
+                [item['price'], label_y],
+                color=item['color'],
+                linewidth=0.9,
+                alpha=0.88,
+                zorder=8.8,
+                clip_on=False,
+            )
+            ax.text(
+                x_right + 0.30,
+                label_y,
+                f' {item["tag"]} {price_fmt} ',
+                color='#ffffff',
+                fontsize=7.3,
+                fontweight='bold',
+                va='center',
+                ha='left',
+                alpha=0.98,
+                zorder=9.2,
+                clip_on=False,
+                bbox={
+                    'boxstyle': 'round,pad=0.22,rounding_size=0.16',
+                    'facecolor': item['color'],
+                    'edgecolor': 'none',
+                    'alpha': 0.96,
+                },
+            )
+
     def _ts_to_bar_index(
         self, ts, time_index: list
     ) -> Optional[int]:
@@ -728,12 +924,14 @@ class ChartGenerator:
             entry   = bb_high
             sl      = round(bb_low - 3.5, 2)
             risk    = entry - sl
-            tp1     = round(entry + risk * 2.5, 2)
-            tp2     = round(entry + risk * 5.0, 2)
+            tp1     = round(entry + risk * 1.5, 2)
+            tp2     = round(entry + risk * 2.0, 2)
 
             sample_poi = {
                 'type':         'BB',
                 'direction':    'BULLISH',
+                'timeframe':    'H1',
+                'role':         'PRIMARY',
                 'high':         bb_high,
                 'low':          bb_low,
                 'timestamp':    times[41],
@@ -742,6 +940,34 @@ class ChartGenerator:
                 'impulse_pips': 52.0,
                 'confidence':   82,
             }
+            sample_refined = [
+                {
+                    'type': 'BB',
+                    'direction': 'BULLISH',
+                    'timeframe': 'M15',
+                    'role': 'REFINEMENT',
+                    'high': round(entry, 2),
+                    'low': round(entry - 2.9, 2),
+                    'timestamp': times[46],
+                    'index': 46,
+                    'volume_ratio': 2.1,
+                    'impulse_pips': 24.0,
+                    'confidence': 79,
+                },
+                {
+                    'type': 'OB',
+                    'direction': 'BULLISH',
+                    'timeframe': 'M5',
+                    'role': 'REFINEMENT',
+                    'high': round(entry, 2),
+                    'low': round(entry - 1.4, 2),
+                    'timestamp': times[48],
+                    'index': 48,
+                    'volume_ratio': 1.8,
+                    'impulse_pips': 13.0,
+                    'confidence': 74,
+                },
+            ]
             sample_setup = {
                 'symbol':        'XAUUSD',
                 'direction':     'BUY',
@@ -761,6 +987,7 @@ class ChartGenerator:
                 data=df,
                 setup_data=sample_setup,
                 poi=sample_poi,
+                refined_pois=sample_refined,
                 bos_events=sample_bos,
             )
 

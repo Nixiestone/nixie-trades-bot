@@ -799,7 +799,7 @@ class SMCStrategy:
             #
             # Old code placed entry at the OPPOSITE end (deep inside zone).
             # That required price to travel through the entire zone before filling,
-            # which almost never happens within the 8-hour expiry window.
+            # which rarely happens even within the 12-hour expiry window.
             if direction in ('BULLISH', 'BUY'):
                 entry = poi_high - (poi_range * zone)
             else:
@@ -1843,6 +1843,182 @@ class SMCStrategy:
 
         except Exception as e:
             self.logger.error("Error in get_closest_unmitigated_poi: %s", e)
+            return None
+
+    def is_nested_refinement_poi(
+        self,
+        parent_poi: Dict,
+        child_poi: Dict,
+        symbol: str = 'EURUSD',
+        tolerance_pips: float = 0.25,
+    ) -> bool:
+        """
+        Return True when the full lower-timeframe zone is contained inside the
+        parent zone, allowing only a tiny tolerance for broker rounding.
+        """
+        try:
+            parent_high = float(parent_poi.get('high', 0))
+            parent_low  = float(parent_poi.get('low', 0))
+            child_high  = float(child_poi.get('high', 0))
+            child_low   = float(child_poi.get('low', 0))
+
+            if parent_high <= parent_low or child_high <= child_low:
+                return False
+
+            pip_size = utils.get_pip_value(symbol)
+            if pip_size <= 0:
+                pip_size = 0.0001
+            tol = max(0.0, float(tolerance_pips)) * pip_size
+            parent_range = parent_high - parent_low
+            child_range = child_high - child_low
+
+            return (
+                child_range < max(parent_range - tol, 0.0)
+                and
+                child_low >= (parent_low - tol)
+                and child_high <= (parent_high + tol)
+            )
+        except Exception:
+            return False
+
+    def find_nested_refinement(
+        self,
+        parent_poi: Dict,
+        data: pd.DataFrame,
+        symbol: str,
+        timeframe: str,
+        htf_swing_high: float = 0.0,
+        htf_swing_low: float = 0.0,
+    ) -> Optional[Dict]:
+        """
+        Find the best lower-timeframe nested POI inside a parent H1/M15 zone.
+
+        Preference order:
+          1. Same POI type as the parent (BB inside BB, OB inside OB)
+          2. Boundary closest to the parent entry edge
+          3. Smallest fully nested zone for tighter risk
+          4. Highest confidence
+        """
+        try:
+            if data is None or len(data) < 30:
+                return None
+
+            direction   = str(parent_poi.get('direction', 'BULLISH')).upper()
+            parent_type = str(parent_poi.get('type', 'OB')).upper()
+            is_buy      = direction in ('BULLISH', 'BUY')
+            data_tail   = data.tail(80)
+
+            def _annotate(poi: Dict) -> Dict:
+                out = dict(poi)
+                out['timeframe'] = timeframe
+                out['role'] = 'REFINEMENT'
+                out['parent_timeframe'] = str(parent_poi.get('timeframe', 'H1'))
+                return out
+
+            candidate_groups: List[List[Dict]] = []
+            if parent_type in ('BB', 'BREAKER'):
+                candidate_groups.append([
+                    _annotate(p) for p in self.detect_breaker_blocks(
+                        data_tail,
+                        direction,
+                        htf_swing_high,
+                        htf_swing_low,
+                        symbol=symbol,
+                    )
+                ])
+                candidate_groups.append([
+                    _annotate(p) for p in self.detect_order_blocks(
+                        data_tail,
+                        direction,
+                        symbol=symbol,
+                    )
+                ])
+            else:
+                candidate_groups.append([
+                    _annotate(p) for p in self.detect_order_blocks(
+                        data_tail,
+                        direction,
+                        symbol=symbol,
+                    )
+                ])
+                candidate_groups.append([
+                    _annotate(p) for p in self.detect_breaker_blocks(
+                        data_tail,
+                        direction,
+                        htf_swing_high,
+                        htf_swing_low,
+                        symbol=symbol,
+                    )
+                ])
+
+            nested: List[Dict] = []
+            seen = set()
+            for group in candidate_groups:
+                for candidate in group[:12]:
+                    if not self.is_nested_refinement_poi(
+                        parent_poi,
+                        candidate,
+                        symbol=symbol,
+                    ):
+                        continue
+                    key = (
+                        str(candidate.get('type', '')),
+                        round(float(candidate.get('low', 0)), 8),
+                        round(float(candidate.get('high', 0)), 8),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    nested.append(candidate)
+
+            if not nested:
+                return None
+
+            parent_entry_edge = float(
+                parent_poi.get('high', 0) if is_buy else parent_poi.get('low', 0)
+            )
+            parent_is_breaker = parent_type in ('BB', 'BREAKER')
+
+            def _sort_key(candidate: Dict):
+                candidate_type = str(candidate.get('type', 'OB')).upper()
+                candidate_is_breaker = candidate_type in ('BB', 'BREAKER')
+                same_type_penalty = 0 if candidate_is_breaker == parent_is_breaker else 1
+                entry_edge = float(
+                    candidate.get('high', 0) if is_buy else candidate.get('low', 0)
+                )
+                boundary_distance = abs(parent_entry_edge - entry_edge)
+                zone_range = abs(float(candidate.get('high', 0)) - float(candidate.get('low', 0)))
+                confidence_penalty = -float(candidate.get('confidence', 0))
+                return (
+                    same_type_penalty,
+                    boundary_distance,
+                    zone_range,
+                    confidence_penalty,
+                )
+
+            nested.sort(key=_sort_key)
+            best = nested[0]
+            best_range_pips = utils.calculate_pips(
+                symbol,
+                float(best.get('high', 0)),
+                float(best.get('low', 0)),
+            )
+            self.logger.info(
+                "Nested %s refinement selected for %s: %s [%.5f - %.5f] inside %s [%.5f - %.5f] (%.1f pips).",
+                timeframe,
+                symbol,
+                str(best.get('type', 'OB')).upper(),
+                float(best.get('low', 0)),
+                float(best.get('high', 0)),
+                str(parent_poi.get('timeframe', 'H1')).upper(),
+                float(parent_poi.get('low', 0)),
+                float(parent_poi.get('high', 0)),
+                best_range_pips,
+            )
+            return best
+
+        except Exception as e:
+            self.logger.error("Error in find_nested_refinement: %s", e)
             return None
     
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:

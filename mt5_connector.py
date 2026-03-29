@@ -688,7 +688,7 @@ class MT5Connector:
         order_type:     str = 'MARKET',
         entry_price:    Optional[float] = None,
         comment:        str = 'NIXIE TRADES',
-        expiry_minutes: int = 480,
+        expiry_minutes: int = config.H1_SETUP_EXPIRY_MINUTES,
         sl_pips:        float = 0.0,
         risk_percent:   float = 1.0,
     ) -> Tuple[bool, Optional[int], float, str]:

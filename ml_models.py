@@ -277,7 +277,7 @@ class MLEnsemble:
           2. Detect BOS/MSS on H1
           3. Identify the POI (Order Block or Breaker Block)
           4. Extract 22-element feature vector
-          5. Label WIN/LOSS by looking 40 bars forward for 1:2 RR
+          5. Label WIN/LOSS across the live expiry window using the live TP2 RR
 
         Inconclusive windows (neither target nor SL reached) are discarded.
         This means training data is a realistic sample of real setups.
@@ -285,12 +285,12 @@ class MLEnsemble:
         feats:  List[np.ndarray] = []
         labels: List[float]      = []
         window_size  = 100
-        forward_bars = 32     # 8 hours on M15 (4 bars/hour) - matches live H1 expiry
-        # Step must be >= forward_bars to ensure non-overlapping labeling windows.
-        # Using step=40 with forward_bars=32 means adjacent windows share future bars,
-        # creating autocorrelation between labels that inflates test accuracy to 98%.
-        # step=64 gives non-overlapping future windows and independent labels.
-        step         = 64
+        forward_bars = int(getattr(config, 'H1_SETUP_EXPIRY_BARS_M15', 48))
+        # Keep sampling stride independent from label expiry.
+        # If we force step >= forward_bars after moving expiry to 12 hours, the
+        # stride widens to 48 bars and sample density drops.
+        configured_step = int(getattr(config, 'TRAINING_WINDOW_STEP_M15', 32))
+        step = max(1, configured_step)
 
         # Diagnostic counters - logged at end so you know where samples are lost
         _cnt_total       = 0
@@ -411,20 +411,46 @@ class MLEnsemble:
                     _cnt_no_poi += 1
                     continue
 
+                h1_poi = dict(poi)
+                h1_poi['timeframe'] = 'H1'
+                h1_poi['role'] = 'PRIMARY'
+
                 # --- Phase 3: Entry/SL via real SMC ---
                 try:
                     atr_val    = self.smc._calculate_atr(m15_win.tail(20))
                     entry_cfg  = self.smc.calculate_entry_price(
-                        poi,
-                        'UNICORN' if str(poi.get('type', '')).upper() == 'UNICORN' else 'STANDARD',
+                        h1_poi,
+                        'UNICORN' if str(h1_poi.get('type', '')).upper() == 'UNICORN' else 'STANDARD',
                         75,
                     )
                     sl_cfg     = self.smc.calculate_stop_loss(
-                        poi,
+                        h1_poi,
                         'BUY' if direction == 'BULLISH' else 'SELL',
                         symbol,
                         atr_val,
                     )
+                    m15_refined = self.smc.find_nested_refinement(
+                        h1_poi,
+                        m15_win.tail(80),
+                        symbol=symbol,
+                        timeframe='M15',
+                        htf_swing_high=float(htf_trend.get('swing_high', 0)),
+                        htf_swing_low=float(htf_trend.get('swing_low', 0)),
+                    )
+                    if m15_refined is not None:
+                        _entry_boundary = float(
+                            m15_refined.get('high', 0)
+                            if direction == 'BULLISH'
+                            else m15_refined.get('low', 0)
+                        )
+                        if _entry_boundary > 0:
+                            entry_cfg['entry_price'] = round(_entry_boundary, 5)
+                            sl_cfg = self.smc.calculate_stop_loss(
+                                m15_refined,
+                                'BUY' if direction == 'BULLISH' else 'SELL',
+                                symbol,
+                                atr_val,
+                            )
                     entry      = float(entry_cfg['entry_price'])
                     sl         = float(sl_cfg['stop_loss'])
 
@@ -457,25 +483,39 @@ class MLEnsemble:
 
                 # --- Phase 4: Feature extraction (exact same fn as live) ---
                 try:
-                    f = self.extract_features(m15_win, poi, htf_trend, setup_type)
+                    f = self.extract_features(m15_win, h1_poi, htf_trend, setup_type)
                 except Exception as _e:
                     self.logger.debug("Feature extraction error at window %d: %s", i, _e)
                     continue
 
                 # --- Phase 5: Label WIN/LOSS from future bars (chronological) ---
-                # forward_bars matches live H1 setup expiry of 8 hours on M15
-                # (8 hours x 4 bars per hour = 32 bars).
-                # Using 80 bars (20 hours) incorrectly includes price action that
+                # forward_bars matches the live H1 setup expiry on M15.
+                # Using a longer horizon incorrectly includes price action that
                 # occurs after a real order would have expired, inflating WIN rate.
-                _expiry_bars = 32  # Matches live H1 setup expiry of 8 hours on M15 (4 bars per hour)
+                _expiry_bars = forward_bars
                 future = m15_df.iloc[i: i + _expiry_bars]
                 if len(future) < 10:
                     continue
 
-                # Use config.MIN_RR_TP2 (3.0) to match the live system exactly.
-                # Training with 2.5 while live uses 3.0 means the model is
-                # calibrated for different price levels than it actually operates on.
-                target_reward = risk * config.MIN_RR_TP2
+                try:
+                    tp_cfg = self.smc.calculate_take_profits(
+                        entry,
+                        sl,
+                        direction,
+                        float(
+                            htf_trend.get(
+                                'swing_high' if direction == 'BULLISH' else 'swing_low',
+                                0,
+                            )
+                        ),
+                        symbol,
+                    )
+                except Exception:
+                    _cnt_no_label += 1
+                    continue
+
+                tp1_price = float(tp_cfg.get('tp1', 0))
+                tp2_price = float(tp_cfg.get('tp2', 0))
                 is_buy = direction == 'BULLISH'
 
                 # Step 1: Verify the limit order would have filled.
@@ -498,25 +538,24 @@ class MLEnsemble:
                     _cnt_unfilled += 1
                     continue
 
-                # Step 2: From the fill bar onward, track TP or SL chronologically.
-                # The FIRST level reached determines the label.
-                # Checking max/min over the whole window simultaneously corrupts
-                # labels when price touches both levels in an unknown sequence.
+                # Step 2: From the fill bar onward, track the managed-trade outcome.
+                # Live trading takes partial profit at TP1 and activates breakeven,
+                # so TP1 reached first is already a positive outcome even if TP2
+                # never hits later.
                 label     = None
-                _tp_price = (entry + target_reward) if is_buy else (entry - target_reward)
                 post_fill = future.iloc[entry_filled_at:]
 
                 for _bar in post_fill.itertuples():
                     if is_buy:
-                        if float(_bar.high) >= _tp_price:
-                            label = 1.0   # TP reached first
+                        if float(_bar.high) >= tp1_price:
+                            label = 1.0   # TP1 reached first => managed trade is profitable
                             break
                         if float(_bar.low) <= sl:
                             label = 0.0   # SL reached first
                             break
                     else:
-                        if float(_bar.low) <= _tp_price:
-                            label = 1.0   # TP reached first
+                        if float(_bar.low) <= tp1_price:
+                            label = 1.0   # TP1 reached first => managed trade is profitable
                             break
                         if float(_bar.high) >= sl:
                             label = 0.0   # SL reached first
@@ -541,9 +580,11 @@ class MLEnsemble:
 
         self.logger.info(
             "%s sample generation summary: "
+            "step=%d  expiry=%d  tp1_rr=%.1f  tp2_rr=%.1f  "
             "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
             "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
             symbol,
+            step, forward_bars, config.MIN_RR_RATIO, config.MIN_RR_TP2,
             _cnt_total, _cnt_asian, _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
             _cnt_bad_entry, _cnt_low_quality, _cnt_unfilled, _cnt_no_label, _cnt_labeled
         )

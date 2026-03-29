@@ -550,7 +550,7 @@ class NixTradesScheduler:
 
             # 15-minute guard: prevents reprocessing the exact same pair
             # on back-to-back scan cycles before any new structure can form.
-            # The 480-minute per-direction guard is applied later after the
+            # The H1-expiry per-direction guard is applied later after the
             # trade direction is determined from the POI.
             if db.recent_signal_exists(symbol, minutes=15):
                 self.logger.debug(
@@ -769,13 +769,21 @@ class NixTradesScheduler:
             sweep_level = float(inducement.get('sweep_level', 0))
 
             # Direction is now confirmed from the anchor POI.
-            # Apply the 480-minute per-direction cooldown here so that a SELL
-            # can fire on a pair that already had a BUY in the last 8 hours.
+            # Apply the H1-expiry per-direction cooldown here so that a SELL
+            # can fire on a pair that already had a BUY in the last 12 hours.
             _dir_str = 'BUY' if trade_direction == 'BULLISH' else 'SELL'
-            if db.recent_signal_exists(symbol, minutes=480, direction=_dir_str):
+            if db.recent_signal_exists(
+                symbol,
+                minutes=config.H1_SETUP_EXPIRY_MINUTES,
+                direction=_dir_str,
+            ):
                 self.logger.info(
-                    "COOLDOWN | %s %s | same direction sent within 480 minutes. "
-                    "Skipping.", symbol, _dir_str)
+                    "COOLDOWN | %s %s | same direction sent within %d minutes. "
+                    "Skipping.",
+                    symbol,
+                    _dir_str,
+                    config.H1_SETUP_EXPIRY_MINUTES,
+                )
                 return
 
             # Now that the sweep is confirmed, pick the CLOSEST unmitigated POI
@@ -828,113 +836,98 @@ class NixTradesScheduler:
                 poi, poi['direction'], symbol,
                 self.smc._calculate_atr(m15_df.tail(20)))
             
-            # Multi-timeframe sniper entry refinement.
-            # Correct SMC sequence: drill down from H1 POI -> M15 OB -> M5 OB.
-            #
-            # ENTRY BOUNDARY RULE (Elite SMC):
-            #   BUY demand zone: price pulls back DOWN into zone.
-            #     Price enters through the TOP (poi_high).
-            #     Limit order at m_ob['high'] — fills on the first pip that
-            #     touches the lower-TF demand zone.
-            #   SELL supply zone: price rallies UP into zone.
-            #     Price enters through the BOTTOM (poi_low).
-            #     Limit order at m_ob['low'] — fills on first touch of supply.
-            #
-            # CRITICAL: When entry is refined to a lower-TF OB, the SL MUST also
-            # be recalculated from that same lower-TF OB. The H1 POI SL is too
-            # wide relative to the tighter M15/M5 entry boundary. Keeping the
-            # H1 SL was producing poor RR that the TP filter then rejected,
-            # suppressing valid sniper setups.
-            _poi_high   = float(poi.get('high', entry_cfg['entry_price']))
-            _poi_low    = float(poi.get('low',  entry_cfg['entry_price']))
-            _is_buy     = poi['direction'] == 'BULLISH'
+            # Multi-timeframe sniper refinement:
+            # H1 parent zone -> M15 nested zone -> optional M5 nested zone.
+            h1_poi = dict(poi)
+            h1_poi['timeframe'] = 'H1'
+            h1_poi['role'] = 'PRIMARY'
+            _poi_high   = float(h1_poi.get('high', entry_cfg['entry_price']))
+            _poi_low    = float(h1_poi.get('low',  entry_cfg['entry_price']))
+            _is_buy     = h1_poi['direction'] == 'BULLISH'
             _refined    = False
-            _refined_ob = None   # The lower-TF OB selected for entry
+            _refined_poi = None
+            refined_pois: List[dict] = []
+            _current_parent = h1_poi
+            _htf_swing_high = float(htf_trend.get('swing_high', 0))
+            _htf_swing_low  = float(htf_trend.get('swing_low', 0))
 
-            # Priority 1: M15 OB within the H1 POI zone.
             if m15_df is not None and len(m15_df) >= 50:
                 try:
-                    m15_obs = self.smc.detect_order_blocks(
-                        m15_df.tail(80), poi['direction'], symbol=symbol)
-                    for m15_ob in m15_obs[:5]:
-                        boundary = (
-                            float(m15_ob.get('high', 0))
-                            if _is_buy
-                            else float(m15_ob.get('low', 0))
-                        )
-                        if _poi_low <= boundary <= _poi_high and boundary > 0:
-                            self.logger.info(
-                                "M15 OB sniper entry for %s: zone %.5f -> M15 boundary %.5f",
-                                symbol, entry_cfg['entry_price'], round(boundary, 5))
-                            entry_cfg['entry_price'] = round(boundary, 5)
-                            _refined_ob = m15_ob
-                            _refined    = True
-                            break
+                    m15_refined = self.smc.find_nested_refinement(
+                        _current_parent,
+                        m15_df.tail(80),
+                        symbol=symbol,
+                        timeframe='M15',
+                        htf_swing_high=_htf_swing_high,
+                        htf_swing_low=_htf_swing_low,
+                    )
+                    if m15_refined is not None:
+                        refined_pois.append(m15_refined)
+                        _current_parent = m15_refined
                 except Exception as m15_err:
                     self.logger.debug(
                         "M15 refinement skipped for %s: %s", symbol, m15_err)
 
-            # Priority 2: M5 OB within H1 POI zone (only if no M15 OB found).
-            if not _refined and m5_df is not None and len(m5_df) >= 50:
+            if m5_df is not None and len(m5_df) >= 50:
                 try:
-                    m5_obs = self.smc.detect_order_blocks(
-                        m5_df.tail(80), poi['direction'], symbol=symbol)
-                    for m5_ob in m5_obs[:5]:
-                        boundary = (
-                            float(m5_ob.get('high', 0))
-                            if _is_buy
-                            else float(m5_ob.get('low', 0))
-                        )
-                        if _poi_low <= boundary <= _poi_high and boundary > 0:
-                            self.logger.info(
-                                "M5 OB sniper entry for %s: zone %.5f -> M5 boundary %.5f",
-                                symbol, entry_cfg['entry_price'], round(boundary, 5))
-                            entry_cfg['entry_price'] = round(boundary, 5)
-                            _refined_ob = m5_ob
-                            _refined    = True
-                            break
+                    m5_refined = self.smc.find_nested_refinement(
+                        _current_parent,
+                        m5_df.tail(80),
+                        symbol=symbol,
+                        timeframe='M5',
+                        htf_swing_high=_htf_swing_high,
+                        htf_swing_low=_htf_swing_low,
+                    )
+                    if m5_refined is not None:
+                        refined_pois.append(m5_refined)
+                        _current_parent = m5_refined
                 except Exception as m5_err:
                     self.logger.debug(
                         "M5 refinement skipped for %s: %s", symbol, m5_err)
 
-            # Recalculate SL from the lower-TF OB that was selected for entry.
-            # Without this, an M15 entry at 1.0852 could have an SL at the H1
-            # POI low of 1.0810 — a 42-pip stop on a 5-pip zone entry.
-            # The SL should sit just beyond the OPPOSITE end of the refined OB:
-            #   BUY:  SL below the M15/M5 OB low  (+ ATR structural buffer)
-            #   SELL: SL above the M15/M5 OB high (+ ATR structural buffer)
-            if _refined and _refined_ob is not None:
+            if refined_pois:
+                _refined_poi = refined_pois[-1]
+                _entry_boundary = float(
+                    _refined_poi.get('high', 0)
+                    if _is_buy
+                    else _refined_poi.get('low', 0)
+                )
+                if _entry_boundary > 0:
+                    entry_cfg['entry_price'] = round(_entry_boundary, 5)
+                    _refined = True
+
+            # Recalculate SL from the most precise nested zone selected for entry.
+            if _refined and _refined_poi is not None:
                 _refinement_atr = self.smc._calculate_atr(m15_df.tail(20))
                 sl_cfg = self.smc.calculate_stop_loss(
-                    _refined_ob,
-                    poi['direction'],
+                    _refined_poi,
+                    h1_poi['direction'],
                     symbol,
                     _refinement_atr,
                 )
                 self.logger.info(
-                    "SL recalculated from lower-TF OB for %s: "
-                    "H1-POI SL %.5f -> refined OB SL %.5f (%.1f pips tighter).",
+                    "Nested refinement active for %s: %s %s [%.5f - %.5f] -> entry %.5f, SL %.5f.",
                     symbol,
-                    float(poi.get('low', 0)) if _is_buy else float(poi.get('high', 0)),
+                    str(_refined_poi.get('timeframe', 'M15')).upper(),
+                    str(_refined_poi.get('type', 'OB')).upper(),
+                    float(_refined_poi.get('low', 0)),
+                    float(_refined_poi.get('high', 0)),
+                    entry_cfg['entry_price'],
                     sl_cfg['stop_loss'],
-                    abs(
-                        (float(poi.get('low', 0)) if _is_buy else float(poi.get('high', 0)))
-                        - sl_cfg['stop_loss']
-                    ) / utils.get_pip_value(symbol),
                 )
             else:
                 self.logger.debug(
-                    "No lower-TF OB found within H1 POI [%.5f - %.5f] for %s. "
-                    "Using H1 zone-percentage entry %.5f with H1 POI SL %.5f.",
+                    "No fully nested lower-TF zone found inside H1 POI [%.5f - %.5f] for %s. "
+                    "Using H1 zone entry %.5f with H1 POI SL %.5f.",
                     _poi_low, _poi_high, symbol,
                     entry_cfg['entry_price'], sl_cfg['stop_loss'])
             try:
                 tp_cfg = self.smc.calculate_take_profits(
                     entry_cfg['entry_price'],
                     sl_cfg['stop_loss'],
-                    poi['direction'],
+                    h1_poi['direction'],
                     htf_trend.get(
-                        'swing_high' if poi['direction'] == 'BULLISH' else 'swing_low',
+                        'swing_high' if h1_poi['direction'] == 'BULLISH' else 'swing_low',
                         0
                     ),
                     symbol,
@@ -954,7 +947,7 @@ class NixTradesScheduler:
                 else:
                     event_ts = event_ts.astimezone(timezone.utc)
                 mins = int((event_ts - datetime.now(timezone.utc)).total_seconds() / 60)
-                if 0 < mins <= 480:
+                if 0 < mins <= config.H1_SETUP_EXPIRY_MINUTES:
                     _time_str = utils.calculate_time_until(event_ts)
                     news_warn = (
                         "Note: %s %s in approximately %s. "
@@ -971,7 +964,7 @@ class NixTradesScheduler:
             # Advisory LLM context from the Sunday weekly analysis.
             # If the stored bias conflicts with the SMC direction, flag it
             # in the alert. Never block a valid setup on LLM alone.
-            _smc_direction_str = 'BUY' if poi['direction'] == 'BULLISH' else 'SELL'
+            _smc_direction_str = 'BUY' if h1_poi['direction'] == 'BULLISH' else 'SELL'
             _llm_bias          = self._llm_weekly_bias.get(symbol, '')
             if _llm_bias and _llm_bias not in ('NEUTRAL', ''):
                 if _llm_bias == _smc_direction_str:
@@ -1010,10 +1003,10 @@ class NixTradesScheduler:
                 'xgboost_score': ml_result['xgboost_score'],
                 'session':       utils.get_session(),
                 'timeframe':     'H1',
-                'expiry_hours':  8,      # H1 expires in 8 hours; M15=2h; H4=24h
+                'expiry_hours':  config.H1_SETUP_EXPIRY_HOURS,
                 'order_type':    await self._determine_order_type(
                     symbol,
-                    'BUY' if poi['direction'] == 'BULLISH' else 'SELL',
+                    'BUY' if h1_poi['direction'] == 'BULLISH' else 'SELL',
                     entry_cfg['entry_price']
                 ),
                 'ml_features':   ml_result['features'],
@@ -1022,8 +1015,13 @@ class NixTradesScheduler:
                 # Chart data is not saved to DB — only used for image generation
                 'chart_data': {
                     'm15_df':          m15_df.tail(80),
-                    'poi':             poi,
-                    'additional_pois': unmitigated[:4],
+                    'poi':             h1_poi,
+                    'refined_pois':    refined_pois,
+                    'additional_pois': [
+                        {**candidate, 'timeframe': 'H1'}
+                        for candidate in unmitigated
+                        if candidate is not poi
+                    ][:4],
                     'fvgs':            self.smc.detect_fair_value_gaps(m15_df.tail(60)),
                     'bos_events':      bos_events[:3],
                 },
@@ -1048,7 +1046,10 @@ class NixTradesScheduler:
                 session=setup_data['session'],
                 order_type=setup_data.get('order_type', 'LIMIT'),
                 timeframe=setup_data.get('timeframe', 'H1'),
-                expiry_hours=setup_data.get('expiry_hours', 8),
+                expiry_hours=setup_data.get(
+                    'expiry_hours',
+                    config.H1_SETUP_EXPIRY_HOURS,
+                ),
             )
 
             if signal_row:
@@ -1240,6 +1241,7 @@ class NixTradesScheduler:
                                 data=_df_snap,
                                 setup_data=_sd,
                                 poi=_poi,
+                                refined_pois=chart_data.get('refined_pois', []),
                                 additional_pois=_add_pois,
                                 fvgs=_fvgs,
                                 bos_events=_bos,
@@ -1313,7 +1315,9 @@ class NixTradesScheduler:
                         session=setup_data.get('session', 'N/A'),
                         order_type=setup_data.get('order_type', 'LIMIT'),
                         lot_size=lot_size,
-                        expiry_hours=int(setup_data.get('expiry_hours', 8)),
+                        expiry_hours=int(
+                            setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
+                        ),
                     )
 
                     if news_warn:
@@ -1445,7 +1449,9 @@ class NixTradesScheduler:
             else:
                 order_type = 'MARKET' if (current is not None and current >= entry) else 'LIMIT'
 
-            expiry_minutes = int(setup_data.get('expiry_hours', 8)) * 60
+            expiry_minutes = int(
+                setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
+            ) * 60
 
             success, ticket, actual_lot, message = await self.mt5.place_order(
                 telegram_id=tid,
