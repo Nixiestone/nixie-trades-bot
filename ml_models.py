@@ -497,6 +497,7 @@ class MLEnsemble:
                 if len(future) < 10:
                     continue
 
+<<<<<<< HEAD
                 try:
                     tp_cfg = self.smc.calculate_take_profits(
                         entry,
@@ -516,6 +517,10 @@ class MLEnsemble:
 
                 tp1_price = float(tp_cfg.get('tp1', 0))
                 tp2_price = float(tp_cfg.get('tp2', 0))
+=======
+                # Use config.MIN_RR_TP2 to match the live system exactly.
+                target_reward = risk * config.MIN_RR_TP2
+>>>>>>> 7266d35353c14973111f4a3c04bcc029787ec042
                 is_buy = direction == 'BULLISH'
 
                 # Step 1: Verify the limit order would have filled.
@@ -580,11 +585,19 @@ class MLEnsemble:
 
         self.logger.info(
             "%s sample generation summary: "
+<<<<<<< HEAD
             "step=%d  expiry=%d  tp1_rr=%.1f  tp2_rr=%.1f  "
             "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
             "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
             symbol,
             step, forward_bars, config.MIN_RR_RATIO, config.MIN_RR_TP2,
+=======
+            "step=%d  expiry=%d  target_rr=%.1f  "
+            "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
+            "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
+            symbol,
+            step, forward_bars, config.MIN_RR_TP2,
+>>>>>>> 7266d35353c14973111f4a3c04bcc029787ec042
             _cnt_total, _cnt_asian, _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
             _cnt_bad_entry, _cnt_low_quality, _cnt_unfilled, _cnt_no_label, _cnt_labeled
         )
