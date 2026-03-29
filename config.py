@@ -145,10 +145,10 @@ ML_TIER_DISCRETIONARY  = 55   # 55-59% = Discretionary (optional, lower confiden
 ML_AUTO_EXECUTE_THRESHOLD = 60
 
 # Training sample density:
-# Labels run for the full 12-hour H1 setup lifetime (48 M15 bars), but we keep
-# a tighter 32-bar sampling stride so the trainer still sees enough candidate
-# windows after the longer expiry change.
-TRAINING_WINDOW_STEP_M15 = 32
+# Labels run for the full 12-hour H1 setup lifetime (48 M15 bars). We sample
+# every 12 M15 bars (3 hours) so the trainer sees materially more setups while
+# still avoiding fully bar-by-bar over-correlation.
+TRAINING_WINDOW_STEP_M15 = 12
 
 # ==================== RISK MANAGEMENT ====================
 

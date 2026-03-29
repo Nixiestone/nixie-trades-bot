@@ -276,21 +276,22 @@ class MLEnsemble:
           1. Determine D1 trend context
           2. Detect BOS/MSS on H1
           3. Identify the POI (Order Block or Breaker Block)
-          4. Extract 22-element feature vector
-          5. Label WIN/LOSS across the live expiry window using the live TP2 RR
+          4. Extract the live 22-element feature vector
+          5. Label the managed trade outcome across the live expiry window
 
-        Inconclusive windows (neither target nor SL reached) are discarded.
-        This means training data is a realistic sample of real setups.
+        Inconclusive windows (no fill, or neither TP1 nor SL reached after fill)
+        are discarded. This keeps the training data aligned with the live setup
+        structure while avoiding guessed labels.
         """
         feats:  List[np.ndarray] = []
         labels: List[float]      = []
         window_size  = 100
         forward_bars = int(getattr(config, 'H1_SETUP_EXPIRY_BARS_M15', 48))
-        # Keep sampling stride independent from label expiry.
-        # If we force step >= forward_bars after moving expiry to 12 hours, the
-        # stride widens to 48 bars and sample density drops.
-        configured_step = int(getattr(config, 'TRAINING_WINDOW_STEP_M15', 32))
+        # Keep sampling stride independent from label expiry. A tighter stride
+        # increases sample density without changing the live trade definition.
+        configured_step = int(getattr(config, 'TRAINING_WINDOW_STEP_M15', 12))
         step = max(1, configured_step)
+        apply_asian_skip = bool(getattr(config, 'AVOID_ASIAN_SESSION', True))
 
         # Diagnostic counters - logged at end so you know where samples are lost
         _cnt_total       = 0
@@ -320,7 +321,7 @@ class MLEnsemble:
 
                 # Skip Asian session windows - they produce low-quality training samples
                 utc_hour = cur_time.hour if hasattr(cur_time, 'hour') else 12
-                if utc_hour >= 22 or utc_hour < 7:
+                if apply_asian_skip and (utc_hour >= 22 or utc_hour < 7):
                     _cnt_asian += 1
                     continue
 
@@ -497,7 +498,6 @@ class MLEnsemble:
                 if len(future) < 10:
                     continue
 
-<<<<<<< HEAD
                 try:
                     tp_cfg = self.smc.calculate_take_profits(
                         entry,
@@ -511,16 +511,15 @@ class MLEnsemble:
                         ),
                         symbol,
                     )
-                except Exception:
+                    tp1_price = float(tp_cfg.get('tp1', 0))
+                    tp2_price = float(tp_cfg.get('tp2', 0))
+                    if tp1_price <= 0 or tp2_price <= 0:
+                        _cnt_no_label += 1
+                        continue
+                except Exception as _e:
+                    self.logger.debug("TP calc error at window %d: %s", i, _e)
                     _cnt_no_label += 1
                     continue
-
-                tp1_price = float(tp_cfg.get('tp1', 0))
-                tp2_price = float(tp_cfg.get('tp2', 0))
-=======
-                # Use config.MIN_RR_TP2 to match the live system exactly.
-                target_reward = risk * config.MIN_RR_TP2
->>>>>>> 7266d35353c14973111f4a3c04bcc029787ec042
                 is_buy = direction == 'BULLISH'
 
                 # Step 1: Verify the limit order would have filled.
@@ -585,20 +584,13 @@ class MLEnsemble:
 
         self.logger.info(
             "%s sample generation summary: "
-<<<<<<< HEAD
             "step=%d  expiry=%d  tp1_rr=%.1f  tp2_rr=%.1f  "
-            "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
+            "total=%d  asian_skip=%d  asian_filter=%s  no_ctx=%d  ranging=%d  no_poi=%d  "
             "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
             symbol,
             step, forward_bars, config.MIN_RR_RATIO, config.MIN_RR_TP2,
-=======
-            "step=%d  expiry=%d  target_rr=%.1f  "
-            "total=%d  asian_skip=%d  no_ctx=%d  ranging=%d  no_poi=%d  "
-            "bad_entry=%d  low_quality=%d  unfilled=%d  inconclusive=%d  labeled=%d",
-            symbol,
-            step, forward_bars, config.MIN_RR_TP2,
->>>>>>> 7266d35353c14973111f4a3c04bcc029787ec042
-            _cnt_total, _cnt_asian, _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
+            _cnt_total, _cnt_asian, 'on' if apply_asian_skip else 'off',
+            _cnt_no_ctx, _cnt_ranging, _cnt_no_poi,
             _cnt_bad_entry, _cnt_low_quality, _cnt_unfilled, _cnt_no_label, _cnt_labeled
         )
 
