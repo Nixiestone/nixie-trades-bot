@@ -983,49 +983,98 @@ class NixTradesScheduler:
             else:
                 _llm_context = ''
 
-            setup_data = {
-                'symbol':        symbol,
-                'direction':     _smc_direction_str,
-                'setup_type':    setup_tier,
-                'setup_label':   setup_label,
-                'entry_price':   entry_cfg['entry_price'],
-                'stop_loss':     sl_cfg['stop_loss'],
-                'take_profit_1': tp_cfg['tp1'],
-                'take_profit_2': tp_cfg['tp2'],
-                'sl_pips':       utils.calculate_pips(
-                    symbol, entry_cfg['entry_price'], sl_cfg['stop_loss']),
-                'tp1_pips':      tp_cfg.get('tp1_pips', 0.0),
-                'tp2_pips':      tp_cfg.get('tp2_pips', 0.0),
-                'rr_tp1':        tp_cfg.get('tp1_rr', 0.0),
-                'rr_tp2':        tp_cfg.get('tp2_rr', 0.0),
-                'ml_score':      consensus,
-                'lstm_score':    ml_result['lstm_score'],
-                'xgboost_score': ml_result['xgboost_score'],
-                'session':       utils.get_session(),
-                'timeframe':     'H1',
-                'expiry_hours':  config.H1_SETUP_EXPIRY_HOURS,
-                'order_type':    await self._determine_order_type(
-                    symbol,
-                    'BUY' if h1_poi['direction'] == 'BULLISH' else 'SELL',
-                    entry_cfg['entry_price']
-                ),
-                'ml_features':   ml_result['features'],
-                'news_warning':  news_warn,
-                'llm_context':   _llm_context,
-                # Chart data is not saved to DB — only used for image generation
-                'chart_data': {
-                    'm15_df':          m15_df.tail(80),
-                    'poi':             h1_poi,
-                    'refined_pois':    refined_pois,
-                    'additional_pois': [
-                        {**candidate, 'timeframe': 'H1'}
-                        for candidate in unmitigated
-                        if candidate is not poi
-                    ][:4],
-                    'fvgs':            self.smc.detect_fair_value_gaps(m15_df.tail(60)),
-                    'bos_events':      bos_events[:3],
-                },
-            }
+            # Determine the single entry POI for chart display.
+                # Use the most refined POI so the zone box starts at the
+                # exact bar where the entry was sourced, on the same TF
+                # as the chart data (M15). H1 zones are NOT drawn because
+                # their timestamps do not align precisely with M15 bars.
+                _chart_entry_poi = dict(refined_pois[-1]) if refined_pois else dict(h1_poi)
+                _chart_entry_poi['role'] = 'PRIMARY'
+
+                # Build all M15-timeframe markups for chart rendering.
+                # All detections use m15_df.tail(80) so timestamps align
+                # exactly with the chart bars and zone boxes are accurate.
+                _chart_m15 = m15_df.tail(80).copy()
+                _chart_direction = h1_poi['direction']
+
+                try:
+                    _chart_obs = self.smc.detect_order_blocks(
+                        _chart_m15, _chart_direction, symbol=symbol)
+                except Exception:
+                    _chart_obs = []
+
+                try:
+                    _chart_bbs = self.smc.detect_breaker_blocks(
+                        _chart_m15,
+                        _chart_direction,
+                        float(htf_trend.get('swing_high', 0)),
+                        float(htf_trend.get('swing_low', 0)),
+                        symbol=symbol)
+                except Exception:
+                    _chart_bbs = []
+
+                try:
+                    _chart_fvgs = self.smc.detect_fair_value_gaps(_chart_m15)
+                except Exception:
+                    _chart_fvgs = []
+
+                try:
+                    _chart_swings = self.smc._identify_swings(_chart_m15, lookback=2)
+                except Exception:
+                    _chart_swings = []
+
+                # The entry POI is the most refined zone available.
+                _chart_entry_poi = dict(refined_pois[-1]) if refined_pois else dict(h1_poi)
+                _chart_entry_poi['role'] = 'PRIMARY'
+                _entry_idx = _chart_entry_poi.get('index', -1)
+
+                # All other M15 zones excluding the entry zone itself.
+                _chart_secondary = []
+                for _z in (_chart_obs + _chart_bbs):
+                    if abs(_z.get('index', -999) - _entry_idx) > 2:
+                        _zc = dict(_z)
+                        _zc['role'] = 'SECONDARY'
+                        _chart_secondary.append(_zc)
+
+                setup_data = {
+                    'symbol':        symbol,
+                    'direction':     _smc_direction_str,
+                    'setup_type':    setup_tier,
+                    'setup_label':   setup_label,
+                    'entry_price':   entry_cfg['entry_price'],
+                    'stop_loss':     sl_cfg['stop_loss'],
+                    'take_profit_1': tp_cfg['tp1'],
+                    'take_profit_2': tp_cfg['tp2'],
+                    'sl_pips':       utils.calculate_pips(
+                        symbol, entry_cfg['entry_price'], sl_cfg['stop_loss']),
+                    'tp1_pips':      tp_cfg.get('tp1_pips', 0.0),
+                    'tp2_pips':      tp_cfg.get('tp2_pips', 0.0),
+                    'rr_tp1':        tp_cfg.get('tp1_rr', 0.0),
+                    'rr_tp2':        tp_cfg.get('tp2_rr', 0.0),
+                    'ml_score':      consensus,
+                    'lstm_score':    0,
+                    'xgboost_score': ml_result['xgboost_score'],
+                    'session':       utils.get_session(),
+                    'timeframe':     'H1',
+                    'expiry_hours':  config.H1_SETUP_EXPIRY_HOURS,
+                    'order_type':    await self._determine_order_type(
+                        symbol,
+                        'BUY' if h1_poi['direction'] == 'BULLISH' else 'SELL',
+                        entry_cfg['entry_price']
+                    ),
+                    'ml_features':   ml_result['features'],
+                    'news_warning':  news_warn,
+                    'llm_context':   _llm_context,
+                    'chart_data': {
+                        'm15_df':          _chart_m15,
+                        'poi':             _chart_entry_poi,
+                        'refined_pois':    [],
+                        'additional_pois': _chart_secondary[:6],
+                        'fvgs':            _chart_fvgs,
+                        'bos_events':      bos_events[:3],
+                        'swing_levels':    _chart_swings,
+                    },
+                }
 
             signal_row = db.save_signal(
                 symbol=setup_data['symbol'],
@@ -1041,7 +1090,7 @@ class NixTradesScheduler:
                 rr_tp1=setup_data['rr_tp1'],
                 rr_tp2=setup_data['rr_tp2'],
                 ml_score=consensus,
-                lstm_score=ml_result['lstm_score'],
+                lstm_score=0,
                 xgboost_score=ml_result['xgboost_score'],
                 session=setup_data['session'],
                 order_type=setup_data.get('order_type', 'LIMIT'),
@@ -1229,22 +1278,24 @@ class NixTradesScheduler:
                         _live_df   = self._candles_to_df(_live_raw)
                         _loop      = asyncio.get_running_loop()
                         # Capture loop-local variables before passing to executor
-                        _poi       = chart_data.get('poi')
-                        _add_pois  = chart_data.get('additional_pois', [])
-                        _fvgs      = chart_data.get('fvgs', [])
-                        _bos       = chart_data.get('bos_events', [])
-                        _sd        = dict(setup_data)   # shallow copy is safe here
-                        _df_snap   = _live_df.tail(80).copy()
+                        _poi      = chart_data.get('poi')
+                        _add_pois = list(chart_data.get('additional_pois', []))
+                        _fvgs     = list(chart_data.get('fvgs', []))
+                        _bos      = list(chart_data.get('bos_events', []))
+                        _swings   = list(chart_data.get('swing_levels', []))
+                        _sd       = dict(setup_data)
+                        _df_snap  = _live_df.tail(80).copy()
                         chart_bytes = await _loop.run_in_executor(
                             None,
                             lambda: self._chart_gen.generate_setup_chart(
                                 data=_df_snap,
                                 setup_data=_sd,
                                 poi=_poi,
-                                refined_pois=chart_data.get('refined_pois', []),
+                                refined_pois=[],
                                 additional_pois=_add_pois,
                                 fvgs=_fvgs,
                                 bos_events=_bos,
+                                swing_levels=_swings,
                             )
                         )
                         if chart_bytes:
@@ -1668,7 +1719,7 @@ class NixTradesScheduler:
                 mt5_ok = False
 
             if mt5_ok:
-                for symbol in ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'GBPJPY', 'AUDUSD']:
+                for symbol in ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD', 'GBPJPY', 'AUDUSD', 'BTCUSD']:
                     try:
                         raw = await self.mt5.get_historical_data(symbol, 'D1', bars=100)
                         if not raw:

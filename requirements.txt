@@ -58,3 +58,4 @@ pywin32
 metaapi-cloud-sdk
 stripe==7.10.0
 pillow
+smartmoneyconcepts

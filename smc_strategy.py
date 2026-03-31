@@ -3,6 +3,14 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+
+try:
+    from smartmoneyconcepts import smc as _smc_pkg
+    _SMC_PKG_AVAILABLE = True
+except ImportError:
+    _smc_pkg = None
+    _SMC_PKG_AVAILABLE = False
+
 import config
 import utils
 
@@ -17,9 +25,20 @@ class SMCStrategy:
     """
     
     def __init__(self):
-        """Initialize SMC Strategy Engine."""
+        """
+        Initialize SMC Strategy Engine.
+        Uses the smartmoneyconcepts package for swing, OB, FVG, BOS and CHOCH
+        detection when available. Falls back to the built-in ATR/volume
+        algorithms on all methods if the package is not installed.
+        """
         self.logger = logging.getLogger(f"{__name__}.SMCStrategy")
-        self.logger.info("SMC Strategy Engine initialized")
+        if _SMC_PKG_AVAILABLE:
+            self.logger.info(
+                "SMC Strategy Engine initialized with smartmoneyconcepts package.")
+        else:
+            self.logger.warning(
+                "SMC Strategy Engine initialized WITHOUT smartmoneyconcepts package. "
+                "Install it: pip install smartmoneyconcepts --break-system-packages")
     
     # ==================== PHASE 1: HTF CONTEXT ====================
     
@@ -44,17 +63,35 @@ class SMCStrategy:
                     'reason': 'Insufficient swing data'
                 }
             
-            # Count Higher Highs vs Lower Lows
-            hh_count = sum(1 for s in swings if s['type'] == 'HH')
-            ll_count = sum(1 for s in swings if s['type'] == 'LL')
-            hl_count = sum(1 for s in swings if s['type'] == 'HL')
-            lh_count = sum(1 for s in swings if s['type'] == 'LH')
-            
-            total = len(swings)
+            # Use only the most recent 12 swings for trend determination.
+            # Older swings from a prior regime dilute the current trend signal
+            # and cause bearish/bullish markets to appear ranging.
+            recent = swings[-12:] if len(swings) > 12 else swings
+            total  = len(recent)
+
+            hh_count = sum(1 for s in recent if s['type'] == 'HH')
+            ll_count = sum(1 for s in recent if s['type'] == 'LL')
+            hl_count = sum(1 for s in recent if s['type'] == 'HL')
+            lh_count = sum(1 for s in recent if s['type'] == 'LH')
+
             bullish_ratio = (hh_count + hl_count) / total
             bearish_ratio = (ll_count + lh_count) / total
+
+            # Secondary price confirmation: if the 50-bar SMA direction agrees
+            # with the swing classification, lower the threshold from 0.60 to 0.55.
+            # This prevents borderline cases being discarded as RANGING.
+            try:
+                ma50        = float(data['close'].rolling(50).mean().iloc[-1])
+                price_now   = float(data['close'].iloc[-1])
+                ma_bullish  = price_now > ma50
+                threshold   = 0.55 if (
+                    (bullish_ratio > bearish_ratio and ma_bullish) or
+                    (bearish_ratio > bullish_ratio and not ma_bullish)
+                ) else 0.60
+            except Exception:
+                threshold = 0.60
             
-            if bullish_ratio >= 0.6:
+            if bullish_ratio >= threshold:
                 # swing_high must come from HIGH direction swings only: HH or LH.
                 # HL is a Higher Low — it is a LOW price, not a HIGH price.
                 # Using HL here was putting a trough price into the TP target for BUY.
@@ -77,7 +114,7 @@ class SMCStrategy:
                     'swing_high': _swing_high,
                     'swing_low':  _swing_low,
                 }
-            elif bearish_ratio >= 0.6:
+            elif bearish_ratio >= threshold:
                 # swing_low must come from LOW direction swings only: LL or HL.
                 # LH is a Lower High — it is a HIGH price, not a LOW price.
                 # Using LH here was putting a peak price into the TP target for SELL.
@@ -119,70 +156,125 @@ class SMCStrategy:
     
     def _identify_swings(self, data: pd.DataFrame, lookback: int = 2) -> List[Dict]:
         """
-        Identify swing highs and lows with trend classification.
-        lookback=2 for HTF trend detection (finds more swings on Daily data).
+        Identify swing highs and lows using the smartmoneyconcepts package when
+        available, falling back to the ATR-based algorithm when the package is
+        not installed or returns insufficient data.
+
+        lookback=2 for HTF trend detection (more swings on Daily data).
         lookback=3 for entry-level structure (stricter, reduces noise on M15/H1).
-        Uses ATR-based minimum size to reject noise spikes without losing real swings.
+
+        Output format is identical regardless of which engine is used:
+            [{'index': int, 'price': float, 'direction': 'HIGH'|'LOW',
+              'type': 'HH'|'HL'|'LH'|'LL'}, ...]
         """
+        if _SMC_PKG_AVAILABLE and len(data) >= lookback * 2 + 5:
+            try:
+                swing_df = _smc_pkg.swing_highs_lows(
+                    data, swing_highs_lows=lookback
+                )
+                swings: List[Dict] = []
+                last_high_price: Optional[float] = None
+                last_low_price:  Optional[float] = None
+
+                for pos, (row_idx, row) in enumerate(swing_df.iterrows()):
+                    hl_val = row.get('HighLow')
+                    if pd.isna(hl_val):
+                        continue
+                    level = row.get('Level')
+                    if pd.isna(level):
+                        continue
+
+                    hl_int = int(hl_val)
+                    price  = float(level)
+                    if price <= 0:
+                        continue
+
+                    if hl_int == 1:
+                        swing_type = (
+                            'HH' if (last_high_price is None or price > last_high_price)
+                            else 'LH'
+                        )
+                        last_high_price = price
+                        swings.append({
+                            'index':     pos,
+                            'price':     price,
+                            'direction': 'HIGH',
+                            'type':      swing_type,
+                        })
+                    elif hl_int == -1:
+                        swing_type = (
+                            'LL' if (last_low_price is None or price < last_low_price)
+                            else 'HL'
+                        )
+                        last_low_price = price
+                        swings.append({
+                            'index':     pos,
+                            'price':     price,
+                            'direction': 'LOW',
+                            'type':      swing_type,
+                        })
+
+                if swings:
+                    return swings
+            except Exception as e:
+                self.logger.debug(
+                    "SMC package swing detection failed, using fallback: %s", e)
+
+        # Fallback: ATR-filtered custom algorithm.
         swings = []
         highs  = data['high'].values
         lows   = data['low'].values
+        close  = data['close'].values
         n      = len(data)
 
-        close     = data['close'].values
         tr_values = []
         for k in range(1, n):
-            tr = max(highs[k] - lows[k],
-                     abs(highs[k] - close[k - 1]),
-                     abs(lows[k]  - close[k - 1]))
+            tr = max(
+                highs[k] - lows[k],
+                abs(highs[k] - close[k - 1]),
+                abs(lows[k]  - close[k - 1]),
+            )
             tr_values.append(tr)
         atr_approx     = float(np.mean(tr_values[-20:])) if len(tr_values) >= 20 else 0.0
         min_swing_size = atr_approx * 0.3
 
         for i in range(lookback, n - lookback):
-            left_ok  = all(highs[i] > highs[i - j] for j in range(1, lookback + 1))
-            right_ok = all(highs[i] > highs[i + j] for j in range(1, lookback + 1))
-            if left_ok and right_ok:
+            if all(highs[i] > highs[i - j] for j in range(1, lookback + 1)) and \
+               all(highs[i] > highs[i + j] for j in range(1, lookback + 1)):
                 swing_size = highs[i] - min(lows[max(0, i - lookback): i + lookback + 1])
                 if swing_size >= min_swing_size:
                     swings.append({
                         'index': i, 'price': highs[i],
-                        'direction': 'HIGH', 'type': None
+                        'direction': 'HIGH', 'type': None,
                     })
 
         for i in range(lookback, n - lookback):
-            left_ok  = all(lows[i] < lows[i - j] for j in range(1, lookback + 1))
-            right_ok = all(lows[i] < lows[i + j] for j in range(1, lookback + 1))
-            if left_ok and right_ok:
+            if all(lows[i] < lows[i - j] for j in range(1, lookback + 1)) and \
+               all(lows[i] < lows[i + j] for j in range(1, lookback + 1)):
                 swing_size = max(highs[max(0, i - lookback): i + lookback + 1]) - lows[i]
                 if swing_size >= min_swing_size:
                     swings.append({
                         'index': i, 'price': lows[i],
-                        'direction': 'LOW', 'type': None
+                        'direction': 'LOW', 'type': None,
                     })
 
         swings.sort(key=lambda x: x['index'])
 
-        # Compare like-to-like: HIGH vs previous HIGH, LOW vs previous LOW.
-        # The old code compared every swing against the immediately previous one
-        # regardless of type. A HIGH vs a LOW comparison is always True for HH
-        # and always True for LL, producing a permanent 50/50 split that resolved
-        # to RANGING for every symbol every time.
-        last_high_price: Optional[float] = None
-        last_low_price:  Optional[float] = None
+        last_high_price = None
+        last_low_price  = None
 
         for swing in swings:
             if swing['direction'] == 'HIGH':
-                if last_high_price is not None:
-                    swing['type'] = 'HH' if swing['price'] > last_high_price else 'LH'
-                else:
-                    swing['type'] = 'HH'
+                swing['type'] = (
+                    'HH' if (last_high_price is None or swing['price'] > last_high_price)
+                    else 'LH'
+                )
                 last_high_price = swing['price']
             else:
-                if last_low_price is not None:
-                    swing['type'] = 'LL' if swing['price'] < last_low_price else 'HL'
-                else:
-                    swing['type'] = 'LL'
+                swing['type'] = (
+                    'LL' if (last_low_price is None or swing['price'] < last_low_price)
+                    else 'HL'
+                )
                 last_low_price = swing['price']
 
         return [s for s in swings if s['type'] is not None]
@@ -195,67 +287,147 @@ class SMCStrategy:
         symbol: str = 'EURUSD',
     ) -> List[Dict]:
         """
-        Detect Order Blocks with volume confirmation (REFINEMENT #1).
-        
+        Detect Order Blocks using the smartmoneyconcepts package.
+        Falls back to the ATR/volume custom algorithm when the package is
+        unavailable or returns no results.
+
         Args:
-            data: OHLCV DataFrame
-            direction: 'BULLISH' or 'BEARISH'
-            min_impulse_pips: Minimum impulse size in pips
-            
+            data:             OHLCV DataFrame
+            direction:        'BULLISH' or 'BEARISH'
+            min_impulse_pips: Minimum impulse size in pips (fallback only)
+            symbol:           Trading symbol for pip size lookup
+
         Returns:
-            list: Valid Order Blocks with confidence scores
+            list: Valid Order Blocks sorted by confidence descending
         """
         order_blocks = []
-        
+        _ob_pip_size = utils.get_pip_value(symbol)
+        if _ob_pip_size <= 0:
+            _ob_pip_size = 0.0001
+        is_bull = direction == 'BULLISH'
+
+        if _SMC_PKG_AVAILABLE and len(data) >= 30:
+            try:
+                swing_df = _smc_pkg.swing_highs_lows(data, swing_highs_lows=3)
+                ob_df    = _smc_pkg.ob(data, swing_df)
+
+                rolling_avg_vol = data['volume'].rolling(20, min_periods=5).mean()
+
+                for i, (idx, row) in enumerate(ob_df.iterrows()):
+                    ob_val = row.get('OB')
+                    if pd.isna(ob_val):
+                        continue
+
+                    # Package: 1 = bullish OB, -1 = bearish OB
+                    ob_int = int(ob_val)
+                    if is_bull and ob_int != 1:
+                        continue
+                    if not is_bull and ob_int != -1:
+                        continue
+
+                    top    = float(row.get('Top',    0) or 0)
+                    bottom = float(row.get('Bottom', 0) or 0)
+                    if top <= bottom or top <= 0:
+                        continue
+
+                    # Skip mitigated OBs (package fills MitigatedIndex when price
+                    # has returned to and closed through the zone).
+                    mitigated_idx = row.get('MitigatedIndex')
+                    if mitigated_idx is not None and not pd.isna(mitigated_idx):
+                        continue
+
+                    # Use get_loc which handles timezone-aware vs naive mismatches.
+                    # list.index() raises TypeError on tz-aware timestamps causing
+                    # silent fallback to the fallback algorithm with strict filtering.
+                    try:
+                        raw_pos = data.index.get_loc(idx)
+                        if isinstance(raw_pos, slice):
+                            pos = raw_pos.start
+                        elif isinstance(raw_pos, np.ndarray):
+                            pos = int(np.where(raw_pos)[0][0])
+                        else:
+                            pos = int(raw_pos)
+                    except Exception:
+                        try:
+                            ts_arr = pd.to_datetime(data.index)
+                            ts_val = pd.to_datetime(idx)
+                            pos    = int(np.argmin(np.abs(ts_arr - ts_val)))
+                        except Exception:
+                            pos = i
+
+                    # Volume confirmation
+                    avg_vol = float(rolling_avg_vol.iloc[pos]) if pos < len(rolling_avg_vol) else 1.0
+                    if avg_vol != avg_vol or avg_vol <= 0:
+                        avg_vol = 1.0
+                    candle      = data.iloc[pos]
+                    candle_vol  = float(candle.get('volume', 1.0))
+                    vol_ratio   = candle_vol / avg_vol if avg_vol > 0 else 1.0
+                    if vol_ratio < config.VOLUME_MULTIPLIER_OB:
+                        continue
+
+                    ob_volume = float(row.get('OBVolume', 0) or 0)
+                    impulse_pips_val = (
+                        abs(top - bottom) / _ob_pip_size
+                        if _ob_pip_size > 0 else 0.0
+                    )
+                    percentage = float(row.get('Percentage', 0) or 0)
+
+                    order_blocks.append({
+                        'type':         'OB',
+                        'direction':    direction,
+                        'index':        pos,
+                        'timestamp':    idx,
+                        'high':         top,
+                        'low':          bottom,
+                        'open':         float(candle.get('open',  bottom)),
+                        'close':        float(candle.get('close', top)),
+                        'volume_ratio': round(vol_ratio, 3),
+                        'impulse_pips': round(impulse_pips_val, 1),
+                        'confidence':   self._calculate_ob_confidence(
+                            vol_ratio,
+                            percentage,
+                            impulse_pips_val,
+                        ),
+                    })
+
+                if order_blocks:
+                    order_blocks.sort(key=lambda x: x['confidence'], reverse=True)
+                    self.logger.info(
+                        "SMC package detected %d Order Blocks for %s.",
+                        len(order_blocks), direction)
+                    return order_blocks
+            except Exception as e:
+                self.logger.debug(
+                    "SMC package OB detection failed, using fallback: %s", e)
+
+        # Fallback: ATR/volume custom algorithm.
         try:
-            # Pre-compute a rolling 20-bar average volume aligned to each candle.
-            # Using data.tail(20).mean() for all candles is look-ahead bias:
-            # a candle from 400 bars ago would be compared against future volume.
-            # min_periods=5 ensures we still get a value for early candles.
             rolling_avg_vol = data['volume'].rolling(20, min_periods=5).mean()
 
             for i in range(10, len(data) - 6):
                 candle       = data.iloc[i]
-                next_candles = data.iloc[i+1:i+6]
+                next_candles = data.iloc[i + 1:i + 6]
 
-                # Use the rolling average up to and including this candle.
-                # If still NaN (first few bars), fall back to the candle's own volume.
                 avg_volume = float(rolling_avg_vol.iloc[i])
                 if avg_volume != avg_volume or avg_volume <= 0:
-                    # NaN check: NaN != NaN is True in Python.
-                    # Also guard against zero-volume brokers.
-                    # Use a small positive sentinel so ratios are 1.0 (neutral).
                     avg_volume = max(float(candle['volume']), 1e-9)
-                
-                # Check for opposite-colored candle before impulse
+
                 is_bullish_candle = candle['close'] > candle['open']
                 is_bearish_candle = candle['close'] < candle['open']
-                
+
                 if direction == 'BULLISH' and not is_bearish_candle:
                     continue
                 if direction == 'BEARISH' and not is_bullish_candle:
                     continue
-                
-                # Check for strong impulse after
+
                 if direction == 'BULLISH':
                     impulse_move = next_candles['high'].max() - candle['low']
                 else:
                     impulse_move = candle['high'] - next_candles['low'].min()
-                
-                # Convert to pips using the correct pip size for this symbol.
-                _ob_pip_size = utils.get_pip_value(symbol) if symbol else 0.0001
-                if _ob_pip_size <= 0:
-                    _ob_pip_size = 0.0001
+
                 impulse_pips = impulse_move / _ob_pip_size
 
-                # ATR-relative impulse threshold.
-                # A "strong" institutional move must be at least
-                # OB_IMPULSE_ATR_MULTIPLIER * ATR in pip terms.
-                # This adapts automatically to instrument volatility:
-                # XAUUSD needs a larger absolute pip count than EURGBP.
-                _atr_val_ob  = float(rolling_avg_vol.iloc[i]) if rolling_avg_vol.iloc[i] > 0 else 0.0
-                # Re-derive ATR in pips from recent true range (not volume avg)
-                _recent_tr   = data['high'].iloc[max(0, i-14):i] - data['low'].iloc[max(0, i-14):i]
+                _recent_tr   = data['high'].iloc[max(0, i - 14):i] - data['low'].iloc[max(0, i - 14):i]
                 _atr_price   = float(_recent_tr.mean()) if len(_recent_tr) > 0 else 0.0
                 _atr_pips_ob = (_atr_price / _ob_pip_size) if _ob_pip_size > 0 else 20.0
                 _min_impulse = max(
@@ -264,60 +436,50 @@ class SMCStrategy:
                 )
                 if impulse_pips < _min_impulse:
                     continue
-                
-                # REFINEMENT #1: Volume confirmation
-                # Guard against NaN and inf from zero-volume broker feeds.
+
                 _candle_vol  = float(candle['volume'])
                 _impulse_vol = float(next_candles['volume'].mean()) if len(next_candles) > 0 else 0.0
                 volume_ratio   = _candle_vol  / avg_volume
                 impulse_volume = _impulse_vol / avg_volume
 
-                # NaN check: any comparison with NaN returns False, so we
-                # must explicitly reject invalid ratios before the threshold check.
                 if not (volume_ratio == volume_ratio) or volume_ratio <= 0:
                     continue
                 if not (impulse_volume == impulse_volume) or impulse_volume <= 0:
                     continue
-
                 if volume_ratio < config.VOLUME_MULTIPLIER_OB:
-                    continue  # OB candle must have 1.5x volume
-
+                    continue
                 if impulse_volume < config.VOLUME_MULTIPLIER_IMPULSE:
-                    continue  # Impulse must have 2x volume
-                
-                # Reject OB candles with tiny bodies - they are indecision, not institutional
-                candle_body_ratio = (abs(candle['close'] - candle['open'])
-                                     / max(candle['high'] - candle['low'], 1e-9))
+                    continue
+
+                candle_body_ratio = (
+                    abs(candle['close'] - candle['open'])
+                    / max(candle['high'] - candle['low'], 1e-9)
+                )
                 if candle_body_ratio < 0.4:
                     continue
-                
-                # Valid Order Block found
+
                 order_blocks.append({
-                    'type': 'OB',
-                    'direction': direction,
-                    'index': i,
-                    'timestamp': data.index[i],
-                    'high': candle['high'],
-                    'low': candle['low'],
-                    'open': candle['open'],
-                    'close': candle['close'],
-                    'volume_ratio': volume_ratio,
-                    'impulse_pips': impulse_pips,
-                    'confidence': self._calculate_ob_confidence(
-                        volume_ratio,
-                        impulse_volume,
-                        impulse_pips
-                    )
+                    'type':         'OB',
+                    'direction':    direction,
+                    'index':        i,
+                    'timestamp':    data.index[i],
+                    'high':         float(candle['high']),
+                    'low':          float(candle['low']),
+                    'open':         float(candle['open']),
+                    'close':        float(candle['close']),
+                    'volume_ratio': round(volume_ratio, 3),
+                    'impulse_pips': round(impulse_pips, 1),
+                    'confidence':   self._calculate_ob_confidence(
+                        volume_ratio, impulse_volume, impulse_pips),
                 })
-            
-            # Sort by confidence
+
             order_blocks.sort(key=lambda x: x['confidence'], reverse=True)
-            
-            self.logger.info(f"Detected {len(order_blocks)} valid Order Blocks for {direction} direction")
+            self.logger.info(
+                "Fallback detected %d Order Blocks for %s.", len(order_blocks), direction)
             return order_blocks
-        
+
         except Exception as e:
-            self.logger.error(f"Error detecting Order Blocks: {e}")
+            self.logger.error("Error detecting Order Blocks: %s", e)
             return []
     
     def detect_breaker_blocks(
@@ -422,57 +584,108 @@ class SMCStrategy:
     
     def detect_fair_value_gaps(self, data: pd.DataFrame) -> List[Dict]:
         """
-        Detect Fair Value Gaps (3-candle imbalances).
-        
+        Detect Fair Value Gaps (3-candle price imbalances) using the
+        smartmoneyconcepts package. Falls back to the 3-candle custom
+        algorithm when the package is unavailable.
+
         Args:
             data: OHLCV DataFrame
-            
+
         Returns:
-            list: Fair Value Gaps
+            list: FVG dicts with keys type, direction, index, timestamp,
+                  high, low, gap_size, filled
         """
         fvgs = []
-        
+
+        if _SMC_PKG_AVAILABLE and len(data) >= 3:
+            try:
+                fvg_df = _smc_pkg.fvg(data, join_consecutive=False)
+                index_list = list(data.index)
+
+                for i, (idx, row) in enumerate(fvg_df.iterrows()):
+                    fvg_val = row.get('FVG')
+                    if pd.isna(fvg_val):
+                        continue
+
+                    top    = float(row.get('Top',    0) or 0)
+                    bottom = float(row.get('Bottom', 0) or 0)
+                    if top <= bottom or top <= 0:
+                        continue
+
+                    fvg_int   = int(fvg_val)
+                    direction = 'BULLISH' if fvg_int == 1 else 'BEARISH'
+
+                    try:
+                        raw_pos = data.index.get_loc(idx)
+                        if isinstance(raw_pos, slice):
+                            pos = raw_pos.start
+                        elif isinstance(raw_pos, np.ndarray):
+                            pos = int(np.where(raw_pos)[0][0])
+                        else:
+                            pos = int(raw_pos)
+                    except Exception:
+                        pos = i
+
+                    mitigated = row.get('MitigatedIndex')
+                    is_filled = (
+                        mitigated is not None and not pd.isna(mitigated)
+                    )
+
+                    fvgs.append({
+                        'type':      'FVG',
+                        'direction': direction,
+                        'index':     pos,
+                        'timestamp': idx,
+                        'high':      top,
+                        'low':       bottom,
+                        'gap_size':  round(top - bottom, 8),
+                        'filled':    is_filled,
+                    })
+
+                self.logger.info(
+                    "SMC package detected %d Fair Value Gaps.", len(fvgs))
+                return fvgs
+            except Exception as e:
+                self.logger.debug(
+                    "SMC package FVG detection failed, using fallback: %s", e)
+
+        # Fallback: 3-candle imbalance algorithm.
         try:
             for i in range(2, len(data)):
-                candle_1 = data.iloc[i-2]
-                candle_2 = data.iloc[i-1]
+                candle_1 = data.iloc[i - 2]
                 candle_3 = data.iloc[i]
-                
-                # Bullish FVG: candle_1.high < candle_3.low
+
                 if candle_1['high'] < candle_3['low']:
                     gap_size = candle_3['low'] - candle_1['high']
-                    
                     fvgs.append({
-                        'type': 'FVG',
+                        'type':      'FVG',
                         'direction': 'BULLISH',
-                        'index': i-1,
-                        'timestamp': data.index[i-1],
-                        'high': candle_3['low'],
-                        'low': candle_1['high'],
-                        'gap_size': gap_size,
-                        'filled': False
+                        'index':     i - 1,
+                        'timestamp': data.index[i - 1],
+                        'high':      float(candle_3['low']),
+                        'low':       float(candle_1['high']),
+                        'gap_size':  round(gap_size, 8),
+                        'filled':    False,
                     })
-                
-                # Bearish FVG: candle_1.low > candle_3.high
                 elif candle_1['low'] > candle_3['high']:
                     gap_size = candle_1['low'] - candle_3['high']
-                    
                     fvgs.append({
-                        'type': 'FVG',
+                        'type':      'FVG',
                         'direction': 'BEARISH',
-                        'index': i-1,
-                        'timestamp': data.index[i-1],
-                        'high': candle_1['low'],
-                        'low': candle_3['high'],
-                        'gap_size': gap_size,
-                        'filled': False
+                        'index':     i - 1,
+                        'timestamp': data.index[i - 1],
+                        'high':      float(candle_1['low']),
+                        'low':       float(candle_3['high']),
+                        'gap_size':  round(gap_size, 8),
+                        'filled':    False,
                     })
-            
-            self.logger.info(f"Detected {len(fvgs)} Fair Value Gaps")
+
+            self.logger.info(
+                "Fallback detected %d Fair Value Gaps.", len(fvgs))
             return fvgs
-        
+
         except Exception as e:
-            self.logger.error(f"Error detecting Fair Value Gaps: {e}")
+            self.logger.error("Error detecting Fair Value Gaps: %s", e)
             return []
     
     # ==================== PHASE 2: STRUCTURE SHIFTS ====================
@@ -484,64 +697,114 @@ class SMCStrategy:
         symbol: str = 'EURUSD',
     ) -> Optional[Dict]:
         """
-        Detect Market Structure Shift (potential reversal).
+        Detect Market Structure Shift (Change of Character / CHoCH) using
+        the smartmoneyconcepts package bos_choch function.
 
-        A Bearish MSS fires when the HTF trend is BULLISH but price breaks
-        below the MOST RECENT internal swing low — the first sign institutions
-        are distributing and reversing direction.
+        A Bearish MSS fires when HTF is BULLISH but a CHOCH to the downside
+        appears, indicating the first internal low has been broken.
+        A Bullish MSS fires when HTF is BEARISH but a CHOCH to the upside
+        appears.
 
-        A Bullish MSS fires when the HTF trend is BEARISH but price breaks
-        above the MOST RECENT internal swing high — the first sign of
-        accumulation and a potential upside reversal.
-
-        Only fires when HTF trend is clearly BULLISH or BEARISH. RANGING
-        markets are excluded because there is no established structure to shift.
+        Only fires against BULLISH or BEARISH trends. RANGING is excluded
+        because there is no established structure to shift.
 
         Args:
             data:      H1 OHLCV DataFrame
             htf_trend: D1 trend string from determine_htf_trend()
-            symbol:    Trading symbol for correct pip size calculation
+            symbol:    Trading symbol for pip size calculation
 
         Returns:
             dict: MSS event dict if detected, None otherwise
         """
-        try:
-            # Only look for MSS against a clear directional trend.
-            # A RANGING market has no established structure to shift.
-            if htf_trend not in ('BULLISH', 'BEARISH'):
+        if htf_trend not in ('BULLISH', 'BEARISH'):
+            return None
+
+        pip_size = utils.get_pip_value(symbol)
+        if pip_size <= 0:
+            pip_size = 0.0001
+
+        current_price = float(data.iloc[-1]['close'])
+
+        if _SMC_PKG_AVAILABLE and len(data) >= 30:
+            try:
+                swing_df = _smc_pkg.swing_highs_lows(data, swing_highs_lows=3)
+                bc_df    = _smc_pkg.bos_choch(data, swing_df, close_break=True)
+
+                # Walk CHOCH events from newest to oldest to find the most recent one.
+                choch_rows = [
+                    (idx, row)
+                    for idx, row in bc_df.iterrows()
+                    if not pd.isna(row.get('CHOCH'))
+                ]
+
+                for idx, row in reversed(choch_rows):
+                    choch_val = int(row['CHOCH'])
+                    level     = row.get('Level')
+                    if pd.isna(level):
+                        continue
+
+                    level_price = float(level)
+
+                    # Bearish CHOCH (-1) against a BULLISH HTF trend = Bearish MSS
+                    if htf_trend == 'BULLISH' and choch_val == -1:
+                        displacement_pips = abs(current_price - level_price) / pip_size
+                        if displacement_pips < 5.0:
+                            continue
+                        self.logger.info(
+                            "SMC package: Bearish MSS (CHoCH) at %.5f, "
+                            "%.1f pip displacement.",
+                            level_price, displacement_pips)
+                        return {
+                            'type':              'MSS',
+                            'direction':         'BEARISH',
+                            'level':             level_price,
+                            'displacement':      displacement_pips,
+                            'displacement_pips': displacement_pips,
+                            'timestamp':         idx,
+                        }
+
+                    # Bullish CHOCH (1) against a BEARISH HTF trend = Bullish MSS
+                    if htf_trend == 'BEARISH' and choch_val == 1:
+                        displacement_pips = abs(current_price - level_price) / pip_size
+                        if displacement_pips < 5.0:
+                            continue
+                        self.logger.info(
+                            "SMC package: Bullish MSS (CHoCH) at %.5f, "
+                            "%.1f pip displacement.",
+                            level_price, displacement_pips)
+                        return {
+                            'type':              'MSS',
+                            'direction':         'BULLISH',
+                            'level':             level_price,
+                            'displacement':      displacement_pips,
+                            'displacement_pips': displacement_pips,
+                            'timestamp':         idx,
+                        }
+
                 return None
+            except Exception as e:
+                self.logger.debug(
+                    "SMC package MSS detection failed, using fallback: %s", e)
 
+        # Fallback: internal swing break algorithm.
+        try:
             recent_swings = self._identify_swings(data.tail(50), lookback=3)
-
             if len(recent_swings) < 3:
                 return None
 
-            current_price = float(data.iloc[-1]['close'])
-            pip_size      = utils.get_pip_value(symbol)
-            if pip_size <= 0:
-                pip_size = 0.0001
-
             if htf_trend == 'BULLISH':
-                # Bearish MSS: price breaks below the MOST RECENT internal swing low.
-                # Using the most recent low (not the minimum) matches the SMC rule:
-                # the first internal low that breaks signals a structure shift.
-                low_swings = [
-                    s for s in recent_swings if s['direction'] == 'LOW'
-                ]
+                low_swings = [s for s in recent_swings if s['direction'] == 'LOW']
                 if len(low_swings) < 2:
                     return None
-                # Most recent internal low is the last one in time-sorted list
                 internal_low = float(low_swings[-1]['price'])
                 if current_price < internal_low * 0.9995:
                     displacement_pips = abs(current_price - internal_low) / pip_size
-                    # Minimum 5-pip displacement to reject noise
                     if displacement_pips < 5.0:
                         return None
                     self.logger.info(
-                        "Bearish MSS detected: price %.5f broke below "
-                        "internal low %.5f (%.1f pips displacement).",
-                        current_price, internal_low, displacement_pips,
-                    )
+                        "Fallback Bearish MSS: price %.5f broke below %.5f "
+                        "(%.1f pips).",
+                        current_price, internal_low, displacement_pips)
                     return {
                         'type':              'MSS',
                         'direction':         'BEARISH',
@@ -550,12 +813,8 @@ class SMCStrategy:
                         'displacement_pips': displacement_pips,
                         'timestamp':         data.index[-1],
                     }
-
-            else:  # BEARISH
-                # Bullish MSS: price breaks above the MOST RECENT internal swing high.
-                high_swings = [
-                    s for s in recent_swings if s['direction'] == 'HIGH'
-                ]
+            else:
+                high_swings = [s for s in recent_swings if s['direction'] == 'HIGH']
                 if len(high_swings) < 2:
                     return None
                 internal_high = float(high_swings[-1]['price'])
@@ -564,10 +823,9 @@ class SMCStrategy:
                     if displacement_pips < 5.0:
                         return None
                     self.logger.info(
-                        "Bullish MSS detected: price %.5f broke above "
-                        "internal high %.5f (%.1f pips displacement).",
-                        current_price, internal_high, displacement_pips,
-                    )
+                        "Fallback Bullish MSS: price %.5f broke above %.5f "
+                        "(%.1f pips).",
+                        current_price, internal_high, displacement_pips)
                     return {
                         'type':              'MSS',
                         'direction':         'BULLISH',
@@ -589,34 +847,72 @@ class SMCStrategy:
         htf_trend: str
     ) -> List[Dict]:
         """
-        Detect Break of Structure (trend continuation).
-        Requires DOUBLE BOS for confirmation.
+        Detect Break of Structure (trend continuation) using the
+        smartmoneyconcepts package bos_choch function.
+        Falls back to the swing-based custom algorithm when the package
+        is unavailable.
+
+        Requires DOUBLE BOS for confirmation (len >= 2).
 
         Args:
-            data: OHLCV DataFrame
-            htf_trend: Current HTF trend direction string
+            data:      OHLCV DataFrame
+            htf_trend: 'BULLISH' or 'BEARISH'
 
         Returns:
-            list: BOS events
+            list: BOS event dicts with keys type, direction, level, timestamp
         """
         bos_events = []
 
-        try:
-            tail_data = data.tail(50)
-            swings    = self._identify_swings(tail_data)
+        if _SMC_PKG_AVAILABLE and len(data) >= 30:
+            try:
+                swing_df = _smc_pkg.swing_highs_lows(data, swing_highs_lows=3)
+                bc_df    = _smc_pkg.bos_choch(data, swing_df, close_break=True)
 
-            # tail_data is a slice of data. swings[i]['index'] is positional
-            # within tail_data. We need the positional offset in the full data
-            # DataFrame so we can use iloc safely and avoid duplicate-label bugs
-            # that occur when MT5 returns repeated timestamps at session boundaries.
+                for idx, row in bc_df.iterrows():
+                    bos_val = row.get('BOS')
+                    if pd.isna(bos_val):
+                        continue
+
+                    bos_int   = int(bos_val)
+                    direction = 'BULLISH' if bos_int == 1 else 'BEARISH'
+
+                    # Only return BOS events that match the HTF trend direction
+                    if direction != htf_trend:
+                        continue
+
+                    level = row.get('Level')
+                    if pd.isna(level):
+                        continue
+
+                    bos_events.append({
+                        'type':      'BOS',
+                        'direction': direction,
+                        'level':     float(level),
+                        'timestamp': idx,
+                    })
+
+                if len(bos_events) >= 2:
+                    self.logger.info(
+                        "SMC package: Double BOS confirmed for %s trend (%d events).",
+                        htf_trend, len(bos_events))
+
+                return bos_events
+            except Exception as e:
+                self.logger.debug(
+                    "SMC package BOS detection failed, using fallback: %s", e)
+
+        # Fallback: swing-based custom algorithm.
+        try:
+            tail_data      = data.tail(50)
+            swings         = self._identify_swings(tail_data)
             tail_start_pos = len(data) - len(tail_data)
 
             if htf_trend == 'BULLISH':
                 for i in range(len(swings) - 1):
                     if swings[i]['direction'] == 'HIGH':
-                        swing_high     = swings[i]['price']
-                        full_pos       = tail_start_pos + swings[i]['index']
-                        later_candles  = data.iloc[full_pos:]
+                        swing_high    = swings[i]['price']
+                        full_pos      = tail_start_pos + swings[i]['index']
+                        later_candles = data.iloc[full_pos:]
                         if later_candles['close'].max() > swing_high:
                             bos_events.append({
                                 'type':      'BOS',
@@ -624,13 +920,12 @@ class SMCStrategy:
                                 'level':     swing_high,
                                 'timestamp': later_candles['close'].idxmax(),
                             })
-
-            else:  # BEARISH
+            else:
                 for i in range(len(swings) - 1):
                     if swings[i]['direction'] == 'LOW':
-                        swing_low      = swings[i]['price']
-                        full_pos       = tail_start_pos + swings[i]['index']
-                        later_candles  = data.iloc[full_pos:]
+                        swing_low     = swings[i]['price']
+                        full_pos      = tail_start_pos + swings[i]['index']
+                        later_candles = data.iloc[full_pos:]
                         if later_candles['close'].min() < swing_low:
                             bos_events.append({
                                 'type':      'BOS',
@@ -640,7 +935,8 @@ class SMCStrategy:
                             })
 
             if len(bos_events) >= 2:
-                self.logger.info("Double BOS confirmed for %s trend", htf_trend)
+                self.logger.info(
+                    "Fallback: Double BOS confirmed for %s trend.", htf_trend)
 
             return bos_events
 
@@ -939,8 +1235,8 @@ class SMCStrategy:
         symbol: str
     ) -> Dict:
         """
-        Calculate TP1 and TP2 with Fibonacci extension (REFINEMENT #4).
-        
+        Calculate exact TP1/TP2 risk multiples for live execution and training.
+
         Args:
             entry: Entry price
             stop_loss: Stop loss price
@@ -957,80 +1253,46 @@ class SMCStrategy:
             risk_pips   = utils.calculate_pips(symbol, entry, stop_loss)
             if risk_pips <= 0:
                 raise ValueError("Risk pips is zero - entry equals stop loss.")
+            is_buy_dir = direction_u in ('BULLISH', 'BUY')
+            target_tp1_rr = float(config.MIN_RR_RATIO)
+            target_tp2_rr = float(config.MIN_RR_TP2)
 
-            # If the structural swing target is not beyond entry in trade direction,
-            # synthesize a minimum valid structural target from risk multiples.
-            if direction_u in ('BULLISH', 'BUY'):
-                if htf_swing <= entry:
-                    htf_swing = entry + (risk_price * config.MIN_RR_TP2)
+            # Use the configured RR targets directly. Structure validates that
+            # the setup has enough room for TP2, but it does not push the target
+            # farther away than requested.
+            if is_buy_dir:
+                tp1 = entry + (risk_price * target_tp1_rr)
+                tp2 = entry + (risk_price * target_tp2_rr)
             else:
-                if htf_swing >= entry:
-                    htf_swing = entry - (risk_price * config.MIN_RR_TP2)
+                tp1 = entry - (risk_price * target_tp1_rr)
+                tp2 = entry - (risk_price * target_tp2_rr)
 
-            # TP1: Internal structural target.
-            # Use the greater of:
-            # - Midpoint to HTF swing
-            # - Minimum configured RR target
-            if direction_u in ('BULLISH', 'BUY'):
-                tp1_structural = entry + ((htf_swing - entry) * 0.5)
-                tp1_min_rr     = entry + (risk_price * config.MIN_RR_RATIO)
-                tp1            = max(tp1_structural, tp1_min_rr)
-            else:
-                tp1_structural = entry - ((entry - htf_swing) * 0.5)
-                tp1_min_rr     = entry - (risk_price * config.MIN_RR_RATIO)
-                tp1            = min(tp1_structural, tp1_min_rr)
-
-            tp1_pips = utils.calculate_pips(symbol, entry, tp1)
-            tp1_rr   = round(tp1_pips / risk_pips, 2) if risk_pips > 0 else 0.0
-
-            if tp1_rr < config.MIN_RR_RATIO:
-                raise ValueError(
-                    "TP1 R:R %.2f is below minimum %.1f. "
-                    "Structure does not offer sufficient reward. Setup rejected." % (
-                        tp1_rr, config.MIN_RR_RATIO)
+            if htf_swing and htf_swing > 0:
+                structural_pips = utils.calculate_pips(symbol, entry, htf_swing)
+                structural_rr = (
+                    round(structural_pips / risk_pips, 2) if risk_pips > 0 else 0.0
                 )
+                if is_buy_dir:
+                    if htf_swing <= entry:
+                        raise ValueError(
+                            "HTF swing is not above entry for a bullish setup."
+                        )
+                    if structural_rr < target_tp2_rr:
+                        raise ValueError(
+                            "HTF swing R:R %.2f is below required TP2 %.1fR. "
+                            "Setup rejected." % (structural_rr, target_tp2_rr)
+                        )
+                else:
+                    if htf_swing >= entry:
+                        raise ValueError(
+                            "HTF swing is not below entry for a bearish setup."
+                        )
+                    if structural_rr < target_tp2_rr:
+                        raise ValueError(
+                            "HTF swing R:R %.2f is below required TP2 %.1fR. "
+                            "Setup rejected." % (structural_rr, target_tp2_rr)
+                        )
 
-            # TP2: Full external structural target - the complete HTF swing level.
-            tp2      = htf_swing
-            tp2_pips = utils.calculate_pips(symbol, entry, tp2)
-            tp2_rr   = round(tp2_pips / risk_pips, 2) if risk_pips > 0 else 0.0
-
-            # Sniper rule: do not force a reduced TP2.
-            # If structure cannot provide required RR at TP2, reject the setup.
-            if tp2_rr < config.MIN_RR_TP2:
-                raise ValueError(
-                    "TP2 R:R %.2f is below minimum %.1f. "
-                    "No valid external target for sniper continuation." % (
-                        tp2_rr, config.MIN_RR_TP2)
-                )
-
-            # Cap TPs at maximum RR so price has a realistic chance of reaching them
-            # within the setup expiry window. The HTF D1 swing target is often
-            # 400-700 pips away, producing RR of 1:50+ on tight H1 SLs. These
-            # never fill and count as losses when the stop is hit on the reversal.
-            _max_tp1_rr = getattr(config, 'MAX_RR_TP1', 5.0)
-            _max_tp2_rr = getattr(config, 'MAX_RR_TP2', 10.0)
-            _is_buy_dir = direction_u in ('BULLISH', 'BUY')
-
-            _cap_tp1 = (entry + risk_price * _max_tp1_rr
-                        if _is_buy_dir else entry - risk_price * _max_tp1_rr)
-            _cap_tp2 = (entry + risk_price * _max_tp2_rr
-                        if _is_buy_dir else entry - risk_price * _max_tp2_rr)
-
-            if _is_buy_dir:
-                tp1 = min(tp1, _cap_tp1)
-                tp2 = min(tp2, _cap_tp2)
-            else:
-                tp1 = max(tp1, _cap_tp1)
-                tp2 = max(tp2, _cap_tp2)
-
-            # Ensure TP2 remains beyond TP1 after capping
-            if _is_buy_dir and tp2 <= tp1:
-                tp2 = tp1 + risk_price
-            elif not _is_buy_dir and tp2 >= tp1:
-                tp2 = tp1 - risk_price
-
-            # Recalculate pips and RR after capping
             tp1_pips = utils.calculate_pips(symbol, entry, tp1)
             tp2_pips = utils.calculate_pips(symbol, entry, tp2)
             tp1_rr   = round(tp1_pips / risk_pips, 2) if risk_pips > 0 else 0.0

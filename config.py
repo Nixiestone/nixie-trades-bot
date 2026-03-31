@@ -61,18 +61,17 @@ MAX_RISK_PERCENT      = 5.0
 MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios
-MIN_RR_RATIO   = 1.5   # Minimum acceptable risk-reward ratio for TP1
-MIN_RR_TP2     = 2.0   # Minimum R:R for TP2 and training outcome targets
+# These are the live targets used by the bot and by historical labeling.
+MIN_RR_RATIO   = 1.5   # TP1 target = 1.5R
+MIN_RR_TP2     = 2.0   # TP2 target = 2.0R
 MIN_SETUP_QUALITY_SCORE = 55   # Setups scoring below this are rejected by _check_filters
 
-# Maximum RR caps — prevent unreachable TP targets derived from D1 swing levels.
-# H1 setups must target levels achievable within the 12-hour expiry window.
-# Without these caps, a 12-pip SL produces 660-pip TPs (RR 1:53) that never fill.
-MAX_RR_TP1 = 5.0    # TP1 never more than 5x risk from entry
-MAX_RR_TP2 = 10.0   # TP2 never more than 10x risk from entry
+# Legacy caps retained for backward compatibility with older code paths.
+MAX_RR_TP1 = 5.0
+MAX_RR_TP2 = 10.0
 
 
-# Fibonacci extension level for TP2 (1.618 = golden ratio)
+# Fibonacci extension level retained for backward compatibility only.
 FIB_EXTENSION_LEVEL = 1.618
 
 # Breakeven settings
@@ -131,8 +130,8 @@ SYMBOL_VARIATIONS = {
 
 # Legacy threshold (kept for backward compatibility)
 ML_THRESHOLD          = 60
-ML_LSTM_WEIGHT        = 0.4   # Updated to match ensemble (XGB=60%, LSTM=40%)
 ML_XGBOOST_WEIGHT     = 0.6
+ML_RF_WEIGHT          = 0.4
 ML_SEQUENCE_LENGTH    = 100
 ML_RETRAINING_INTERVAL = 100
 
@@ -148,7 +147,7 @@ ML_AUTO_EXECUTE_THRESHOLD = 60
 # Labels run for the full 12-hour H1 setup lifetime (48 M15 bars). We sample
 # every 12 M15 bars (3 hours) so the trainer sees materially more setups while
 # still avoiding fully bar-by-bar over-correlation.
-TRAINING_WINDOW_STEP_M15 = 12
+TRAINING_WINDOW_STEP_M15 = 4
 
 # ==================== RISK MANAGEMENT ====================
 

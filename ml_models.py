@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score
 import config
 import utils
@@ -16,19 +15,19 @@ logger = logging.getLogger(__name__)
 
 _MODEL_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 _XGB_PATH    = os.path.join(_MODEL_DIR, 'xgboost_model.pkl')
-_LSTM_PATH   = os.path.join(_MODEL_DIR, 'lstm_model.pkl')
 _SCALER_PATH = os.path.join(_MODEL_DIR, 'scaler.pkl')
 _RF_PATH     = os.path.join(_MODEL_DIR, 'rf_model.pkl')
 _META_PATH   = os.path.join(_MODEL_DIR, 'training_metadata.pkl')
 _FEATURE_DIM = 22
 
-# Only train on setups scoring >= this value. Weak setups (~50% win rate) dilute training.
+# Only train on setups scoring >= this value. Weak setups dilute training and
+# amplify the class imbalance problem on historical labels.
 TRAINING_MIN_QUALITY_SCORE = 35
 
 
 class MLEnsemble:
     """
-    ML ensemble: XGBoost + GradientBoostingClassifier.
+    ML ensemble: XGBoost + RandomForest.
     Loads trained models from disk on startup.
     Training uses the real SMCStrategy so training data = live signal data.
     """
@@ -37,8 +36,7 @@ class MLEnsemble:
         self.logger         = logging.getLogger(f"{__name__}.MLEnsemble")
         self.mt5            = mt5_connector
         self.xgboost_model  = None
-        self.lstm_model     = None
-        self.rf_model = None
+        self.rf_model       = None
         self.scaler         = StandardScaler()
         self.models_trained = False
         self.training_metadata: Dict = {}
@@ -73,26 +71,25 @@ class MLEnsemble:
 
     def _load_from_disk(self) -> bool:
         try:
-            if not all(os.path.exists(p) for p in [_XGB_PATH, _LSTM_PATH, _SCALER_PATH]):
+            if not all(os.path.exists(p) for p in [_XGB_PATH, _SCALER_PATH]):
                 self.logger.info(
                     "No saved models found. Run train_models.py once before going live.")
                 return False
             with open(_XGB_PATH,    'rb') as f: self.xgboost_model = pickle.load(f)
-            with open(_LSTM_PATH,   'rb') as f: self.lstm_model    = pickle.load(f)
             with open(_SCALER_PATH, 'rb') as f: self.scaler        = pickle.load(f)
-            # RF model is optional for backward compatibility with older model bundles.
             if os.path.exists(_RF_PATH):
                 with open(_RF_PATH, 'rb') as f:
                     self.rf_model = pickle.load(f)
             else:
                 self.rf_model = None
                 self.logger.info(
-                    "RF model file not found. Using 2-model ensemble (XGBoost + LSTM).")
+                    "RF model file not found. Ensemble will use XGBoost only.")
             if os.path.exists(_META_PATH):
                 with open(_META_PATH, 'rb') as f: self.training_metadata = pickle.load(f)
             self.models_trained = True
             self.logger.info(
-                "Trained models loaded. Samples: %s. XGBoost accuracy: %s. RF loaded: %s.",
+                "Trained models loaded. Samples: %s. XGBoost accuracy: %s. "
+                "RF loaded: %s.",
                 self.training_metadata.get('samples', 'N/A'),
                 self.training_metadata.get('xgboost_accuracy', 'N/A'),
                 self.rf_model is not None)
@@ -104,9 +101,8 @@ class MLEnsemble:
 
     def _save_to_disk(self) -> bool:
         try:
-            with open(_XGB_PATH,    'wb') as f: pickle.dump(self.xgboost_model,    f)
-            with open(_LSTM_PATH,   'wb') as f: pickle.dump(self.lstm_model,        f)
-            with open(_SCALER_PATH, 'wb') as f: pickle.dump(self.scaler,            f)
+            with open(_XGB_PATH,    'wb') as f: pickle.dump(self.xgboost_model, f)
+            with open(_SCALER_PATH, 'wb') as f: pickle.dump(self.scaler,         f)
             if self.rf_model is not None:
                 with open(_RF_PATH, 'wb') as f: pickle.dump(self.rf_model, f)
             elif os.path.exists(_RF_PATH):
@@ -289,9 +285,16 @@ class MLEnsemble:
         forward_bars = int(getattr(config, 'H1_SETUP_EXPIRY_BARS_M15', 48))
         # Keep sampling stride independent from label expiry. A tighter stride
         # increases sample density without changing the live trade definition.
-        configured_step = int(getattr(config, 'TRAINING_WINDOW_STEP_M15', 12))
-        step = max(1, configured_step)
-        apply_asian_skip = bool(getattr(config, 'AVOID_ASIAN_SESSION', True))
+        configured_step = int(getattr(config, 'TRAINING_WINDOW_STEP_M15', 4))
+        # Cap at 6 bars (90 minutes on M15) to ensure adequate sample density.
+        # A step of 12 produces only one window per 3 hours of market data
+        # which is the compounding cause of the low labeled count per symbol.
+        step = max(1, min(configured_step, 6))
+        # Asian session is NOT skipped during training.
+        # The live scanner filters Asian setups at broadcast time.
+        # Skipping Asian hours here removes 69% of all M15 windows before
+        # any SMC analysis runs, which is the primary cause of the low label count.
+        apply_asian_skip = False
 
         # Diagnostic counters - logged at end so you know where samples are lost
         _cnt_total       = 0
@@ -600,6 +603,12 @@ class MLEnsemble:
 
     def _train_all_models(self, X: np.ndarray, y: np.ndarray) -> bool:
         try:
+            # Wipe stale keys from any previous training run (e.g. lstm_accuracy)
+            # so the metadata written to disk only reflects the current ensemble.
+            self.training_metadata = {
+                'samples': len(X),
+            }
+
             # Chronological split: first 80% = train, last 20% = test.
             # Random split causes look-ahead bias on time-series data.
             split_idx    = int(len(X) * 0.8)
@@ -616,10 +625,9 @@ class MLEnsemble:
             X_te_s = self.scaler.transform(X_te)
 
             ok1 = self._fit_xgboost(X_tr_s, y_tr, X_te_s, y_te)
-            ok2 = self._fit_lstm_sub(X_tr_s, y_tr, X_te_s, y_te)
             self._fit_random_forest(X_tr_s, y_tr, X_te_s, y_te)
 
-            if not (ok1 and ok2):
+            if not ok1:
                 return False
 
             self.models_trained = True
@@ -680,36 +688,9 @@ class MLEnsemble:
         self.training_metadata.update({
             'xgboost_accuracy': f"{acc*100:.1f}%",
             'xgboost_auc':      f"{auc:.3f}",
-            'samples':          len(X_tr) + len(X_te),
-            'trained_at':       datetime.now(timezone.utc).isoformat()})
+            'trained_at':       datetime.now(timezone.utc).isoformat(),
+        })
         return True
-
-    def _fit_lstm_sub(self, X_tr, y_tr, X_te, y_te) -> bool:
-        """GradientBoostingClassifier with different hyperparameters for ensemble diversity."""
-        try:
-            self.lstm_model = GradientBoostingClassifier(
-                n_estimators=300,
-                max_depth=2,
-                learning_rate=0.02,
-                subsample=0.5,
-                min_samples_leaf=40,
-                min_samples_split=80,
-                max_features='sqrt',
-                random_state=99)
-            self.lstm_model.fit(X_tr, y_tr)
-            y_prob = self.lstm_model.predict_proba(X_te)[:, 1]
-            acc = accuracy_score(y_te, (y_prob > 0.5).astype(int))
-            auc = roc_auc_score(y_te, y_prob)
-            self.logger.info(
-                "LSTM substitute training complete. Accuracy: %.1f%%  AUC: %.3f",
-                acc * 100, auc)
-            self.training_metadata.update({
-                'lstm_accuracy': f"{acc*100:.1f}%",
-                'lstm_auc':      f"{auc:.3f}"})
-            return True
-        except Exception as e:
-            self.logger.error("LSTM substitute training failed: %s", e)
-            return False
         
         
     def _fit_random_forest(self, X_tr, y_tr, X_te, y_te) -> bool:
@@ -926,17 +907,6 @@ class MLEnsemble:
 
     # ==================== LIVE PREDICTIONS ====================
 
-    def predict_lstm(self, data, poi, htf_trend, setup_type) -> int:
-        try:
-            f = self.extract_features(data, poi, htf_trend, setup_type)
-            if self.models_trained and self.lstm_model is not None:
-                p = self.lstm_model.predict_proba(
-                    self.scaler.transform(f.reshape(1, -1)))[0][1]
-                return int(p * 100)
-            return self._heuristic_lstm(data, poi, htf_trend)
-        except Exception as e:
-            self.logger.error("LSTM prediction error: %s", e)
-            return 50
 
     def predict_xgboost(self, data, poi, htf_trend, setup_type) -> int:
         try:
@@ -957,17 +927,16 @@ class MLEnsemble:
 
     def get_ensemble_prediction(self, data, poi, htf_trend, setup_type) -> Dict:
         """
-        Combined prediction. XGBoost weight 60%, LSTM weight 40%.
+        Combined prediction using XGBoost (70%) and RandomForest (30%).
+        Falls back to XGBoost alone when the RF model is not trained.
+
         The 'features' key must be saved and passed to record_trade_outcome()
-        when the trade closes, so the model learns from this specific trade.
+        when the trade closes, so the models learn from this specific trade.
         """
         try:
-            features  = self.extract_features(data, poi, htf_trend, setup_type)
-            lstm_s    = self.predict_lstm(data, poi, htf_trend, setup_type)
-            xgb_s     = self.predict_xgboost(data, poi, htf_trend, setup_type)
+            features = self.extract_features(data, poi, htf_trend, setup_type)
+            xgb_s    = self.predict_xgboost(data, poi, htf_trend, setup_type)
 
-            # Include Random Forest if available. Weights: XGB 50%, LSTM 30%, RF 20%.
-            # Falls back to XGB 60% / LSTM 40% if RF model not trained.
             rf_s = None
             if self.models_trained and self.rf_model is not None:
                 try:
@@ -976,12 +945,12 @@ class MLEnsemble:
                 except Exception as rf_err:
                     self.logger.debug("RF prediction skipped: %s", rf_err)
 
-            if rf_s is not None:
-                consensus = int(xgb_s * 0.50 + lstm_s * 0.30 + rf_s * 0.20)
-            else:
-                consensus = int(lstm_s * 0.40 + xgb_s * 0.60)
+            consensus = (
+                int(xgb_s * 0.70 + rf_s * 0.30)
+                if rf_s is not None
+                else xgb_s
+            )
 
-            # Agreement reflects signal strength (consensus score), not model spread.
             # 75%+ = STRONG  -> auto-execute eligible
             # 60-74% = MODERATE -> auto-execute eligible
             # Below 60% = WEAK -> notify only, never auto-execute
@@ -989,27 +958,31 @@ class MLEnsemble:
                 'STRONG'    if consensus >= 75 else
                 ('MODERATE' if consensus >= 60 else 'WEAK')
             )
-            
+
             self.logger.info(
-                "Ensemble: LSTM=%d%%  XGBoost=%d%%  RF=%s%%  Consensus=%d%%  "
+                "Ensemble: XGBoost=%d%%  RF=%s%%  Consensus=%d%%  "
                 "Agreement=%s  Trained: %s",
-                lstm_s, xgb_s, rf_s if rf_s is not None else 'N/A',
+                xgb_s,
+                rf_s if rf_s is not None else 'N/A',
                 consensus, agreement, self.models_trained)
+
             return {
-                'lstm_score':    lstm_s,
-                'xgboost_score': xgb_s,
-                'rf_score':      rf_s,
+                'xgboost_score':   xgb_s,
+                'rf_score':        rf_s,
                 'consensus_score': consensus,
-                'agreement':     agreement,
-                'direction':     poi.get('direction', 'BULLISH'),
-                'features':      features,
+                'agreement':       agreement,
+                'direction':       poi.get('direction', 'BULLISH'),
+                'features':        features,
             }
-            
+
         except Exception as e:
             self.logger.error("Ensemble prediction error: %s", e)
             return {
-                'lstm_score': 50, 'xgboost_score': 50, 'consensus_score': 50,
-                'agreement': 'WEAK', 'direction': poi.get('direction', 'BULLISH'),
+                'xgboost_score': 50,
+                'rf_score':      None,
+                'consensus_score': 50,
+                'agreement': 'WEAK',
+                'direction': poi.get('direction', 'BULLISH'),
                 'features': np.zeros(_FEATURE_DIM, dtype=np.float32),
             }
 
@@ -1038,9 +1011,8 @@ class MLEnsemble:
                     'Run: python train_models.py')}
         return {
             'trained':          True,
-            'status_text':      'Trained ML models active (trained on SMC strategy data).',
+            'status_text':      'Trained ML models active (XGBoost + RandomForest ensemble).',
             'xgboost_accuracy': self.training_metadata.get('xgboost_accuracy', 'N/A'),
-            'lstm_accuracy':    self.training_metadata.get('lstm_accuracy',    'N/A'),
             'rf_accuracy':      self.training_metadata.get('rf_accuracy',      'N/A'),
             'xgboost_auc':      self.training_metadata.get('xgboost_auc',      'N/A'),
             'rf_loaded':        self.rf_model is not None,
@@ -1052,21 +1024,7 @@ class MLEnsemble:
 
     # ==================== HEURISTIC FALLBACKS (PRE-TRAINING) ====================
 
-    def _heuristic_lstm(self, data, poi, htf_trend) -> int:
-        """Narrow range (45-72) to be honest about uncertainty."""
-        score = 55
-        try:
-            is_buy = poi.get('direction', 'BULLISH') == 'BULLISH'
-            if htf_trend.get('trend') == poi.get('direction'): score += 10
-            rsi = self._calc_rsi(data)
-            if is_buy and 35 <= rsi <= 52: score += 7
-            elif not is_buy and 48 <= rsi <= 65: score += 7
-            if poi.get('volume_ratio', 0) >= 1.5: score += 8
-            if 'volume' in data.columns:
-                avg = data['volume'].mean()
-                if avg > 0 and data['volume'].values[-5:].mean() > avg * 1.2: score += 6
-        except Exception: score = 55
-        return max(45, min(score, 72))
+    
 
     def _heuristic_xgboost(self, data, poi, htf_trend, setup_type) -> int:
         """Range 38-78 before training."""

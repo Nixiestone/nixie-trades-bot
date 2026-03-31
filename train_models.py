@@ -123,10 +123,7 @@ def main():
                     ml.training_metadata.get('xgboost_accuracy', 'N/A'))
         logger.info("XGBoost AUC:      %s",
                     ml.training_metadata.get('xgboost_auc', 'N/A'))
-        logger.info("LSTM accuracy:    %s",
-                    ml.training_metadata.get('lstm_accuracy', 'N/A'))
-        logger.info("LSTM AUC:         %s",
-                    ml.training_metadata.get('lstm_auc', 'N/A'))
+        
         logger.info("Training samples: %s",
                     ml.training_metadata.get('samples', 'N/A'))
         logger.info("Models saved to:  models/")

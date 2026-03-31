@@ -98,6 +98,7 @@ class ChartGenerator:
         additional_pois: Optional[List[Dict]] = None,
         fvgs: Optional[List[Dict]] = None,
         bos_events: Optional[List[Dict]] = None,
+        swing_levels: Optional[List[Dict]] = None,
     ) -> Optional[bytes]:
         """
         Render the complete annotated chart and return optimised PNG bytes.
@@ -153,17 +154,22 @@ class ChartGenerator:
             if bos_events:
                 self._draw_bos_lines(ax, bos_events)
 
-            for extra in (additional_pois or [])[:4]:
+            # Draw secondary M15 zones (other OBs and BBs detected on the
+            # same timeframe as the chart data — bar positions are accurate).
+            for extra in (additional_pois or [])[:6]:
                 self._draw_zone(ax, extra, time_index, n, x_right,
                                 primary=False)
 
+            # Draw the primary entry zone last so it renders on top.
             if poi:
                 self._draw_zone(ax, poi, time_index, n, x_right,
                                 primary=True)
 
-            for refined in (refined_pois or [])[:3]:
-                self._draw_zone(ax, refined, time_index, n, x_right,
-                                primary=False)
+            # Draw swing structure markers so users can see the HH/HL/LH/LL
+            # sequence that informed the BOS and CHOCH detection.
+            if swing_levels:
+                self._draw_swing_levels(ax, swing_levels, time_index, n,
+                                        y_min, y_max)
 
             position_anchor = self._resolve_position_anchor(
                 poi, refined_pois or [], time_index, n)
@@ -350,7 +356,11 @@ class ChartGenerator:
 
         start_x = self._ts_to_bar_index(poi.get('timestamp'), time_index)
         if start_x is None:
-            start_x = max(0, n - 38)
+            # No timestamp in POI - place zone at the most recent 20 bars
+            # which keeps it visible without guessing the wrong position.
+            start_x = max(0, n - 20)
+        # Clamp to valid range
+        start_x = max(0, min(start_x, n - 1))
 
         box_left  = float(start_x) - 0.5
         box_width = float(x_right) - box_left
@@ -446,6 +456,77 @@ class ChartGenerator:
                 va='bottom', ha='left',
                 alpha=0.80, zorder=8,
             )
+
+    # =========================================================================
+    # SWING STRUCTURE LEVELS
+    # =========================================================================
+
+    def _draw_swing_levels(
+        self,
+        ax: plt.Axes,
+        swing_levels: List[Dict],
+        time_index: list,
+        n: int,
+        y_min: float,
+        y_max: float,
+    ):
+        """
+        Draw swing high and swing low markers as small triangles with faint
+        dotted extension lines to the right edge.
+        """
+        price_range = max(y_max - y_min, 1e-10)
+        for swing in swing_levels[-20:]:
+            direction = str(swing.get('direction', '')).upper()
+            price     = float(swing.get('price', 0))
+            if price <= 0 or price < y_min * 0.98 or price > y_max * 1.02:
+                continue
+
+            pos = swing.get('index', None)
+            if pos is None:
+                continue
+            pos = int(pos)
+            if pos < 0 or pos >= n:
+                continue
+
+            if direction == 'HIGH':
+                color  = self.C_DOWN
+                marker = 'v'
+                y_pos  = price + price_range * 0.007
+            else:
+                color  = self.C_UP
+                marker = '^'
+                y_pos  = price - price_range * 0.007
+
+            ax.plot(
+                pos, y_pos,
+                marker=marker,
+                color=color,
+                markersize=4.0,
+                alpha=0.65,
+                zorder=8,
+                linestyle='none',
+            )
+            ax.plot(
+                [pos, n - 1],
+                [price, price],
+                color=color,
+                linewidth=0.45,
+                linestyle=(0, (2, 5)),
+                alpha=0.25,
+                zorder=3,
+            )
+            sw_type = str(swing.get('type', '')).upper()
+            if sw_type in ('HH', 'LL', 'HL', 'LH'):
+                ax.text(
+                    pos + 0.5, y_pos,
+                    sw_type,
+                    color=color,
+                    fontsize=5.2,
+                    va='center',
+                    ha='left',
+                    alpha=0.60,
+                    zorder=8,
+                )
 
     # =========================================================================
     # PRICE LEVEL LINES
