@@ -62,8 +62,8 @@ MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios
 # These are the live targets used by the bot and by historical labeling.
-MIN_RR_RATIO   = 1.5   # TP1 target = 1.5R
-MIN_RR_TP2     = 2.0   # TP2 target = 2.0R
+MIN_RR_RATIO   = 1.0   
+MIN_RR_TP2     = 1.5   
 MIN_SETUP_QUALITY_SCORE = 55   # Setups scoring below this are rejected by _check_filters
 
 # Legacy caps retained for backward compatibility with older code paths.

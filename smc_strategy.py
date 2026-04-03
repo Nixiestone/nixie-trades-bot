@@ -458,13 +458,37 @@ class SMCStrategy:
                 if candle_body_ratio < 0.4:
                     continue
 
+                # Freshness gate: reject Order Blocks older than 50 bars.
+                # Institutional orders at aged zones have either been filled
+                # or abandoned. Only the most recent unfilled clusters matter.
+                bars_since_ob = (len(data) - 1) - i
+                if bars_since_ob > 50:
+                    continue
+
+                ob_high = float(candle['high'])
+                ob_low  = float(candle['low'])
+
+                # Mitigation check: if any candle AFTER the OB has closed
+                # through the zone boundary, the zone is spent. Skip it.
+                # This mirrors what the SMC package does via MitigatedIndex.
+                post_ob = data.iloc[i + 1:]
+                if not post_ob.empty:
+                    if direction == 'BULLISH' and bool(
+                        (post_ob['close'] < ob_low).any()
+                    ):
+                        continue
+                    if direction == 'BEARISH' and bool(
+                        (post_ob['close'] > ob_high).any()
+                    ):
+                        continue
+
                 order_blocks.append({
                     'type':         'OB',
                     'direction':    direction,
                     'index':        i,
                     'timestamp':    data.index[i],
-                    'high':         float(candle['high']),
-                    'low':          float(candle['low']),
+                    'high':         ob_high,
+                    'low':          ob_low,
                     'open':         float(candle['open']),
                     'close':        float(candle['close']),
                     'volume_ratio': round(volume_ratio, 3),
@@ -522,57 +546,78 @@ class SMCStrategy:
                     continue
 
                 if direction == 'BULLISH':
-                    # Look for broken resistance becoming support
+                    # Look for broken resistance becoming support.
                     resistance = prev_candles['high'].max()
-                    
-                    # Check if price broke above resistance
+
                     if candle['close'] > resistance:
-                        # Check if price held above on pullback
                         pullback_low = next_candles['low'].min()
-                        
-                        if pullback_low >= candle['low'] * 0.995:  # Within 0.5%
+
+                        if pullback_low >= candle['low'] * 0.995:
                             _bb_pip_sz = utils.get_pip_value(symbol)
                             if _bb_pip_sz <= 0:
                                 _bb_pip_sz = 0.0001
-                            _bb_impulse = max((candle['close'] - resistance) / _bb_pip_sz, 0.0)
+                            _bb_impulse = max(
+                                (candle['close'] - resistance) / _bb_pip_sz, 0.0)
+
+                            # Minimum 10-pip displacement confirms institutional
+                            # intent, not noise around the resistance level.
+                            if _bb_impulse < 10.0:
+                                continue
+
+                            # The breakout candle volume must be at least 80% of
+                            # the peak volume inside the previous resistance zone.
+                            # Weak-volume breakouts are fakeouts, not real BBs.
+                            _zone_peak_vol = float(prev_candles['volume'].max())
+                            if (_zone_peak_vol > 0
+                                    and float(candle['volume']) < _zone_peak_vol * 0.80):
+                                continue
+
                             breakers.append({
-                                'type': 'BB',
-                                'direction': direction,
-                                'index': i,
-                                'timestamp': data.index[i],
-                                'high': candle['high'],
-                                'low': candle['low'],
+                                'type':          'BB',
+                                'direction':     direction,
+                                'index':         i,
+                                'timestamp':     data.index[i],
+                                'high':          float(candle['high']),
+                                'low':           float(candle['low']),
                                 'breaker_level': resistance,
-                                'volume_ratio': _candle_vol_ratio,
-                                'impulse_pips': _bb_impulse,
-                                'confidence': 75
+                                'volume_ratio':  _candle_vol_ratio,
+                                'impulse_pips':  _bb_impulse,
+                                'confidence':    75,
                             })
-                
+
                 else:  # BEARISH
-                    # Look for broken support becoming resistance
+                    # Look for broken support becoming resistance.
                     support = prev_candles['low'].min()
-                    
-                    # Check if price broke below support
+
                     if candle['close'] < support:
-                        # Check if price held below on pullback
                         pullback_high = next_candles['high'].max()
-                        
+
                         if pullback_high <= candle['high'] * 1.005:
                             _bb_pip_sz = utils.get_pip_value(symbol)
                             if _bb_pip_sz <= 0:
                                 _bb_pip_sz = 0.0001
-                            _bb_impulse = max((support - candle['close']) / _bb_pip_sz, 0.0)
+                            _bb_impulse = max(
+                                (support - candle['close']) / _bb_pip_sz, 0.0)
+
+                            if _bb_impulse < 10.0:
+                                continue
+
+                            _zone_peak_vol = float(prev_candles['volume'].max())
+                            if (_zone_peak_vol > 0
+                                    and float(candle['volume']) < _zone_peak_vol * 0.80):
+                                continue
+
                             breakers.append({
-                                'type': 'BB',
-                                'direction': direction,
-                                'index': i,
-                                'timestamp': data.index[i],
-                                'high': candle['high'],
-                                'low': candle['low'],
+                                'type':          'BB',
+                                'direction':     direction,
+                                'index':         i,
+                                'timestamp':     data.index[i],
+                                'high':          float(candle['high']),
+                                'low':           float(candle['low']),
                                 'breaker_level': support,
-                                'volume_ratio': _candle_vol_ratio,
-                                'impulse_pips': _bb_impulse,
-                                'confidence': 75
+                                'volume_ratio':  _candle_vol_ratio,
+                                'impulse_pips':  _bb_impulse,
+                                'confidence':    75,
                             })
             
             self.logger.info(f"Detected {len(breakers)} valid Breaker Blocks for {direction} direction")
@@ -787,53 +832,91 @@ class SMCStrategy:
                     "SMC package MSS detection failed, using fallback: %s", e)
 
         # Fallback: internal swing break algorithm.
+        # Per sniper spec: a wick break = liquidity sweep, NOT a structure shift.
+        # A candle BODY CLOSE beyond the swing level is required to confirm MSS.
         try:
-            recent_swings = self._identify_swings(data.tail(50), lookback=3)
+            tail_df       = data.tail(80)
+            recent_swings = self._identify_swings(tail_df, lookback=3)
             if len(recent_swings) < 3:
                 return None
 
             if htf_trend == 'BULLISH':
+                # Bearish MSS: a candle body-closes below the most recent internal low.
                 low_swings = [s for s in recent_swings if s['direction'] == 'LOW']
                 if len(low_swings) < 2:
                     return None
                 internal_low = float(low_swings[-1]['price'])
-                if current_price < internal_low * 0.9995:
-                    displacement_pips = abs(current_price - internal_low) / pip_size
-                    if displacement_pips < 5.0:
-                        return None
-                    self.logger.info(
-                        "Fallback Bearish MSS: price %.5f broke below %.5f "
-                        "(%.1f pips).",
-                        current_price, internal_low, displacement_pips)
-                    return {
-                        'type':              'MSS',
-                        'direction':         'BEARISH',
-                        'level':             internal_low,
-                        'displacement':      displacement_pips,
-                        'displacement_pips': displacement_pips,
-                        'timestamp':         data.index[-1],
-                    }
+                swing_bar    = int(low_swings[-1].get('index', 0))
+
+                # Scan bars formed AFTER the swing for one whose CLOSE
+                # (not just wick) is strictly below internal_low.
+                mss_bar  = None
+                mss_time = None
+                for bar_idx in range(swing_bar + 1, len(tail_df)):
+                    if float(tail_df.iloc[bar_idx]['close']) < internal_low:
+                        mss_bar  = bar_idx
+                        mss_time = tail_df.index[bar_idx]
+                        break
+
+                if mss_bar is None:
+                    return None
+
+                displacement_pips = (
+                    abs(float(tail_df.iloc[mss_bar]['close']) - internal_low) / pip_size
+                )
+                if displacement_pips < 5.0:
+                    return None
+
+                self.logger.info(
+                    "Fallback Bearish MSS (body close): %.5f closed below %.5f "
+                    "(%.1f pips).",
+                    float(tail_df.iloc[mss_bar]['close']), internal_low, displacement_pips)
+                return {
+                    'type':              'MSS',
+                    'direction':         'BEARISH',
+                    'level':             internal_low,
+                    'displacement':      displacement_pips,
+                    'displacement_pips': displacement_pips,
+                    'timestamp':         mss_time,
+                }
+
             else:
+                # Bullish MSS: a candle body-closes above the most recent internal high.
                 high_swings = [s for s in recent_swings if s['direction'] == 'HIGH']
                 if len(high_swings) < 2:
                     return None
                 internal_high = float(high_swings[-1]['price'])
-                if current_price > internal_high * 1.0005:
-                    displacement_pips = abs(current_price - internal_high) / pip_size
-                    if displacement_pips < 5.0:
-                        return None
-                    self.logger.info(
-                        "Fallback Bullish MSS: price %.5f broke above %.5f "
-                        "(%.1f pips).",
-                        current_price, internal_high, displacement_pips)
-                    return {
-                        'type':              'MSS',
-                        'direction':         'BULLISH',
-                        'level':             internal_high,
-                        'displacement':      displacement_pips,
-                        'displacement_pips': displacement_pips,
-                        'timestamp':         data.index[-1],
-                    }
+                swing_bar     = int(high_swings[-1].get('index', 0))
+
+                mss_bar  = None
+                mss_time = None
+                for bar_idx in range(swing_bar + 1, len(tail_df)):
+                    if float(tail_df.iloc[bar_idx]['close']) > internal_high:
+                        mss_bar  = bar_idx
+                        mss_time = tail_df.index[bar_idx]
+                        break
+
+                if mss_bar is None:
+                    return None
+
+                displacement_pips = (
+                    abs(float(tail_df.iloc[mss_bar]['close']) - internal_high) / pip_size
+                )
+                if displacement_pips < 5.0:
+                    return None
+
+                self.logger.info(
+                    "Fallback Bullish MSS (body close): %.5f closed above %.5f "
+                    "(%.1f pips).",
+                    float(tail_df.iloc[mss_bar]['close']), internal_high, displacement_pips)
+                return {
+                    'type':              'MSS',
+                    'direction':         'BULLISH',
+                    'level':             internal_high,
+                    'displacement':      displacement_pips,
+                    'displacement_pips': displacement_pips,
+                    'timestamp':         mss_time,
+                }
 
             return None
 
@@ -1200,31 +1283,37 @@ class SMCStrategy:
             direction_u = str(direction).upper()
             atr_pips    = (atr / pip_size) if atr and atr > 0 else 0.0
 
-            # Dynamic structural buffer:
-            # 20% of ATR, clamped to avoid both overly tight and overly wide stops.
-            if atr_pips > 0:
-                buffer_pips = min(8.0, max(2.0, atr_pips * 0.20))
-            else:
-                buffer_pips = 3.0
+            # ATR-based stop loss per sniper specification:
+            # Buy:  SL = POI Swing Low  - (1.5 * ATR(14))
+            # Sell: SL = POI Swing High + (1.5 * ATR(14))
+            # The 1.5x multiplier is proportional to the instrument's live
+            # volatility — pips for FX, dollars for Gold, points for BTC.
+            atr_offset = atr * 1.5 if (atr and atr > 0) else (15.0 * pip_size)
 
             if direction_u in ('BUY', 'BULLISH'):
-                sl_price = float(poi['low']) - (buffer_pips * pip_size)
+                sl_price = float(poi['low']) - atr_offset
             else:  # SELL / BEARISH
-                sl_price = float(poi['high']) + (buffer_pips * pip_size)
-            
+                sl_price = float(poi['high']) + atr_offset
+
+            sl_pips = abs(
+                sl_price - float(poi['low'] if direction_u in ('BUY', 'BULLISH') else poi['high'])
+            ) / pip_size
+
             return {
-                'stop_loss': round(sl_price, 5),
-                'buffer_pips': round(buffer_pips, 1),
-                'atr_adjusted': True
+                'stop_loss':    round(sl_price, 5),
+                'buffer_pips':  round(sl_pips, 1),
+                'atr_adjusted': True,
             }
-        
+
         except Exception as e:
-            self.logger.error(f"Error calculating stop loss: {e}")
-            # Fallback
+            self.logger.error("Error calculating stop loss: %s", e)
+            _ps = utils.get_pip_value(symbol)
+            if _ps <= 0:
+                _ps = 0.0001
             if str(direction).upper() in ('BUY', 'BULLISH'):
-                return {'stop_loss': round(poi['low'] - (3 * utils.get_pip_value(symbol)), 5), 'buffer_pips': 3, 'atr_adjusted': False}
+                return {'stop_loss': round(float(poi['low']) - (15.0 * _ps), 5), 'buffer_pips': 15.0, 'atr_adjusted': False}
             else:
-                return {'stop_loss': round(poi['high'] + (3 * utils.get_pip_value(symbol)), 5), 'buffer_pips': 3, 'atr_adjusted': False}
+                return {'stop_loss': round(float(poi['high']) + (15.0 * _ps), 5), 'buffer_pips': 15.0, 'atr_adjusted': False}
     
     def calculate_take_profits(
         self,
@@ -1232,68 +1321,126 @@ class SMCStrategy:
         stop_loss: float,
         direction: str,
         htf_swing: float,
-        symbol: str
+        symbol: str,
+        m15_data: Optional[pd.DataFrame] = None,
     ) -> Dict:
         """
-        Calculate exact TP1/TP2 risk multiples for live execution and training.
+        Calculate structural TP1 and TP2 per sniper specification.
+
+        TP1 (Reasonable Structure):
+            Previous M15 structural peak (Buy) or trough (Sell).
+            Profit is taken at the nearest natural liquidity resistance,
+            not at an arbitrary math ratio.
+
+        TP2 (Institutional Target):
+            H1 Swing High (Buy) or H1 Swing Low (Sell).
+            This is the full institutional target passed in as htf_swing.
 
         Args:
-            entry: Entry price
+            entry:     Entry price
             stop_loss: Stop loss price
-            direction: Trade direction
-            htf_swing: HTF swing high/low
-            symbol: Trading symbol
-            
+            direction: 'BULLISH'/'BUY' or 'BEARISH'/'SELL'
+            htf_swing: H1 Swing High (Buy) or H1 Swing Low (Sell) — used as TP2
+            symbol:    Trading symbol
+            m15_data:  M15 OHLCV DataFrame for structural TP1 calculation
+
         Returns:
-            dict: TP1 and TP2 levels
+            dict: tp1, tp2, tp1_pips, tp2_pips, tp1_rr, tp2_rr
         """
         try:
             direction_u = str(direction).upper()
+            is_buy_dir  = direction_u in ('BULLISH', 'BUY')
             risk_price  = abs(entry - stop_loss)
             risk_pips   = utils.calculate_pips(symbol, entry, stop_loss)
+
             if risk_pips <= 0:
-                raise ValueError("Risk pips is zero - entry equals stop loss.")
-            is_buy_dir = direction_u in ('BULLISH', 'BUY')
-            target_tp1_rr = float(config.MIN_RR_RATIO)
-            target_tp2_rr = float(config.MIN_RR_TP2)
+                raise ValueError("Risk pips is zero — entry equals stop loss.")
 
-            # Use the configured RR targets directly. Structure validates that
-            # the setup has enough room for TP2, but it does not push the target
-            # farther away than requested.
-            if is_buy_dir:
-                tp1 = entry + (risk_price * target_tp1_rr)
-                tp2 = entry + (risk_price * target_tp2_rr)
-            else:
-                tp1 = entry - (risk_price * target_tp1_rr)
-                tp2 = entry - (risk_price * target_tp2_rr)
-
+            # ---- TP2: H1 Swing High (Buy) or H1 Swing Low (Sell) ----
+            # htf_swing is the H1 structural extreme passed from the scanner.
+            # Minimum 1.5R from entry to the H1 swing is required.
             if htf_swing and htf_swing > 0:
+                if is_buy_dir and htf_swing <= entry:
+                    raise ValueError(
+                        "HTF swing high %.5f is not above entry %.5f. "
+                        "Setup rejected." % (htf_swing, entry)
+                    )
+                if not is_buy_dir and htf_swing >= entry:
+                    raise ValueError(
+                        "HTF swing low %.5f is not below entry %.5f. "
+                        "Setup rejected." % (htf_swing, entry)
+                    )
                 structural_pips = utils.calculate_pips(symbol, entry, htf_swing)
-                structural_rr = (
-                    round(structural_pips / risk_pips, 2) if risk_pips > 0 else 0.0
-                )
-                if is_buy_dir:
-                    if htf_swing <= entry:
-                        raise ValueError(
-                            "HTF swing is not above entry for a bullish setup."
-                        )
-                    if structural_rr < target_tp2_rr:
-                        raise ValueError(
-                            "HTF swing R:R %.2f is below required TP2 %.1fR. "
-                            "Setup rejected." % (structural_rr, target_tp2_rr)
-                        )
-                else:
-                    if htf_swing >= entry:
-                        raise ValueError(
-                            "HTF swing is not below entry for a bearish setup."
-                        )
-                    if structural_rr < target_tp2_rr:
-                        raise ValueError(
-                            "HTF swing R:R %.2f is below required TP2 %.1fR. "
-                            "Setup rejected." % (structural_rr, target_tp2_rr)
-                        )
+                structural_rr   = round(structural_pips / risk_pips, 2) if risk_pips > 0 else 0.0
+                if structural_rr < float(config.MIN_RR_TP2):
+                    raise ValueError(
+                        "H1 swing R:R %.2fR is below minimum %.1fR. "
+                        "Setup rejected." % (structural_rr, config.MIN_RR_TP2)
+                    )
+                tp2 = float(htf_swing)
+            else:
+                # No H1 swing provided: fall back to fixed 2R.
+                tp2 = (entry + risk_price * 2.0) if is_buy_dir else (entry - risk_price * 2.0)
 
+            # ---- TP1: Previous M15 structural peak (Buy) or trough (Sell) ----
+            # Search M15 swings for the nearest swing HIGH above entry (Buy)
+            # or swing LOW below entry (Sell), sitting between entry and TP2.
+            tp1 = None
+
+            if m15_data is not None and len(m15_data) >= 20:
+                try:
+                    m15_swings = self._identify_swings(m15_data.tail(100), lookback=2)
+                    if is_buy_dir:
+                        # Nearest swing HIGH above entry and below TP2.
+                        candidates = [
+                            s for s in m15_swings
+                            if s['direction'] == 'HIGH'
+                            and float(s['price']) > entry
+                            and float(s['price']) < tp2
+                        ]
+                        if candidates:
+                            tp1 = float(
+                                min(candidates, key=lambda s: float(s['price']))['price']
+                            )
+                    else:
+                        # Nearest swing LOW below entry and above TP2.
+                        candidates = [
+                            s for s in m15_swings
+                            if s['direction'] == 'LOW'
+                            and float(s['price']) < entry
+                            and float(s['price']) > tp2
+                        ]
+                        if candidates:
+                            tp1 = float(
+                                max(candidates, key=lambda s: float(s['price']))['price']
+                            )
+                except Exception as _tp1_err:
+                    self.logger.debug(
+                        "M15 structural TP1 failed for %s: %s. "
+                        "Falling back to 1.5R.", symbol, _tp1_err)
+
+            if tp1 is None:
+                # Fallback: fixed 1.5R when no M15 structural level is found.
+                tp1 = (
+                    entry + risk_price * float(config.MIN_RR_RATIO)
+                    if is_buy_dir
+                    else entry - risk_price * float(config.MIN_RR_RATIO)
+                )
+                self.logger.debug(
+                    "No M15 structural TP1 for %s %s. Using 1.5R fallback %.5f.",
+                    symbol, direction_u, tp1)
+
+            # TP1 must offer at least 0.8R — if the structural level is too close,
+            # fall back to the fixed 1.5R level which is always adequate.
             tp1_pips = utils.calculate_pips(symbol, entry, tp1)
+            if tp1_pips < risk_pips * 0.8:
+                tp1 = (
+                    entry + risk_price * float(config.MIN_RR_RATIO)
+                    if is_buy_dir
+                    else entry - risk_price * float(config.MIN_RR_RATIO)
+                )
+                tp1_pips = utils.calculate_pips(symbol, entry, tp1)
+
             tp2_pips = utils.calculate_pips(symbol, entry, tp2)
             tp1_rr   = round(tp1_pips / risk_pips, 2) if risk_pips > 0 else 0.0
             tp2_rr   = round(tp2_pips / risk_pips, 2) if risk_pips > 0 else 0.0
@@ -1306,7 +1453,7 @@ class SMCStrategy:
                 'tp1_rr':   tp1_rr,
                 'tp2_rr':   tp2_rr,
             }
-        
+
         except ValueError:
             raise
         except Exception as e:
@@ -1593,24 +1740,22 @@ class SMCStrategy:
             total_range    = swing_high - swing_low
             price_position = (current_price - swing_low) / total_range
 
+            # Per sniper spec: Buys valid ONLY below 50% equilibrium (discount).
+            # Sells valid ONLY above 50% equilibrium (premium).
             if direction == 'BULLISH':
                 if price_position <= 0.35:
-                    return True,  price_position, f"Deep discount zone ({price_position:.1%})"
+                    return True,  price_position, "Deep discount zone (%.1f%%) — high priority BUY zone" % (price_position * 100)
                 elif price_position <= 0.50:
-                    return True,  price_position, f"Discount zone ({price_position:.1%})"
-                elif price_position <= 0.65:
-                    return False, price_position, f"Mid zone ({price_position:.1%}) - marginal"
+                    return True,  price_position, "Discount zone (%.1f%%) — valid BUY zone" % (price_position * 100)
                 else:
-                    return False, price_position, f"Premium zone ({price_position:.1%}) - avoid BUY"
+                    return False, price_position, "Premium zone (%.1f%%) — BUY not valid above equilibrium" % (price_position * 100)
             else:
                 if price_position >= 0.65:
-                    return True,  price_position, f"Deep premium zone ({price_position:.1%})"
+                    return True,  price_position, "Deep premium zone (%.1f%%) — high priority SELL zone" % (price_position * 100)
                 elif price_position >= 0.50:
-                    return True,  price_position, f"Premium zone ({price_position:.1%})"
-                elif price_position >= 0.35:
-                    return False, price_position, f"Mid zone ({price_position:.1%}) - marginal"
+                    return True,  price_position, "Premium zone (%.1f%%) — valid SELL zone" % (price_position * 100)
                 else:
-                    return False, price_position, f"Discount zone ({price_position:.1%}) - avoid SELL"
+                    return False, price_position, "Discount zone (%.1f%%) — SELL not valid below equilibrium" % (price_position * 100)
 
         except Exception as e:
             self.logger.error("Error detecting premium/discount zone: %s", e)

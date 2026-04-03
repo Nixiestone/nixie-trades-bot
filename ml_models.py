@@ -513,6 +513,7 @@ class MLEnsemble:
                             )
                         ),
                         symbol,
+                        m15_data=m15_win,
                     )
                     tp1_price = float(tp_cfg.get('tp1', 0))
                     tp2_price = float(tp_cfg.get('tp2', 0))

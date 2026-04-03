@@ -99,6 +99,9 @@ class ChartGenerator:
         fvgs: Optional[List[Dict]] = None,
         bos_events: Optional[List[Dict]] = None,
         swing_levels: Optional[List[Dict]] = None,
+        inducement_data: Optional[Dict] = None,
+        htf_swing_high: float = 0.0,
+        htf_swing_low: float = 0.0,
     ) -> Optional[bytes]:
         """
         Render the complete annotated chart and return optimised PNG bytes.
@@ -146,13 +149,20 @@ class ChartGenerator:
 
             self._draw_watermark(ax, symbol)
 
+            # Draw premium/discount zone background shading first so all
+            # price structure sits on top of it.
+            if htf_swing_high > 0 and htf_swing_low > 0 and htf_swing_high > htf_swing_low:
+                _is_buy_dir = str(setup_data.get('direction', 'BUY')).upper() == 'BUY'
+                self._draw_premium_discount_zone(
+                    ax, htf_swing_high, htf_swing_low, _is_buy_dir, y_min, y_max)
+
             if fvgs:
                 for fvg in fvgs:
                     self._draw_fvg(ax, fvg, time_index, n, x_right,
                                    y_min, y_max)
 
             if bos_events:
-                self._draw_bos_lines(ax, bos_events)
+                self._draw_bos_lines(ax, bos_events, time_index, n, x_right)
 
             # Draw secondary M15 zones (other OBs and BBs detected on the
             # same timeframe as the chart data — bar positions are accurate).
@@ -170,6 +180,11 @@ class ChartGenerator:
             if swing_levels:
                 self._draw_swing_levels(ax, swing_levels, time_index, n,
                                         y_min, y_max)
+
+            # Draw IDM (inducement sweep) marker on the exact sweep candle.
+            if inducement_data:
+                self._draw_inducement(ax, inducement_data, time_index, n,
+                                      x_right, y_min, y_max)
 
             position_anchor = self._resolve_position_anchor(
                 poi, refined_pois or [], time_index, n)
@@ -435,31 +450,265 @@ class ChartGenerator:
     # BOS LINES
     # =========================================================================
 
-    def _draw_bos_lines(self, ax: plt.Axes, bos_events: List[Dict]):
+    def _draw_bos_lines(
+        self,
+        ax: plt.Axes,
+        bos_events: List[Dict],
+        time_index: list,
+        n: int,
+        x_right: int,
+    ):
+        """
+        Draw BOS lines starting from the bar where the break occurred,
+        not full-width across the chart. The label is placed at the
+        break bar so the user can see exactly which candle confirmed the BOS.
+        """
         seen: set = set()
-        for bos in bos_events[:3]:
+        for bos in bos_events[:4]:
             level = float(bos.get('level', 0))
             if level <= 0 or level in seen:
                 continue
             seen.add(level)
-            ax.axhline(
-                y=level,
+
+            # Locate the BOS bar using its timestamp.
+            # Fall back to a position 30 bars from the right edge.
+            bos_bar = self._ts_to_bar_index(bos.get('timestamp'), time_index)
+            if bos_bar is None:
+                bos_bar = max(0, n - 30)
+            bos_bar = max(0, min(bos_bar, n - 1))
+
+            # Horizontal dashed line from BOS bar to right edge.
+            ax.plot(
+                [float(bos_bar), float(x_right)],
+                [level, level],
                 color=self.C_BOS_LINE,
-                linewidth=0.75,
-                linestyle=(0, (6, 4)),
-                alpha=0.65, zorder=4,
+                linewidth=0.9,
+                linestyle=(0, (6, 3)),
+                alpha=0.75,
+                zorder=4,
             )
+            # Vertical tick at the BOS bar to indicate the confirmation candle.
+            ax.plot(
+                [float(bos_bar), float(bos_bar)],
+                [level - (level * 0.0003), level + (level * 0.0003)],
+                color=self.C_BOS_LINE,
+                linewidth=2.0,
+                alpha=0.90,
+                zorder=5,
+                solid_capstyle='round',
+            )
+            # Label at the BOS bar.
             ax.text(
-                0.5, level,
+                bos_bar + 0.5,
+                level,
                 ' BOS',
-                color=self.C_BOS_LINE, fontsize=6.5,
-                va='bottom', ha='left',
-                alpha=0.80, zorder=8,
+                color=self.C_BOS_LINE,
+                fontsize=7.0,
+                fontweight='bold',
+                va='bottom',
+                ha='left',
+                alpha=0.90,
+                zorder=8,
             )
 
     # =========================================================================
     # SWING STRUCTURE LEVELS
     # =========================================================================
+    
+
+    def _draw_inducement(
+        self,
+        ax: plt.Axes,
+        inducement_data: Dict,
+        time_index: list,
+        n: int,
+        x_right: int,
+        y_min: float,
+        y_max: float,
+    ):
+        """
+        Draw the Inducement (IDM) sweep level and highlight the sweep candle.
+        The IDM is the M15 internal pullback that was swept before the entry.
+        A clear sweep label tells the user the stop hunt is complete.
+        """
+        sweep_level = float(inducement_data.get('sweep_level', 0))
+        if sweep_level <= 0:
+            return
+
+        # The sweep candle data is nested inside inducement_data.
+        sweep_candle = inducement_data.get('sweep_candle', {}) or {}
+        direction    = str(inducement_data.get('direction', 'BULLISH')).upper()
+        sweep_pips   = float(inducement_data.get('sweep_pips', 0))
+        quality      = str(inducement_data.get('quality', 'MODERATE')).upper()
+        is_buy       = direction in ('BULLISH', 'BUY')
+
+        # Colour: teal for buy IDM, orange for sell IDM.
+        idm_color = '#06b6d4' if is_buy else '#f97316'
+
+        # Draw the IDM sweep level as a horizontal dotted line.
+        ax.axhline(
+            y=sweep_level,
+            color=idm_color,
+            linewidth=0.80,
+            linestyle=(0, (2, 3)),
+            alpha=0.70,
+            zorder=4,
+        )
+
+        # Locate the sweep candle bar by its timestamp.
+        sweep_ts  = sweep_candle.get('timestamp')
+        sweep_bar = self._ts_to_bar_index(sweep_ts, time_index)
+
+        if sweep_bar is not None and 0 <= sweep_bar < n:
+            # Highlight the sweep candle with a coloured background rectangle.
+            ax.add_patch(mpatches.Rectangle(
+                (sweep_bar - 0.5, y_min),
+                1.0,
+                y_max - y_min,
+                facecolor=idm_color,
+                edgecolor='none',
+                alpha=0.08,
+                zorder=3,
+            ))
+            # Arrow pointing to the sweep wick.
+            arrow_y = (
+                float(sweep_candle.get('sweep_low', sweep_level)) - (y_max - y_min) * 0.015
+                if is_buy
+                else float(sweep_candle.get('sweep_high', sweep_level)) + (y_max - y_min) * 0.015
+            )
+            ax.annotate(
+                '',
+                xy=(sweep_bar, sweep_level),
+                xytext=(sweep_bar, arrow_y),
+                arrowprops=dict(
+                    arrowstyle='-|>',
+                    color=idm_color,
+                    lw=1.2,
+                ),
+                zorder=9,
+            )
+            # Label above/below the sweep candle.
+            label_y = (
+                arrow_y - (y_max - y_min) * 0.018
+                if is_buy
+                else arrow_y + (y_max - y_min) * 0.018
+            )
+            quality_tag = 'STRONG' if quality == 'STRONG' else 'MOD'
+            ax.text(
+                sweep_bar,
+                label_y,
+                'IDM SWEPT\n%.1f pips [%s]' % (sweep_pips, quality_tag),
+                color=idm_color,
+                fontsize=5.8,
+                fontweight='bold',
+                ha='center',
+                va='top' if is_buy else 'bottom',
+                alpha=0.92,
+                zorder=9,
+            )
+
+        # Right-edge label for the sweep level.
+        ax.text(
+            x_right + 0.3,
+            sweep_level,
+            ' IDM %.5f ' % sweep_level,
+            color=idm_color,
+            fontsize=6.5,
+            fontweight='bold',
+            va='center',
+            ha='left',
+            alpha=0.88,
+            zorder=9,
+            clip_on=False,
+            bbox={
+                'boxstyle':  'round,pad=0.18',
+                'facecolor': idm_color,
+                'edgecolor': 'none',
+                'alpha':     0.22,
+            },
+        )
+
+    def _draw_premium_discount_zone(
+        self,
+        ax: plt.Axes,
+        htf_swing_high: float,
+        htf_swing_low: float,
+        is_buy: bool,
+        y_min: float,
+        y_max: float,
+    ):
+        """
+        Shade the chart background to show the 50 percent equilibrium split.
+        Premium zone (top 50 percent) is shaded red — valid only for SELL.
+        Discount zone (bottom 50 percent) is shaded green — valid only for BUY.
+        The equilibrium line at 50 percent is drawn in white at low opacity.
+        """
+        equilibrium = (htf_swing_high + htf_swing_low) / 2.0
+        chart_min   = max(y_min, htf_swing_low)
+        chart_max   = min(y_max, htf_swing_high)
+
+        if chart_max <= chart_min:
+            # HTF swing is outside the visible chart range — draw equilibrium only.
+            if y_min <= equilibrium <= y_max:
+                ax.axhline(
+                    y=equilibrium,
+                    color='#ffffff',
+                    linewidth=0.55,
+                    linestyle=(0, (8, 6)),
+                    alpha=0.20,
+                    zorder=2,
+                )
+            return
+
+        eq_visible = max(chart_min, min(equilibrium, chart_max))
+
+        # Discount zone (below equilibrium): light green background.
+        discount_top = eq_visible
+        discount_bot = chart_min
+        if discount_top > discount_bot:
+            ax.axhspan(
+                discount_bot,
+                discount_top,
+                facecolor='#22c55e',
+                alpha=0.04,
+                zorder=1,
+            )
+
+        # Premium zone (above equilibrium): light red background.
+        premium_top = chart_max
+        premium_bot = eq_visible
+        if premium_top > premium_bot:
+            ax.axhspan(
+                premium_bot,
+                premium_top,
+                facecolor='#ef4444',
+                alpha=0.04,
+                zorder=1,
+            )
+
+        # Equilibrium line.
+        ax.axhline(
+            y=equilibrium,
+            color='#ffffff',
+            linewidth=0.65,
+            linestyle=(0, (8, 5)),
+            alpha=0.28,
+            zorder=2,
+        )
+
+        # Label the equilibrium line at the right edge.
+        zone_label = 'EQ (DISCOUNT)' if is_buy else 'EQ (PREMIUM)'
+        ax.text(
+            0.5,
+            equilibrium,
+            ' 50%% EQ',
+            color='#ffffff',
+            fontsize=5.5,
+            va='bottom',
+            ha='left',
+            alpha=0.38,
+            zorder=8,
+        )
 
     def _draw_swing_levels(
         self,
