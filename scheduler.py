@@ -76,7 +76,7 @@ class NixTradesScheduler:
         # Appended to the LLM prompt in weekly analysis for continuity.
         self._last_daily_context: str = ''
 
-        # Tracks which users already received each message today.
+        # Tracks which users already received each message on a given LOCAL date.
         # Format: "YYYY-MM-DD" -> set of telegram_ids
         self._briefing_sent: dict = {}
         self._news_sent:     dict = {}
@@ -132,6 +132,59 @@ class NixTradesScheduler:
         df.set_index('time', inplace=True)
         df.sort_index(inplace=True)
         return df
+
+    @staticmethod
+    def _prune_delivery_tracker(tracker: dict, keep_days: int = 5) -> None:
+        """Keep only the most recent local-date buckets for timed-message dedupe."""
+        if len(tracker) <= keep_days:
+            return
+        for old_key in sorted(tracker.keys())[:-keep_days]:
+            tracker.pop(old_key, None)
+
+    @staticmethod
+    def _rank_inducement_candidates(
+        pois: List[dict],
+        current_price: float,
+        h1_len: int,
+    ) -> List[dict]:
+        """
+        Rank candidate POIs for inducement checks.
+
+        We prefer zones that are:
+        1. on the correct side of the current market price
+        2. closest to the current market price
+        3. more recent
+        4. higher confidence
+
+        This prevents a stale high-confidence H1 zone from blocking the symbol
+        when a nearer valid zone exists.
+        """
+        def _rank(poi: dict):
+            direction = str(poi.get('direction', 'BULLISH')).upper()
+            is_buy = direction in ('BULLISH', 'BUY')
+            entry_edge = float(
+                poi.get('high', current_price) if is_buy else poi.get('low', current_price)
+            )
+            side_penalty = 0 if (
+                (is_buy and entry_edge <= current_price) or
+                ((not is_buy) and entry_edge >= current_price)
+            ) else 1
+            distance = abs(entry_edge - current_price)
+            try:
+                bars_ago = max(0, h1_len - int(poi.get('index', h1_len - 1)) - 1)
+            except Exception:
+                bars_ago = h1_len
+            confidence_penalty = -float(poi.get('confidence', 0))
+            zone_range = abs(float(poi.get('high', 0)) - float(poi.get('low', 0)))
+            return (
+                side_penalty,
+                distance,
+                bars_ago,
+                zone_range,
+                confidence_penalty,
+            )
+
+        return sorted(pois, key=_rank)
 
     # ==================== LIFECYCLE ====================
 
@@ -732,37 +785,56 @@ class NixTradesScheduler:
                     symbol, len(all_candidates))
                 return
 
-            # Use the highest-confidence unmitigated POI as the anchor for
-            # inducement detection. We need one reference zone to define the
-            # direction and price area of the expected sweep.
-            anchor_poi      = max(unmitigated, key=lambda x: x.get('confidence', 0))
-            trade_direction = anchor_poi['direction']
-
-            # Phase 2b: Inducement gate — validated on H1 to match setup timeframe.
-            # H1 identifies the trade idea (BOS/MSS and POI zones).
-            # M15 confirms the liquidity sweep (inducement) has actually occurred.
-            # M5 is used later for precise entry price refinement only.
-            # This 3-layer zoom is the correct Smart Money workflow.
-            # Pass the full M15 DataFrame so the inducement detector can scan
-            # 80 bars (20 hours) of M15 history for the liquidity sweep.
-            # The previous tail(60) combined with the internal tail(40) was
-            # producing only 40 bars (10 hours), missing sweeps on slow setups.
-            # An H1 BOS can precede the sweep by up to 12-16 hours.
-            inducement = self.smc.detect_inducement_post_structure(
-                m15_df,
-                anchor_poi,
-                trade_direction,
-                lookback_bars=80,
-                symbol=symbol,
-                timeframe='M15',
+            # Rank multiple valid POIs before inducement checks.
+            # Previously the scheduler tested only the single highest-confidence
+            # zone, which allowed an old or distant H1 POI to block the symbol
+            # even when a nearer valid zone existed.
+            current_price = float(m15_df.iloc[-1]['close'])
+            ranked_anchors = self._rank_inducement_candidates(
+                unmitigated,
+                current_price=current_price,
+                h1_len=len(h1_df),
             )
-            if inducement is None:
+
+            anchor_poi = None
+            inducement = None
+            trade_direction = ''
+            checked_count = 0
+
+            # Phase 2b: Inducement gate — validated on M15 after H1 structure.
+            # Check a few ranked candidates so one stale anchor cannot force the
+            # entire symbol into "awaiting inducement" every scan cycle.
+            for candidate in ranked_anchors[:4]:
+                checked_count += 1
+                candidate_direction = str(candidate.get('direction', 'BULLISH')).upper()
+                candidate_inducement = self.smc.detect_inducement_post_structure(
+                    m15_df,
+                    candidate,
+                    candidate_direction,
+                    lookback_bars=80,
+                    symbol=symbol,
+                    timeframe='M15',
+                )
+                if candidate_inducement is not None:
+                    anchor_poi = candidate
+                    inducement = candidate_inducement
+                    trade_direction = candidate_direction
+                    break
+
+            if anchor_poi is None:
+                anchor_poi = ranked_anchors[0]
+                trade_direction = str(anchor_poi.get('direction', 'BULLISH')).upper()
                 self.logger.info(
                     "AWAITING INDUCEMENT | %s | %s %s | "
-                    "Anchor POI [%.5f - %.5f] valid but no M15 sweep yet. "
-                    "Will re-check next scan.",
-                    symbol, setup_type, trade_direction,
-                    float(anchor_poi.get('low', 0)), float(anchor_poi.get('high', 0)),
+                    "Checked %d candidate POI(s); nearest anchor [%.5f - %.5f] still has no valid M15 sweep. "
+                    "Current price: %.5f. Will re-check next scan.",
+                    symbol,
+                    setup_type,
+                    trade_direction,
+                    checked_count,
+                    float(anchor_poi.get('low', 0)),
+                    float(anchor_poi.get('high', 0)),
+                    current_price,
                 )
                 return
 
@@ -1630,14 +1702,7 @@ class NixTradesScheduler:
             if not users:
                 return
 
-            utc_now  = datetime.now(timezone.utc)
-            date_key = utc_now.strftime('%Y-%m-%d')
-
-            # Reset tracking sets each new UTC day
-            if date_key not in self._briefing_sent:
-                self._briefing_sent = {date_key: set()}
-                self._news_sent     = {date_key: set()}
-                self._weekly_sent   = {date_key: set()}
+            utc_now = datetime.now(timezone.utc)
 
             for user in users:
                 tid    = user['telegram_id']
@@ -1650,6 +1715,11 @@ class NixTradesScheduler:
 
                 user_now  = utc_now.astimezone(user_tz)
                 weekday   = user_now.weekday()   # 0=Monday, 6=Sunday
+                date_key  = user_now.strftime('%Y-%m-%d')
+
+                self._briefing_sent.setdefault(date_key, set())
+                self._news_sent.setdefault(date_key, set())
+                self._weekly_sent.setdefault(date_key, set())
 
                 def _is_due(target_hour: int, target_minute: int) -> bool:
                     due_at = user_now.replace(
@@ -1684,6 +1754,10 @@ class NixTradesScheduler:
                         asyncio.create_task(
                             self._send_weekly_analysis(tid, user_now)
                         )
+
+            self._prune_delivery_tracker(self._briefing_sent)
+            self._prune_delivery_tracker(self._news_sent)
+            self._prune_delivery_tracker(self._weekly_sent)
 
         except Exception as e:
             self.logger.error("Error in _timed_messages: %s", e, exc_info=True)
@@ -1800,27 +1874,40 @@ class NixTradesScheduler:
             date_str = user_now.strftime('%A, %B %d, %Y')
 
             try:
-                events = self.news.get_red_folder_events(hours_ahead=24)
+                events = self.news.get_red_folder_events(hours_ahead=36)
                 if events:
-                    event_lines = []
+                    event_items = []
                     user_tz = user_now.tzinfo
+                    local_date = user_now.date()
                     for ev in events:
                         try:
-                            # Convert UTC event time to user's local timezone
-                            ev_utc  = ev.timestamp
+                            # Convert UTC event time to the user's local timezone,
+                            # then keep only the events that occur on the user's
+                            # current local calendar day.
+                            ev_utc = ev.timestamp
                             if ev_utc.tzinfo is None:
                                 import pytz
                                 ev_utc = pytz.utc.localize(ev_utc)
-                            ev_local   = ev_utc.astimezone(user_tz)
-                            day_str    = ev_local.strftime('%a')
-                            time_str   = ev_local.strftime('%I:%M %p').lstrip('0')
-                            local_str  = f"{day_str} {time_str} (your time)"
+                            ev_local = ev_utc.astimezone(user_tz)
+                            if ev_local.date() != local_date:
+                                continue
+                            currency = getattr(ev, 'currency', 'N/A')
+                            title = getattr(ev, 'title', str(ev))
+                            event_items.append((ev_local, currency, title))
                         except Exception:
-                            local_str = 'Unknown time'
-                        currency = getattr(ev, 'currency', 'N/A')
-                        title    = getattr(ev, 'title', str(ev))
-                        event_lines.append(f"  {local_str}  {currency:<4}  {title}")
-                    news_body = "\n".join(event_lines)
+                            continue
+
+                    if event_items:
+                        event_items.sort(key=lambda item: item[0])
+                        event_lines = []
+                        for ev_local, currency, title in event_items:
+                            day_str = ev_local.strftime('%a')
+                            time_str = ev_local.strftime('%I:%M %p').lstrip('0')
+                            local_str = f"{day_str} {time_str} (your time)"
+                            event_lines.append(f"  {local_str}  {currency:<4}  {title}")
+                        news_body = "\n".join(event_lines)
+                    else:
+                        news_body = "  No high-impact events found for today."
                 else:
                     news_body = "  No high-impact events found for today."
             except Exception:

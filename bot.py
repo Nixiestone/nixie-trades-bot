@@ -1558,7 +1558,7 @@ class NixTradesBot:
             update,
             utils.validate_user_message(
                 f"Timezone updated to {raw}.\n\n"
-                "Daily market briefings will now arrive at 8:00 AM in this timezone.\n\n"
+                "Daily market briefings will now arrive at 6:30 AM and news alerts at 8:00 AM in this timezone.\n\n"
                 f"{config.FOOTER}"
             ),
         )

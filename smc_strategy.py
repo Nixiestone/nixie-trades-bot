@@ -1953,7 +1953,7 @@ class SMCStrategy:
 
             if poi_high <= poi_low:
                 self.logger.info(
-                    "Malformed POI [%.5f - %.5f]. Passing inducement check.",
+                    "Malformed POI [%.5f - %.5f]. Inducement check skipped.",
                     poi_low, poi_high)
                 return None
 
