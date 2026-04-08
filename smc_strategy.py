@@ -1934,9 +1934,7 @@ class SMCStrategy:
         Caller should skip broadcast and retry on next scan cycle.
         """
         try:
-            df = data.tail(lookback_bars).copy()
-
-            if len(df) < 10:
+            if len(data) < 10:
                 # Insufficient bars to confirm a liquidity sweep.
                 # Return None so the scheduler's inducement guard fires correctly
                 # and the setup is deferred to the next scan cycle.
@@ -1944,7 +1942,7 @@ class SMCStrategy:
                 # broadcasting setups with zero sweep confirmation.
                 self.logger.info(
                     "Insufficient M15 bars (%d) for inducement check. "
-                    "Deferring setup until more bars are available.", len(df))
+                    "Deferring setup until more bars are available.", len(data))
                 return None
 
             is_buy   = direction == 'BULLISH'
@@ -1955,40 +1953,6 @@ class SMCStrategy:
                 self.logger.info(
                     "Malformed POI [%.5f - %.5f]. Inducement check skipped.",
                     poi_low, poi_high)
-                return None
-
-            internal_swings = self._identify_swings(df, lookback=2)
-
-            if not internal_swings:
-                self.logger.info(
-                    "No internal swings found in %d M15 bars.", len(df))
-                return None
-
-            if is_buy:
-                # BUY demand zone is BELOW current price.
-                # Smart money sweeps SELL STOPS sitting below the demand zone
-                # (below poi_low) before reversing up into the zone.
-                # We look for swing LOWS that are BELOW poi_low.
-                # Old code looked for swing lows ABOVE poi_high — completely wrong.
-                candidates = [
-                    s for s in internal_swings
-                    if s['direction'] == 'LOW' and s['price'] < poi_low
-                ]
-            else:
-                # SELL supply zone is ABOVE current price.
-                # Smart money sweeps BUY STOPS sitting above the supply zone
-                # (above poi_high) before reversing down into the zone.
-                # We look for swing HIGHS that are ABOVE poi_high.
-                # Old code looked for swing highs BELOW poi_low — completely wrong.
-                candidates = [
-                    s for s in internal_swings
-                    if s['direction'] == 'HIGH' and s['price'] > poi_high
-                ]
-
-            if not candidates:
-                self.logger.info(
-                    "No inducement candidates outside POI [%.5f - %.5f] "
-                    "for %s.", poi_low, poi_high, direction)
                 return None
 
             # Prefer the NEAREST valid swing to the POI boundary.
@@ -2007,80 +1971,116 @@ class SMCStrategy:
                 timeframe.upper(), 1.5)
             _min_dist_pips = config.INDUCEMENT_MIN_PIPS_BASE * _tf_scale
 
-            if is_buy:
-                # For BUY: valid swing lows must be at least 3 pips BELOW poi_low
-                valid_candidates = [
-                    s for s in candidates
-                    if (poi_low - s['price']) / _pip_size_for_dist >= _min_dist_pips
-                ]
-            else:
-                # For SELL: valid swing highs must be at least 3 pips ABOVE poi_high
-                valid_candidates = [
-                    s for s in candidates
-                    if (s['price'] - poi_high) / _pip_size_for_dist >= _min_dist_pips
-                ]
-
-            if not valid_candidates:
-                self.logger.info(
-                    "No qualifying inducement candidates found outside POI "
-                    "[%.5f - %.5f] for %s with minimum %.1f pip distance. "
-                    "Awaiting formation of a valid liquidity pool.",
-                    poi_low, poi_high, direction, _min_dist_pips)
-                return None
-
-            # Select the nearest valid candidate to the zone boundary.
-            if is_buy:
-                target_swing = max(valid_candidates, key=lambda s: s['price'])
-            else:
-                target_swing = min(valid_candidates, key=lambda s: s['price'])
-
-            sweep_level  = target_swing['price']
-            swing_idx    = target_swing['index']
-
-            sweep_candle = None
             _pip_size = utils.get_pip_value(symbol)
             if _pip_size <= 0:
                 _pip_size = 0.0001
 
-            for j in range(swing_idx + 1, len(df)):
-                candle = df.iloc[j]
+            def _sorted_valid_candidates(df_slice: pd.DataFrame, swing_lookback: int) -> List[Dict]:
+                internal_swings = self._identify_swings(df_slice, lookback=swing_lookback)
+                if not internal_swings:
+                    return []
                 if is_buy:
-                    if (float(candle['low']) < sweep_level
-                            and float(candle['close']) > sweep_level):
-                        sweep_pips = (sweep_level - float(candle['low'])) / _pip_size
-                        if sweep_pips >= _min_dist_pips:
-                            sweep_candle = {
-                                'index':       j,
-                                'timestamp':   df.index[j],
-                                'sweep_level': round(sweep_level, 5),
-                                'sweep_low':   round(float(candle['low']), 5),
-                                'close':       round(float(candle['close']), 5),
-                                'sweep_pips':  round(sweep_pips, 1),
-                            }
-                            break
-                else:
-                    if (float(candle['high']) > sweep_level
-                            and float(candle['close']) < sweep_level):
-                        sweep_pips = (float(candle['high']) - sweep_level) / _pip_size
-                        if sweep_pips >= _min_dist_pips:
-                            sweep_candle = {
-                                'index':       j,
-                                'timestamp':   df.index[j],
-                                'sweep_level': round(sweep_level, 5),
-                                'sweep_high':  round(float(candle['high']), 5),
-                                'close':       round(float(candle['close']), 5),
-                                'sweep_pips':  round(sweep_pips, 1),
-                            }
-                            break                                
+                    candidates = [
+                        s for s in internal_swings
+                        if s['direction'] == 'LOW' and s['price'] < poi_low
+                    ]
+                    valid = [
+                        s for s in candidates
+                        if (poi_low - s['price']) / _pip_size_for_dist >= _min_dist_pips
+                    ]
+                    return sorted(valid, key=lambda s: s['price'], reverse=True)
+                candidates = [
+                    s for s in internal_swings
+                    if s['direction'] == 'HIGH' and s['price'] > poi_high
+                ]
+                valid = [
+                    s for s in candidates
+                    if (s['price'] - poi_high) / _pip_size_for_dist >= _min_dist_pips
+                ]
+                return sorted(valid, key=lambda s: s['price'])
 
-            if sweep_candle is None:
+            primary_df = data.tail(max(lookback_bars, 40)).copy()
+            valid_candidates = _sorted_valid_candidates(primary_df, swing_lookback=2)
+
+            if not valid_candidates:
+                extended_bars = max(
+                    getattr(config, 'INDUCEMENT_EXTENDED_LOOKBACK_BARS_M15', lookback_bars * 2),
+                    lookback_bars,
+                )
+                extended_df = data.tail(extended_bars).copy()
+                valid_candidates = _sorted_valid_candidates(extended_df, swing_lookback=1)
+                df = extended_df
+            else:
+                df = primary_df
+
+            if not valid_candidates:
                 self.logger.info(
-                    "Sweep NOT YET confirmed. Internal %s at %.5f not yet "
-                    "swept on M15. Awaiting inducement.",
-                    'LOW' if is_buy else 'HIGH', sweep_level)
+                    "No inducement candidates outside POI [%.5f - %.5f] "
+                    "for %s after scanning %d M15 bars.",
+                    poi_low,
+                    poi_high,
+                    direction,
+                    len(df),
+                )
                 return None
 
-            current_price = float(df.iloc[-1]['close'])
+            sweep_candle = None
+            sweep_level = 0.0
+            checked_candidates = 0
+            for target_swing in valid_candidates[:8]:
+                checked_candidates += 1
+                swing_level = float(target_swing['price'])
+                swing_idx = int(target_swing['index'])
+                candidate_sweep = None
+
+                for j in range(swing_idx + 1, len(df)):
+                    candle = df.iloc[j]
+                    if is_buy:
+                        if (float(candle['low']) < swing_level
+                                and float(candle['close']) > swing_level):
+                            sweep_pips = (swing_level - float(candle['low'])) / _pip_size
+                            if sweep_pips >= _min_dist_pips:
+                                candidate_sweep = {
+                                    'index':       j,
+                                    'timestamp':   df.index[j],
+                                    'sweep_level': round(swing_level, 5),
+                                    'sweep_low':   round(float(candle['low']), 5),
+                                    'close':       round(float(candle['close']), 5),
+                                    'sweep_pips':  round(sweep_pips, 1),
+                                }
+                                break
+                    else:
+                        if (float(candle['high']) > swing_level
+                                and float(candle['close']) < swing_level):
+                            sweep_pips = (float(candle['high']) - swing_level) / _pip_size
+                            if sweep_pips >= _min_dist_pips:
+                                candidate_sweep = {
+                                    'index':       j,
+                                    'timestamp':   df.index[j],
+                                    'sweep_level': round(swing_level, 5),
+                                    'sweep_high':  round(float(candle['high']), 5),
+                                    'close':       round(float(candle['close']), 5),
+                                    'sweep_pips':  round(sweep_pips, 1),
+                                }
+                                break
+
+                if candidate_sweep is not None:
+                    sweep_candle = candidate_sweep
+                    sweep_level = swing_level
+                    break
+
+            if sweep_candle is None:
+                nearest_level = float(valid_candidates[0]['price'])
+                self.logger.info(
+                    "Sweep NOT YET confirmed. Checked %d candidate %s level(s); "
+                    "nearest at %.5f not yet swept on M15. Awaiting inducement.",
+                    checked_candidates or min(len(valid_candidates), 8),
+                    'LOW' if is_buy else 'HIGH',
+                    nearest_level,
+                )
+                return None
+
+            current_price = float(data.iloc[-1]['close'])
             if is_buy and current_price < poi_low:
                 self.logger.info(
                     "Inducement found but price %.5f already below POI low "
@@ -2096,11 +2096,13 @@ class SMCStrategy:
 
             self.logger.info(
                 "Inducement CONFIRMED [%s]: %.1f pip sweep %s internal %s "
-                "at %.5f. Price %.5f approaching POI [%.5f - %.5f]. "
-                "Quality: %s.",
+                "at %.5f after checking %d candidate level(s). "
+                "Price %.5f approaching POI [%.5f - %.5f]. Quality: %s.",
                 direction, sweep_candle['sweep_pips'],
                 'below' if is_buy else 'above',
-                'LOW' if is_buy else 'HIGH', sweep_level,
+                'LOW' if is_buy else 'HIGH',
+                sweep_level,
+                checked_candidates,
                 current_price, poi_low, poi_high, quality,
             )
 

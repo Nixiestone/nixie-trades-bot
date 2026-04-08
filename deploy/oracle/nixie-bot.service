@@ -1,0 +1,30 @@
+[Unit]
+Description=Nixie Trades Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=nixiebot
+Group=nixiebot
+WorkingDirectory=/opt/nixie-trades-bot/app
+EnvironmentFile=/etc/nixie-trades-bot/bot.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/nixie-trades-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/nixie-trades-bot/app
+UMask=0077
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

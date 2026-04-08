@@ -1,0 +1,25 @@
+# Nixie Trades Bot - Oracle/Linux deployment requirements
+# Use this on the Oracle bot host.
+# Do not install Windows-only MT5 worker packages here.
+
+typing-extensions
+urllib3
+cryptography
+pytz
+python-dotenv
+numpy
+pandas
+requests
+aiohttp
+beautifulsoup4
+supabase
+APScheduler
+scikit-learn
+xgboost
+matplotlib
+mplfinance
+colorlog
+python-telegram-bot
+metaapi-cloud-sdk
+pillow
+smartmoneyconcepts

@@ -110,6 +110,63 @@ class NixTradesScheduler:
         self.logger.info("Scheduler initialised.")
 
     @staticmethod
+    def _event_to_user_time(event, user_tz) -> Optional[datetime]:
+        """Convert a news event timestamp to the user's timezone."""
+        try:
+            ev_utc = event.timestamp
+            if ev_utc.tzinfo is None:
+                ev_utc = ev_utc.replace(tzinfo=timezone.utc)
+            else:
+                ev_utc = ev_utc.astimezone(timezone.utc)
+            return ev_utc.astimezone(user_tz)
+        except Exception:
+            return None
+
+    def _partition_news_events_for_user_day(
+        self,
+        events: List,
+        user_now: datetime,
+    ) -> tuple[list[tuple[datetime, str, str]], list[tuple[datetime, str, str]]]:
+        """
+        Split events into the user's local calendar day versus later dates.
+        """
+        user_tz = user_now.tzinfo or timezone.utc
+        local_date = user_now.date()
+        today_items: list[tuple[datetime, str, str]] = []
+        later_items: list[tuple[datetime, str, str]] = []
+
+        for ev in events:
+            ev_local = self._event_to_user_time(ev, user_tz)
+            if ev_local is None:
+                continue
+            item = (
+                ev_local,
+                getattr(ev, 'currency', 'N/A'),
+                getattr(ev, 'title', str(ev)),
+            )
+            if ev_local.date() == local_date:
+                today_items.append(item)
+            elif ev_local.date() > local_date:
+                later_items.append(item)
+
+        today_items.sort(key=lambda item: item[0])
+        later_items.sort(key=lambda item: item[0])
+        return today_items, later_items
+
+    @staticmethod
+    def _format_news_items_for_user(
+        items: list[tuple[datetime, str, str]],
+    ) -> str:
+        """Render local-time news rows for Telegram."""
+        lines = []
+        for ev_local, currency, title in items:
+            day_str = ev_local.strftime('%a')
+            time_str = ev_local.strftime('%I:%M %p').lstrip('0')
+            local_str = f"{day_str} {time_str} (your time)"
+            lines.append(f"  {local_str}  {currency:<4}  {title}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _candles_to_df(raw: List[dict]) -> pd.DataFrame:
         """
         Convert MT5 candle payload to a UTC-indexed DataFrame.
@@ -404,7 +461,7 @@ class NixTradesScheduler:
                 return
 
             market_overview = await self._generate_market_overview()
-            news_summary    = self.news.format_news_summary(hours_ahead=24)
+            news_summary = self.news.format_news_summary(hours_ahead=24)
 
             message = utils.validate_user_message(
                 f"GOOD MORNING - DAILY MARKET OVERVIEW\n"
@@ -510,23 +567,33 @@ class NixTradesScheduler:
                 if len(self._reminded_events) > 300:
                     self._reminded_events = set(list(self._reminded_events)[-200:])
 
-                time_str = utils.calculate_time_until(ev_ts)
-                reminder = utils.validate_user_message(
-                    "HIGH-IMPACT NEWS REMINDER\n\n"
-                    f"Event:    {event.currency} — {event.title}\n"
-                    f"Time:     In approximately {time_str}\n\n"
-                    f"Avoid opening new trades on pairs involving {event.currency} "
-                    "for the next 30 minutes.\n\n"
-                    "The bot pauses automated setups on affected pairs "
-                    "during the blackout window.\n\n"
-                    f"{config.FOOTER}"
-                )
-
                 from payment_handler import get_subscription_manager as _gsm
                 _sub_mgr   = _gsm()
                 subscribed = db.get_subscribed_users()
                 for user in subscribed:
                     if _sub_mgr.get_tier(user['telegram_id']) in ('basic', 'pro', 'admin'):
+                        try:
+                            import pytz
+                            tz_str = user.get('timezone') or user.get('user_timezone') or 'UTC'
+                            user_tz = pytz.timezone(tz_str)
+                        except Exception:
+                            tz_str = 'UTC'
+                            user_tz = timezone.utc
+
+                        local_ts = ev_ts.astimezone(user_tz)
+                        local_str = local_ts.strftime('%a %I:%M %p').lstrip('0')
+                        eta_str = utils.format_time_until(ev_ts, tz_str)
+                        reminder = utils.validate_user_message(
+                            "HIGH-IMPACT NEWS REMINDER\n\n"
+                            f"Event:    {event.currency} — {event.title}\n"
+                            f"Time:     {local_str} (your time)\n"
+                            f"ETA:      In approximately {eta_str}\n\n"
+                            f"Avoid opening new trades on pairs involving {event.currency} "
+                            "for the next 30 minutes.\n\n"
+                            "The bot pauses automated setups on affected pairs "
+                            "during the blackout window.\n\n"
+                            f"{config.FOOTER}"
+                        )
                         await self._safe_send(user['telegram_id'], reminder)
                         await asyncio.sleep(_TELEGRAM_SEND_DELAY)
 
@@ -620,7 +687,7 @@ class NixTradesScheduler:
             #   H4:  Same as D1. 400 covers ~67 trading days for alignment context.
             #   H1:  OB rolling_avg_vol needs 20 bars, OB loop needs 10+6=16 bars,
             #         detect_break_of_structure uses tail(50). 600 = ~25 trading days.
-            #   M15: Inducement lookback 80 bars (20 hours). ML features use 100 bars.
+            #   M15: Inducement uses a configurable lookback window plus ML features.
             #         700 bars = ~175 hours of M15 data for POI and sweep detection.
             #   M5:  OB refinement uses tail(80). 400 bars = 33 hours of M5 data.
             d1_raw  = await self.mt5.get_historical_data(symbol, 'D1',  bars=300)
@@ -643,7 +710,7 @@ class NixTradesScheduler:
                     "Insufficient H1 data for %s (%d bars). Need 200. Skipping.",
                     symbol, len(h1_raw) if h1_raw else 0)
                 return
-            # M15: inducement lookback is 80 bars, ML features need 100 bars.
+            # M15: inducement uses a configurable lookback window, ML features need 100 bars.
             if not m15_raw or len(m15_raw) < 120:
                 self.logger.debug(
                     "Insufficient M15 data for %s (%d bars). Need 120. Skipping.",
@@ -811,7 +878,7 @@ class NixTradesScheduler:
                     m15_df,
                     candidate,
                     candidate_direction,
-                    lookback_bars=80,
+                    lookback_bars=config.INDUCEMENT_LOOKBACK_BARS_M15,
                     symbol=symbol,
                     timeframe='M15',
                 )
@@ -827,7 +894,7 @@ class NixTradesScheduler:
                 self.logger.info(
                     "AWAITING INDUCEMENT | %s | %s %s | "
                     "Checked %d candidate POI(s); nearest anchor [%.5f - %.5f] still has no valid M15 sweep. "
-                    "Current price: %.5f. Will re-check next scan.",
+                    "Latest M15 close: %.5f. Will re-check next scan.",
                     symbol,
                     setup_type,
                     trade_direction,
@@ -1013,6 +1080,7 @@ class NixTradesScheduler:
             # News warning text
             next_news = self.news.get_next_high_impact(symbol)
             news_warn = ''
+            news_event_payload = None
             if next_news:
                 event_ts = next_news.timestamp
                 if event_ts.tzinfo is None:
@@ -1022,6 +1090,11 @@ class NixTradesScheduler:
                 mins = int((event_ts - datetime.now(timezone.utc)).total_seconds() / 60)
                 if 0 < mins <= config.H1_SETUP_EXPIRY_MINUTES:
                     _time_str = utils.calculate_time_until(event_ts)
+                    news_event_payload = {
+                        'timestamp': event_ts,
+                        'currency': next_news.currency,
+                        'title': next_news.title,
+                    }
                     news_warn = (
                         "Note: %s %s in approximately %s. "
                         "Consider reducing position size or waiting for the release." % (
@@ -1137,6 +1210,7 @@ class NixTradesScheduler:
                 ),
                 'ml_features':   ml_result['features'],
                 'news_warning':  news_warn,
+                'news_event':    news_event_payload,
                 'llm_context':   _llm_context,
                 'chart_data': {
                     'm15_df':          _chart_m15,
@@ -1324,10 +1398,24 @@ class NixTradesScheduler:
             subscribed = db.get_subscribed_users()
             if not subscribed:
                 return
+            from payment_handler import get_subscription_manager as _gsm
+            _sub_mgr = _gsm()
+            free_signal_window_count = db.count_recent_signals(
+                days=config.FREE_SETUP_ALERT_WINDOW_DAYS
+            )
+            free_limit_reached = (
+                free_signal_window_count > config.FREE_SETUP_ALERT_LIMIT
+            )
+            if free_limit_reached:
+                self.logger.info(
+                    "Free-tier setup cap reached: %d setups in the last %d days. "
+                    "Skipping free-tier delivery for setup #%s.",
+                    free_signal_window_count,
+                    config.FREE_SETUP_ALERT_WINDOW_DAYS,
+                    setup_data.get('signal_number', 0),
+                )
 
             signal_num = setup_data.get('signal_number', 0)
-            news_warn  = setup_data.get('news_warning', '')
-
             # Fetch live M15 data for chart generation.
             # Priority: MetaApi -> MT5 worker -> skip image entirely.
             # If neither source delivers data, the broadcast continues as
@@ -1393,6 +1481,10 @@ class NixTradesScheduler:
             for user in subscribed:
                 tid = user['telegram_id']
                 try:
+                    user_tier = _sub_mgr.get_tier(tid)
+                    if user_tier == 'free' and free_limit_reached:
+                        continue
+
                     # Calculate lot size per user's risk setting if MT5 connected.
                     # mt5_connected flag checked first, then credentials as fallback
                     # so a user who connected but whose flag was not set still executes.
@@ -1444,8 +1536,36 @@ class NixTradesScheduler:
                         ),
                     )
 
-                    if news_warn:
-                        message += f"\n\n{news_warn}"
+                    user_news_warn = setup_data.get('news_warning', '')
+                    news_event = setup_data.get('news_event')
+                    if news_event:
+                        try:
+                            import pytz
+                            tz_str = user.get('timezone') or user.get('user_timezone') or 'UTC'
+                            user_tz = pytz.timezone(tz_str)
+                            event_ts = news_event.get('timestamp')
+                            if event_ts is not None:
+                                if getattr(event_ts, 'tzinfo', None) is None:
+                                    event_ts = event_ts.replace(tzinfo=timezone.utc)
+                                else:
+                                    event_ts = event_ts.astimezone(timezone.utc)
+                                local_ts = event_ts.astimezone(user_tz)
+                                local_str = local_ts.strftime('%a %I:%M %p').lstrip('0')
+                                eta_str = utils.format_time_until(event_ts, tz_str)
+                                user_news_warn = (
+                                    "Note: %s %s at %s (your time), in approximately %s. "
+                                    "Consider reducing position size or waiting for the release." % (
+                                        news_event.get('currency', ''),
+                                        news_event.get('title', ''),
+                                        local_str,
+                                        eta_str,
+                                    )
+                                )
+                        except Exception:
+                            user_news_warn = setup_data.get('news_warning', '')
+
+                    if user_news_warn:
+                        message += f"\n\n{user_news_warn}"
                     _llm_ctx = setup_data.get('llm_context', '')
                     if _llm_ctx:
                         message += f"\n\n{_llm_ctx}"
@@ -1453,9 +1573,7 @@ class NixTradesScheduler:
                     try:
                         # Chart images are a Basic+ feature.
                         # Free-tier subscribers receive text-only alerts.
-                        from payment_handler import get_subscription_manager as _gsm
-                        _user_tier = _gsm().get_tier(tid)
-                        if chart_bytes and _user_tier in ('basic', 'pro', 'admin'):
+                        if chart_bytes and user_tier in ('basic', 'pro', 'admin'):
                             try:
                                 await self.bot.send_photo(
                                     chat_id=tid,
@@ -1703,10 +1821,13 @@ class NixTradesScheduler:
                 return
 
             utc_now = datetime.now(timezone.utc)
+            from payment_handler import get_subscription_manager as _gsm
+            _sub_mgr = _gsm()
 
             for user in users:
                 tid    = user['telegram_id']
                 tz_str = user.get('user_timezone') or user.get('timezone') or 'UTC'
+                user_tier = _sub_mgr.get_tier(tid)
 
                 try:
                     user_tz = pytz.timezone(tz_str)
@@ -1732,7 +1853,7 @@ class NixTradesScheduler:
                     return 0 <= minutes_since < self.alert_check_interval_minutes
 
                 # 06:30 Daily Market Briefing
-                if _is_due(6, 30):
+                if user_tier in ('basic', 'pro', 'admin') and _is_due(6, 30):
                     if tid not in self._briefing_sent[date_key]:
                         self._briefing_sent[date_key].add(tid)
                         asyncio.create_task(
@@ -1740,7 +1861,7 @@ class NixTradesScheduler:
                         )
 
                 # 08:00 Red Folder News Alert
-                if _is_due(8, 0):
+                if user_tier in ('basic', 'pro', 'admin') and _is_due(8, 0):
                     if tid not in self._news_sent[date_key]:
                         self._news_sent[date_key].add(tid)
                         asyncio.create_task(
@@ -1748,7 +1869,7 @@ class NixTradesScheduler:
                         )
 
                 # Sunday 09:00 Weekly Analysis
-                if weekday == 6 and _is_due(9, 0):
+                if user_tier in ('pro', 'admin') and weekday == 6 and _is_due(9, 0):
                     if tid not in self._weekly_sent[date_key]:
                         self._weekly_sent[date_key].add(tid)
                         asyncio.create_task(
@@ -1873,43 +1994,31 @@ class NixTradesScheduler:
 
             date_str = user_now.strftime('%A, %B %d, %Y')
 
+            intro_line = "Red folder events scheduled today."
             try:
                 events = self.news.get_red_folder_events(hours_ahead=36)
                 if events:
-                    event_items = []
-                    user_tz = user_now.tzinfo
-                    local_date = user_now.date()
-                    for ev in events:
-                        try:
-                            # Convert UTC event time to the user's local timezone,
-                            # then keep only the events that occur on the user's
-                            # current local calendar day.
-                            ev_utc = ev.timestamp
-                            if ev_utc.tzinfo is None:
-                                import pytz
-                                ev_utc = pytz.utc.localize(ev_utc)
-                            ev_local = ev_utc.astimezone(user_tz)
-                            if ev_local.date() != local_date:
-                                continue
-                            currency = getattr(ev, 'currency', 'N/A')
-                            title = getattr(ev, 'title', str(ev))
-                            event_items.append((ev_local, currency, title))
-                        except Exception:
-                            continue
-
-                    if event_items:
-                        event_items.sort(key=lambda item: item[0])
-                        event_lines = []
-                        for ev_local, currency, title in event_items:
-                            day_str = ev_local.strftime('%a')
-                            time_str = ev_local.strftime('%I:%M %p').lstrip('0')
-                            local_str = f"{day_str} {time_str} (your time)"
-                            event_lines.append(f"  {local_str}  {currency:<4}  {title}")
-                        news_body = "\n".join(event_lines)
+                    today_items, later_items = self._partition_news_events_for_user_day(
+                        events, user_now
+                    )
+                    if today_items:
+                        news_body = self._format_news_items_for_user(today_items)
+                    elif later_items:
+                        intro_line = (
+                            "No red folder events are scheduled for the rest of today."
+                        )
+                        news_body = (
+                            "  Next upcoming red-folder event:\n\n"
+                            f"{self._format_news_items_for_user(later_items[:1])}"
+                        )
                     else:
-                        news_body = "  No high-impact events found for today."
+                        intro_line = (
+                            "No red folder events are currently listed in the live feed."
+                        )
+                        news_body = "  No high-impact events are currently listed in the next 36 hours."
                 else:
-                    news_body = "  No high-impact events found for today."
+                    intro_line = "No red folder events are currently listed in the live feed."
+                    news_body = "  No high-impact events are currently listed in the next 36 hours."
             except Exception:
                 news_body = (
                     "  Live news feed unavailable.\n"
@@ -1921,7 +2030,7 @@ class NixTradesScheduler:
                 "HIGH-IMPACT NEWS ALERT",
                 date_str,
                 "",
-                "Red folder events scheduled today.",
+                intro_line,
                 "Trading is paused automatically 30 minutes before",
                 "and 15 minutes after each high-impact event.",
                 "",

@@ -1,0 +1,9 @@
+[Unit]
+Description=Nixie Trades Bot log freshness health check
+
+[Service]
+Type=oneshot
+User=nixiebot
+Group=nixiebot
+WorkingDirectory=/opt/nixie-trades-bot/app
+ExecStart=/opt/nixie-trades-bot/venv/bin/python deploy/oracle/bot_healthcheck.py --log-file /opt/nixie-trades-bot/app/nixie_trades_bot.log --max-age-seconds 1800

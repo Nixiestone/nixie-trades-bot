@@ -364,6 +364,8 @@ STRIPE_PRICE_BASIC    = os.getenv('STRIPE_PRICE_BASIC', '')
 STRIPE_PRICE_PRO      = os.getenv('STRIPE_PRICE_PRO', '')
 BYBIT_API_KEY         = os.getenv('BYBIT_API_KEY', '')
 BYBIT_API_SECRET      = os.getenv('BYBIT_API_SECRET', '')
+BYBIT_MERCHANT_ID     = os.getenv('BYBIT_MERCHANT_ID', '')
+BYBIT_CLIENT_ID       = os.getenv('BYBIT_CLIENT_ID', '')
 PAYMENT_CALLBACK_URL  = os.getenv('PAYMENT_CALLBACK_URL', '')
 PAYMENT_SUCCESS_URL   = os.getenv('PAYMENT_SUCCESS_URL', 'https://t.me/NixieTradesBot')
 PAYMENT_CANCEL_URL    = os.getenv('PAYMENT_CANCEL_URL', 'https://t.me/NixieTradesBot')
@@ -403,6 +405,12 @@ TIER_ACCOUNT_LIMITS = {
     'pro':   3,
     'admin': 9999,
 }
+
+FREE_SETUP_ALERT_LIMIT = 10
+FREE_SETUP_ALERT_WINDOW_DAYS = 7
+
+INDUCEMENT_LOOKBACK_BARS_M15 = 160
+INDUCEMENT_EXTENDED_LOOKBACK_BARS_M15 = 320
 
 # ==================== LEGAL DISCLAIMER ====================
 
@@ -476,8 +484,9 @@ SUBSCRIBE_SUCCESS = (
     "Subscription activated successfully.\n\n"
     "You will receive automated setup alerts when market conditions align "
     "with Smart Money Concepts criteria.\n\n"
-    "Daily briefing: 6:30 AM your time. News alert: 8:00 AM your time.\n"
-    "Use /settings to set your timezone and risk.\n\n"
+    "Free access includes up to 10 automated setup alerts each week.\n"
+    "No briefing, news, or weekly analysis alerts are included on the Free plan.\n"
+    "Use /upgrade to unlock charts, MT5 automation, daily briefing, and news alerts.\n\n"
     "Want automatic trade execution?\n"
     "Use /connect_mt5 to link your MT5 broker account.\n\n"
     "For questions: {support_contact}\n\n"

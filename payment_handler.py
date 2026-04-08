@@ -16,10 +16,13 @@ The word 'Admin' is never shown to end users; they see 'Staff' or nothing at all
 
 import hashlib
 import hmac as _hmac
+import ipaddress
 import json
 import logging
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -116,6 +119,10 @@ class SubscriptionManager:
 
     def __init__(self):
         self.logger = logging.getLogger(f"{__name__}.SubscriptionManager")
+        self._usd_ngn_rate_cache: Optional[Decimal] = None
+        self._usd_ngn_rate_cache_until = 0.0
+        self._public_ip_cache: Optional[str] = None
+        self._public_ip_cache_until = 0.0
 
     # ==================== TIER QUERIES ====================
 
@@ -231,7 +238,7 @@ class SubscriptionManager:
         Args:
             telegram_id: Embedded in payment metadata for webhook processing.
             tier:        'basic' or 'pro'
-            provider:    'paystack', 'stripe', or 'bybit'
+            provider:    'paystack' or 'crypto' (legacy: 'bybit', 'stripe')
 
         Returns:
             {'url': str, 'reference': str} on success, None on failure.
@@ -246,10 +253,12 @@ class SubscriptionManager:
         try:
             if provider == 'paystack':
                 return self._paystack_link(telegram_id, tier, amount_usd, reference)
+            if provider == 'crypto':
+                return self._crypto_link(telegram_id, tier, amount_usd, reference)
             if provider == 'stripe':
                 return self._stripe_link(telegram_id, tier, amount_usd, reference)
             if provider == 'bybit':
-                return self._bybit_link(telegram_id, tier, amount_usd, reference)
+                return self._crypto_link(telegram_id, tier, amount_usd, reference)
             self.logger.error("Unknown payment provider: %s", provider)
             return None
         except Exception as exc:
@@ -270,7 +279,7 @@ class SubscriptionManager:
     ) -> Optional[Dict]:
         """
         Initialize a Paystack transaction.
-        Amount is in kobo (100 kobo = 1 USD/NGN cent).
+        Amount is sent in NGN kobo (100 kobo = 1 naira).
         """
         secret = config.PAYSTACK_SECRET_KEY
         if not secret:
@@ -278,22 +287,26 @@ class SubscriptionManager:
                 "PAYSTACK_SECRET_KEY not set. Cannot generate Paystack link.")
             return None
 
+        amount_subunits, display_amount = self._get_paystack_amount(amount_usd)
         headers = {
             "Authorization": f"Bearer {secret}",
             "Content-Type":  "application/json",
         }
         payload = {
-            "amount":       amount_usd * 100,
-            "currency":     "USD",
+            "amount":       amount_subunits,
+            "currency":     "NGN",
             "email":        f"user{telegram_id}@nixietrades.bot",
             "reference":    reference,
             "callback_url": (
-                config.PAYMENT_CALLBACK_URL or "https://t.me/NixieTradesBot"
+                config.PAYMENT_SUCCESS_URL or "https://t.me/NixieTradesBot"
             ),
             "metadata": {
                 "telegram_id": str(telegram_id),
                 "tier":        tier,
                 "product":     "Nixie Trades Subscription",
+                "amount_usd":  str(amount_usd),
+                "charge_currency": "NGN",
+                "charge_amount": display_amount,
             },
             "channels": ["card", "bank_transfer"],
         }
@@ -321,6 +334,90 @@ class SubscriptionManager:
             'url':       data['data']['authorization_url'],
             'reference': data['data']['reference'],
         }
+
+    def _get_paystack_amount(self, amount_usd: int) -> Tuple[int, str]:
+        """Convert the USD plan price into NGN kobo using a live FX rate."""
+        rate = self._get_live_usd_ngn_rate()
+        major_amount = Decimal(str(amount_usd)) * rate
+        subunits = self._major_to_subunits(major_amount)
+        return subunits, self._format_major_amount(subunits, "NGN")
+
+    def _get_live_usd_ngn_rate(self) -> Decimal:
+        """Fetch and cache a live USD/NGN rate from public FX sources."""
+        now = time.time()
+        if (
+            self._usd_ngn_rate_cache is not None
+            and now < self._usd_ngn_rate_cache_until
+        ):
+            return self._usd_ngn_rate_cache
+
+        sources = [
+            (
+                "open.er-api.com",
+                "https://open.er-api.com/v6/latest/USD",
+                lambda data: data.get("rates", {}).get("NGN"),
+            ),
+            (
+                "exchangerate-api.com",
+                "https://api.exchangerate-api.com/v4/latest/USD",
+                lambda data: data.get("rates", {}).get("NGN"),
+            ),
+            (
+                "floatrates.com",
+                "https://www.floatrates.com/daily/usd.json",
+                lambda data: (data.get("ngn") or {}).get("rate"),
+            ),
+        ]
+
+        last_error = None
+        for source_name, url, extractor in sources:
+            try:
+                resp = requests.get(url, timeout=8)
+                resp.raise_for_status()
+                data = resp.json()
+                raw_rate = extractor(data)
+                rate = Decimal(str(raw_rate))
+                if rate <= 0 or rate >= 10000:
+                    raise ValueError(f"Out-of-range USD/NGN rate: {rate}")
+                self._usd_ngn_rate_cache = rate
+                self._usd_ngn_rate_cache_until = now + 1800
+                return rate
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(
+                    "FX rate lookup failed via %s: %s", source_name, exc
+                )
+
+        if self._usd_ngn_rate_cache is not None:
+            self.logger.warning(
+                "Using stale cached USD/NGN rate after FX lookup failure: %s",
+                last_error,
+            )
+            return self._usd_ngn_rate_cache
+
+        fallback_rate = Decimal("1600")
+        self._usd_ngn_rate_cache = fallback_rate
+        self._usd_ngn_rate_cache_until = now + 300
+        self.logger.error(
+            "All FX sources failed. Falling back temporarily to USD/NGN %s: %s",
+            fallback_rate,
+            last_error,
+        )
+        return fallback_rate
+
+    def _major_to_subunits(self, major_amount: Decimal) -> int:
+        subunits = (major_amount * Decimal("100")).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+        return max(int(subunits), 100)
+
+    def _format_major_amount(self, subunits: int, currency: str) -> str:
+        major = (Decimal(subunits) / Decimal("100")).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+        return f"{currency} {major}"
 
     # ==================== STRIPE ====================
 
@@ -401,9 +498,9 @@ class SubscriptionManager:
             self.logger.error("Stripe session creation failed: %s", exc)
             return None
 
-    # ==================== BYBIT PAY ====================
+    # ==================== CRYPTO CHECKOUT ====================
 
-    def _bybit_link(
+    def _crypto_link(
         self,
         telegram_id: int,
         tier: str,
@@ -411,38 +508,68 @@ class SubscriptionManager:
         reference: str,
     ) -> Optional[Dict]:
         """
-        Create a Bybit Pay crypto checkout order.
-        Falls back to the support contact URL if credentials are absent.
+        Create a crypto checkout order using the configured backend.
+        The current backend uses Bybit Pay under the hood, but that
+        provider name is intentionally hidden from Telegram user-facing text.
         """
-        api_key    = config.BYBIT_API_KEY
-        api_secret = config.BYBIT_API_SECRET
+        api_key      = config.BYBIT_API_KEY
+        api_secret   = config.BYBIT_API_SECRET
+        merchant_id  = config.BYBIT_MERCHANT_ID.strip()
+        client_id    = config.BYBIT_CLIENT_ID.strip() or f"tg_{telegram_id}"
+        callback_url = self._get_public_callback_url()
+        source_ip    = self._detect_public_ip()
 
-        if not api_key or not api_secret:
+        if not api_key or not api_secret or not merchant_id:
             self.logger.warning(
-                "Bybit credentials not set. Directing user to support.")
-            handle = config.SUPPORT_CONTACT.lstrip('@')
-            return {'url': f"https://t.me/{handle}", 'reference': reference}
+                "Crypto checkout credentials incomplete. "
+                "Require BYBIT_API_KEY, BYBIT_API_SECRET, and BYBIT_MERCHANT_ID. "
+                "Directing user to support."
+            )
+            return self._crypto_fallback(reference)
 
-        merchant_id = reference[:32]
         timestamp   = str(int(time.time() * 1000))
         recv_window = "5000"
         tier_name   = TIER_DISPLAY_NAMES.get(tier, tier.capitalize())
+        success_url = config.PAYMENT_SUCCESS_URL or "https://t.me/NixieTradesBot"
+        cancel_url  = config.PAYMENT_CANCEL_URL or "https://t.me/NixieTradesBot"
+
+        if not callback_url:
+            self.logger.warning(
+                "Crypto checkout requires a public PAYMENT_CALLBACK_URL. "
+                "Current value is blank, localhost, or a private host. "
+                "Directing user to support."
+            )
+            return self._crypto_fallback(reference)
+
+        if not source_ip:
+            self.logger.warning(
+                "Crypto checkout could not determine a public source IP automatically. "
+                "Directing user to support."
+            )
+            return self._crypto_fallback(reference)
 
         body = json.dumps({
-            "merchantOrderId": merchant_id,
-            "orderAmount":     str(amount_usd),
-            "currency":        "USDT",
-            "productType":     "1",
-            "productName":     f"Nixie Trades {tier_name} Plan",
-            "returnUrl":  (
-                config.PAYMENT_SUCCESS_URL or "https://t.me/NixieTradesBot"
-            ),
-            "successUrl": (
-                config.PAYMENT_SUCCESS_URL or "https://t.me/NixieTradesBot"
-            ),
-            "cancelUrl": (
-                config.PAYMENT_CANCEL_URL or "https://t.me/NixieTradesBot"
-            ),
+            "merchantId": merchant_id,
+            "merchantTradeNo": reference,
+            "clientId": client_id,
+            "paymentType": "E_COMMERCE",
+            "currency": "USDT",
+            "currencyType": "crypto",
+            "orderAmount": str(amount_usd),
+            "goods": [{
+                "goodsName": f"Nixie Trades {tier_name} Plan",
+                "goodsDetail": f"Monthly {tier_name} subscription",
+            }],
+            "successUrl": success_url,
+            "failedUrl": cancel_url,
+            "webhookUrl": callback_url,
+            "orderExpireTime": int(time.time()) + 3600,
+            "remark": f"Nixie Trades {tier_name} monthly subscription",
+            "env": {
+                "terminalType": "WEB",
+                "device": "Telegram Bot",
+                "ip": source_ip,
+            },
         }, separators=(',', ':'))
 
         sign_str  = f"{timestamp}{api_key}{recv_window}{body}"
@@ -452,42 +579,163 @@ class SubscriptionManager:
 
         headers = {
             "Content-Type":       "application/json",
+            "X-BAPI-SIGN-TYPE":   "2",
             "X-BAPI-API-KEY":     api_key,
             "X-BAPI-SIGN":        signature,
             "X-BAPI-TIMESTAMP":   timestamp,
             "X-BAPI-RECV-WINDOW": recv_window,
         }
 
-        try:
-            resp = requests.post(
-                "https://api.bybit.com/v3/private/pay/merchant/order/create",
-                data=body, headers=headers, timeout=15,
+        base_urls = self._crypto_base_urls()
+        last_error = None
+        for base_url in base_urls:
+            try:
+                resp = requests.post(
+                    f"{base_url}/v5/bybitpay/create_pay",
+                    data=body, headers=headers, timeout=15,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                self.logger.warning(
+                    "Crypto checkout network error via %s: %s", base_url, exc
+                )
+                continue
+
+            if resp.status_code != 200:
+                last_error = RuntimeError(
+                    f"HTTP {resp.status_code}: {resp.text[:200]}"
+                )
+                self.logger.warning(
+                    "Crypto checkout returned %d via %s: %s",
+                    resp.status_code, base_url, resp.text[:200]
+                )
+                continue
+
+            data = resp.json()
+            ret_code = data.get('retCode', data.get('ret_code', -1))
+            if str(ret_code) not in ('0', '100000'):
+                last_error = RuntimeError(
+                    f"{ret_code}: {data.get('retMsg', data.get('ret_msg'))}"
+                )
+                self.logger.warning(
+                    "Crypto checkout error via %s %s: %s",
+                    base_url,
+                    ret_code,
+                    data.get('retMsg', data.get('ret_msg')),
+                )
+                continue
+
+            url = self._extract_crypto_checkout_url(data)
+            if url:
+                return {'url': url, 'reference': reference}
+
+            last_error = RuntimeError("No checkout URL in response.")
+            self.logger.warning(
+                "Crypto checkout returned no checkout URL via %s.", base_url
             )
-        except requests.RequestException as exc:
-            self.logger.error("Bybit Pay network error: %s", exc)
-            return None
 
-        if resp.status_code != 200:
-            self.logger.error(
-                "Bybit Pay returned %d: %s", resp.status_code, resp.text[:200])
-            return None
-
-        data = resp.json()
-        if data.get('ret_code', -1) != 0:
-            self.logger.error(
-                "Bybit Pay error %s: %s",
-                data.get('ret_code'), data.get('ret_msg'))
-            return None
-
-        url = (
-            data.get('result', {}).get('checkoutUrl')
-            or data.get('result', {}).get('payUrl')
+        self.logger.error(
+            "Crypto checkout unavailable across all configured endpoints: %s",
+            last_error,
         )
-        if not url:
-            self.logger.error("Bybit Pay: no checkout URL in response.")
-            return None
+        return self._crypto_fallback(reference)
 
-        return {'url': url, 'reference': merchant_id}
+    def _crypto_base_urls(self) -> list[str]:
+        """Return unique crypto API base URLs in retry order."""
+        urls = []
+        for candidate in (
+            "https://api2.bybit.com",
+            "https://api.bytick.com",
+        ):
+            value = (candidate or "").strip().rstrip("/")
+            if value and value not in urls:
+                urls.append(value)
+        return urls
+
+    def _extract_crypto_checkout_url(self, payload: dict) -> Optional[str]:
+        """Extract the best usable checkout URL from a Bybit Pay response."""
+        result = payload.get('result', {}) or {}
+        for key in ('checkoutLink', 'checkoutUrl', 'payUrl', 'url'):
+            value = (result.get(key) or '').strip()
+            if value:
+                return value
+        return None
+
+    def _get_public_callback_url(self) -> str:
+        """Return the configured webhook URL only if it is publicly reachable."""
+        candidate = (config.PAYMENT_CALLBACK_URL or '').strip()
+        if not candidate:
+            return ''
+        if not self._is_public_url(candidate):
+            return ''
+        return candidate
+
+    def _is_public_url(self, value: str) -> bool:
+        """Reject localhost and private-network callback URLs."""
+        try:
+            parsed = urlparse(value)
+            host = (parsed.hostname or '').strip().lower()
+            if parsed.scheme not in ('http', 'https') or not host:
+                return False
+            if host in {'localhost', '127.0.0.1', '::1', '0.0.0.0'}:
+                return False
+            if host.endswith('.local'):
+                return False
+            try:
+                ip = ipaddress.ip_address(host)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return False
+            except ValueError:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _detect_public_ip(self) -> str:
+        """Best-effort public IP detection for provider anti-fraud fields."""
+        now = time.time()
+        if self._public_ip_cache and now < self._public_ip_cache_until:
+            return self._public_ip_cache
+
+        sources = (
+            "https://api.ipify.org",
+            "https://api64.ipify.org",
+            "https://ifconfig.me/ip",
+        )
+        last_error = None
+        for url in sources:
+            try:
+                resp = requests.get(url, timeout=5)
+                resp.raise_for_status()
+                candidate = (resp.text or '').strip()
+                ip = ipaddress.ip_address(candidate)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    raise ValueError(f"Non-public IP returned: {candidate}")
+                self._public_ip_cache = candidate
+                self._public_ip_cache_until = now + 1800
+                return candidate
+            except Exception as exc:
+                last_error = exc
+
+        callback_url = self._get_public_callback_url()
+        if callback_url:
+            try:
+                host = urlparse(callback_url).hostname or ''
+                ip = ipaddress.ip_address(host)
+                if not (ip.is_private or ip.is_loopback or ip.is_link_local):
+                    self._public_ip_cache = host
+                    self._public_ip_cache_until = now + 1800
+                    return host
+            except ValueError:
+                pass
+
+        self.logger.warning("Public IP detection failed for crypto checkout: %s", last_error)
+        return ''
+
+    def _crypto_fallback(self, reference: str) -> Dict:
+        """Return a manual fallback destination when the crypto API is unavailable."""
+        handle = config.SUPPORT_CONTACT.lstrip('@')
+        return {'url': f"https://t.me/{handle}", 'reference': reference}
 
     # ==================== WEBHOOK VERIFICATION ====================
 

@@ -1,0 +1,14 @@
+# Nixie Trades MT5 worker - Windows VPS requirements
+# Use this only on the separate Windows machine that runs mt5_worker.py.
+
+typing-extensions
+urllib3
+cryptography
+python-dotenv
+requests
+colorlog
+waitress
+flask
+flask-limiter
+MetaTrader5
+pywin32

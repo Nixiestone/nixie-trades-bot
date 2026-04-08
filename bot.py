@@ -465,7 +465,7 @@ class NixTradesBot:
         app.add_handler(CommandHandler('test_scan',     self.cmd_test_scan))
         app.add_handler(CommandHandler('upgrade',       self.cmd_upgrade))
         app.add_handler(CallbackQueryHandler(
-            self.callback_upgrade_plan, pattern=r'^upgrade_(basic|pro)_(paystack|stripe|bybit)$'
+            self.callback_upgrade_plan, pattern=r'^(upgrade|renew)_(basic|pro)_(paystack|crypto|bybit|stripe)$'
         ))
 
         self.logger.info("All handlers registered.")
@@ -2216,51 +2216,140 @@ class NixTradesBot:
 
         from payment_handler import TIER_DISPLAY_NAMES
         tier_name = TIER_DISPLAY_NAMES.get(current_tier, current_tier.capitalize())
+        subscription_status = (user or {}).get('subscription_status', '')
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "Basic - $30/month (1 account)",
-                    callback_data='upgrade_basic_paystack',
+        if current_tier == 'admin':
+            await self._reply(
+                update,
+                utils.validate_user_message(
+                    "STAFF ACCESS ACTIVE\n\n"
+                    "Your account already has staff-level access.\n"
+                    "No payment or renewal is required.\n\n"
+                    f"{config.FOOTER}"
                 ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "Pro - $100/month (3 accounts + any currency)",
-                    callback_data='upgrade_pro_paystack',
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "Pay via Stripe (card)",
-                    callback_data='upgrade_basic_stripe',
-                ),
-                InlineKeyboardButton(
-                    "Pay via Bybit (crypto)",
-                    callback_data='upgrade_basic_bybit',
-                ),
-            ],
-        ])
+            )
+            return
 
-        await self._reply(
-            update,
-            utils.validate_user_message(
+        if current_tier == 'basic' and subscription_status == 'active':
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "Renew Basic via Paystack",
+                        callback_data='renew_basic_paystack',
+                    ),
+                    InlineKeyboardButton(
+                        "Renew Basic via Crypto",
+                        callback_data='renew_basic_crypto',
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Upgrade to Pro via Paystack",
+                        callback_data='upgrade_pro_paystack',
+                    ),
+                    InlineKeyboardButton(
+                        "Upgrade to Pro via Crypto",
+                        callback_data='upgrade_pro_crypto',
+                    ),
+                ],
+            ])
+            message = (
+                "YOUR SUBSCRIPTION IS ACTIVE\n\n"
+                f"Current plan: {tier_name}\n\n"
+                "You already have an active Basic subscription.\n"
+                "Choose whether you want to renew Basic or upgrade to Pro.\n\n"
+                "BASIC RENEWAL - $30 per month\n"
+                "  - 1 MT5 account connection\n"
+                "  - All automated setup alerts\n"
+                "  - Auto-execution and position management\n"
+                "  - Daily briefing and news alerts\n\n"
+                "PRO UPGRADE - $100 per month\n"
+                "  - Up to 3 MT5 account connections\n"
+                "  - Accounts in any currency\n"
+                "  - Sunday weekly market analysis\n"
+                "  - Priority support\n\n"
+                "Choose Paystack or Crypto below.\n\n"
+                f"Questions? Contact {config.SUPPORT_CONTACT}\n\n"
+                f"{config.FOOTER}"
+            )
+        elif current_tier == 'pro' and subscription_status == 'active':
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "Renew Pro via Paystack",
+                        callback_data='renew_pro_paystack',
+                    ),
+                    InlineKeyboardButton(
+                        "Renew Pro via Crypto",
+                        callback_data='renew_pro_crypto',
+                    ),
+                ],
+            ])
+            message = (
+                "YOUR SUBSCRIPTION IS ACTIVE\n\n"
+                f"Current plan: {tier_name}\n\n"
+                "You already have an active Pro subscription.\n"
+                "Choose a payment method below if you want to renew it.\n\n"
+                "PRO RENEWAL - $100 per month\n"
+                "  - Up to 3 MT5 account connections\n"
+                "  - All automated setup alerts\n"
+                "  - Auto-execution and position management\n"
+                "  - Daily briefing and news alerts\n"
+                "  - Sunday weekly market analysis\n"
+                "  - Priority support\n\n"
+                "Choose Paystack or Crypto below.\n\n"
+                f"Questions? Contact {config.SUPPORT_CONTACT}\n\n"
+                f"{config.FOOTER}"
+            )
+        else:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "Basic via Paystack",
+                        callback_data='upgrade_basic_paystack',
+                    ),
+                    InlineKeyboardButton(
+                        "Basic via Crypto",
+                        callback_data='upgrade_basic_crypto',
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "Pro via Paystack",
+                        callback_data='upgrade_pro_paystack',
+                    ),
+                    InlineKeyboardButton(
+                        "Pro via Crypto",
+                        callback_data='upgrade_pro_crypto',
+                    ),
+                ],
+            ])
+            message = (
                 "NIXIE TRADES SUBSCRIPTION PLANS\n\n"
                 f"Your current plan: {tier_name}\n\n"
+                "FREE\n"
+                "  - Up to 10 automated setup alerts each week\n"
+                "  - No chart images, MT5 automation, briefing, or news alerts\n\n"
                 "BASIC - $30 per month\n"
                 "  - 1 MT5 account connection\n"
                 "  - All automated setup alerts\n"
-                "  - Auto-execution and position management\n\n"
+                "  - Auto-execution and position management\n"
+                "  - Daily briefing and news alerts\n\n"
                 "PRO - $100 per month\n"
                 "  - Up to 3 MT5 account connections\n"
                 "  - All Basic features\n"
                 "  - Accounts in any currency (USD, EUR, GBP, NGN, etc.)\n"
+                "  - Sunday weekly market analysis\n"
                 "  - Priority support\n\n"
-                "Select a plan below to generate a secure payment link.\n"
-                "Subscription is activated automatically within minutes of payment.\n\n"
+                "Choose Paystack or Crypto below to generate a secure payment link.\n"
+                "Your payment reference will be included in the checkout.\n\n"
                 f"Questions? Contact {config.SUPPORT_CONTACT}\n\n"
                 f"{config.FOOTER}"
-            ),
+            )
+
+        await self._reply(
+            update,
+            utils.validate_user_message(message),
             reply_markup=keyboard,
         )
 
@@ -2277,8 +2366,9 @@ class NixTradesBot:
             await query.edit_message_text("Invalid selection. Please use /upgrade again.")
             return
 
+        action   = parts[0]   # 'upgrade' or 'renew'
         tier     = parts[1]   # 'basic' or 'pro'
-        provider = parts[2]   # 'paystack', 'stripe', 'bybit'
+        provider = parts[2]   # 'paystack', 'crypto' (legacy: 'bybit', 'stripe')
 
         sub_mgr  = get_subscription_manager()
         info     = sub_mgr.generate_payment_link(
@@ -2291,7 +2381,13 @@ class NixTradesBot:
             from payment_handler import TIER_PRICES_USD, TIER_DISPLAY_NAMES
             amount    = TIER_PRICES_USD.get(tier, 0)
             plan_name = TIER_DISPLAY_NAMES.get(tier, tier.capitalize())
-            provider_label = {'paystack': 'Paystack', 'stripe': 'Stripe', 'bybit': 'Bybit'}.get(provider, provider)
+            provider_label = {
+                'paystack': 'Paystack',
+                'crypto': 'Crypto',
+                'bybit': 'Crypto',
+                'stripe': 'Card',
+            }.get(provider, provider.capitalize())
+            action_label = 'Renewal' if action == 'renew' else 'Upgrade'
 
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -2302,12 +2398,12 @@ class NixTradesBot:
             await query.edit_message_text(
                 utils.validate_user_message(
                     "PAYMENT LINK READY\n\n"
+                    f"Type:      {action_label}\n"
                     f"Plan:      {plan_name}\n"
                     f"Amount:    ${amount} per month\n"
                     f"Provider:  {provider_label}\n\n"
                     "Tap the button below to complete your payment securely.\n\n"
-                    "Your subscription activates automatically within a few minutes "
-                    "of payment confirmation. You will receive a Telegram notification.\n\n"
+                    "Keep the reference below. It is used to reconcile your payment.\n\n"
                     f"Reference: {info.get('reference', 'N/A')}\n\n"
                     f"Support: {config.SUPPORT_CONTACT}\n\n"
                     f"{config.FOOTER}"

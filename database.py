@@ -501,6 +501,20 @@ def get_signal_count() -> int:
 
 
 @_db_retry()
+def count_recent_signals(days: int = 7) -> int:
+    """Return how many setups were generated within the last `days` days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    result = (
+        _client()
+        .table('signals')
+        .select('id', count='exact')
+        .gte('created_at', cutoff)
+        .execute()
+    )
+    return result.count or 0
+
+
+@_db_retry()
 def recent_signal_exists_by_direction(
     symbol: str,
     direction: str,

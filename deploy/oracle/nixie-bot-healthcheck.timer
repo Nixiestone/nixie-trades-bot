@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Nixie Trades Bot health check every 5 minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=5m
+Unit=nixie-bot-healthcheck.service
+
+[Install]
+WantedBy=timers.target

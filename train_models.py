@@ -57,9 +57,16 @@ def main():
         )
         sys.exit(1)
 
-    # ---- Step 1: Connect to MT5 worker ----
-    logger.info("Step 1: Connecting to MT5 worker at %s ...", config.MT5_WORKER_URL)
+    # ---- Step 1: Connect to market-data/execution backend ----
     mt5 = MT5Connector()
+    backend_label = mt5.service_label()
+    if mt5._use_metaapi:
+        logger.info("Step 1: Connecting to %s ...", backend_label)
+    else:
+        logger.info(
+            "Step 1: Connecting to %s at %s ...",
+            backend_label, config.MT5_WORKER_URL
+        )
 
     if not mt5.is_service_reachable_sync():
         if mt5._use_metaapi:
@@ -74,7 +81,7 @@ def main():
                 mt5._worker_url)
         sys.exit(1)
 
-    logger.info("MT5 worker is reachable.")
+    logger.info("%s is reachable.", backend_label)
 
     # ---- Step 2: Initialise ML ensemble ----
     logger.info("Step 2: Initialising ML ensemble ...")

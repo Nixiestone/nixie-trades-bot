@@ -47,6 +47,11 @@ Minimum local requirements:
 
 Depending on how the environment is configured, some deployments may also use an external execution provider. That setup is intentionally not described here.
 
+Deployment-specific requirements files:
+
+- `requirements.oracle.txt` for the Oracle/Linux bot host
+- `requirements.mt5-worker.txt` for the separate Windows MT5 worker fallback
+
 ## Environment
 
 Create a `.env` file with the required project secrets and connection settings.
@@ -74,7 +79,7 @@ Notes:
 ## Initial Setup
 
 1. Create and activate a virtual environment.
-2. Install dependencies with `pip install -r requirements.txt`.
+2. Install dependencies with the requirements file for your target environment.
 3. Configure the `.env` file.
 4. Initialise the database schema with `create_tables.sql` if required.
 5. Start the MT5 worker if your environment uses worker-based MT5 access.
@@ -85,6 +90,7 @@ Notes:
 Start the MT5 worker:
 
 ```powershell
+pip install -r requirements.mt5-worker.txt
 python mt5_worker.py
 ```
 
@@ -97,6 +103,7 @@ python train_models.py
 Start the bot:
 
 ```powershell
+pip install -r requirements.oracle.txt
 python bot.py
 ```
 
