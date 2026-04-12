@@ -37,14 +37,27 @@ class NewsEvent:
     def affects_symbol(self, symbol: str) -> bool:
         """
         Check if this news event affects a trading symbol.
-        
+        Matches only against the base or quote currency of the pair,
+        not as a substring. AUD news must NOT blackout AUDUSD AND USDAUD —
+        it must only blackout pairs that actually contain AUD as base or quote.
+
         Args:
             symbol: Trading symbol (e.g., 'EURUSD')
-            
+
         Returns:
             bool: True if affects symbol
         """
-        return self.currency in symbol
+        clean = symbol.upper()
+        for sfx in ('.PRO', '.RAW', '-A', '.M', '.I', '.B', '.C', '_M', 'M'):
+            if clean.endswith(sfx) and len(clean) - len(sfx) >= 6:
+                clean = clean[:-len(sfx)]
+                break
+        clean = clean.replace('/', '')
+        if len(clean) < 6:
+            return self.currency.upper() in clean
+        base  = clean[:3]
+        quote = clean[3:6]
+        return self.currency.upper() in (base, quote)
 
 
 class NewsAPIRateLimiter:
@@ -140,31 +153,35 @@ class NewsFetcher:
             # Impact filtering is applied after retrieval. This prevents multiple
             # parallel cache keys for the same time window that would each trigger
             # separate HTTP fetches to Forex Factory and cause HTTP 429 rate limiting.
-            cache_key = str(hours_ahead)
+            cache_key = 'master'
             now_utc   = datetime.now(timezone.utc)
 
             if cache_key in self.cache and cache_key in self.cache_expiry:
                 if now_utc < self.cache_expiry[cache_key]:
-                    cached = self.cache[cache_key]
+                    cutoff = now_utc + timedelta(hours=hours_ahead)
+                    cached = [e for e in self.cache[cache_key] if e.timestamp <= cutoff]
                     if impact_filter != 'ALL':
                         cached = [e for e in cached if e.impact == impact_filter]
                     self.logger.debug(
-                        "Returning cached news (%d events after filter %s)",
-                        len(cached), impact_filter,
+                        "Returning cached news (%d events after filter %s, window %dh)",
+                        len(cached), impact_filter, hours_ahead,
                     )
                     return cached
 
             stale_cache = self.cache.get(cache_key, [])
             
-            # Fetch new data
+            # Always fetch the full 168-hour week window and filter at retrieval.
+            # One HTTP call per cache cycle (2 hours by default) serves all callers
+            # regardless of whether they asked for 2h, 24h, or 168h of events.
+            _fetch_window = 168
             events = []
-            
+
             # Priority 1: Forex Factory - most accurate economic calendar
-            events = self._fetch_from_forex_factory(hours_ahead)
+            events = self._fetch_from_forex_factory(_fetch_window)
 
             # Priority 2: Investing.com - fallback when FF is blocked (403)
             if not events:
-                events = self._fetch_from_investing_com(hours_ahead)
+                events = self._fetch_from_investing_com(_fetch_window)
 
             # Priority 3: NewsAPI - last resort, general financial news only
             if not events and self.api_key:
@@ -225,13 +242,16 @@ class NewsFetcher:
             self.cache[cache_key]        = events
             self.cache_expiry[cache_key] = now_utc + self.cache_duration
 
-            # Apply impact filter for this specific caller after caching
-            filtered = events if impact_filter == 'ALL' else [
-                e for e in events if e.impact == impact_filter
+            # Filter to the requested time window and impact level for this caller.
+            cutoff   = now_utc + timedelta(hours=hours_ahead)
+            windowed = [e for e in events if e.timestamp <= cutoff]
+            filtered = windowed if impact_filter == 'ALL' else [
+                e for e in windowed if e.impact == impact_filter
             ]
             self.logger.info(
-                "Fetched %d news events (next %dh), returning %d after filter=%s",
-                len(events), hours_ahead, len(filtered), impact_filter,
+                "Fetched %d events total (168h cache), returning %d "
+                "for window=%dh filter=%s",
+                len(events), len(filtered), hours_ahead, impact_filter,
             )
             return filtered
         
@@ -256,13 +276,15 @@ class NewsFetcher:
             
             # Search for forex-related news
             params = {
-                'apiKey': self.api_key,
-                'q': 'forex OR "central bank" OR "interest rate" OR inflation OR GDP',
+                'apiKey':   self.api_key,
+                'q':        (
+                    '"central bank" OR "interest rate" OR "CPI" OR '
+                    '"non-farm payroll" OR "GDP" OR "trade balance" OR '
+                    '"Fed decision" OR "ECB" OR "BOE" OR "BOJ" OR inflation'
+                ),
                 'language': 'en',
-                'sortBy': 'publishedAt',
+                'sortBy':   'publishedAt',
                 'pageSize': 20,
-                'from': now_utc.isoformat(),
-                'to': (now_utc + timedelta(hours=hours_ahead)).isoformat()
             }
             
             response = requests.get(url, params=params, timeout=10)

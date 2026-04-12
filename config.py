@@ -152,8 +152,9 @@ TRAINING_WINDOW_STEP_M15 = 4
 # ==================== RISK MANAGEMENT ====================
 
 MAX_RISK_PIPS        = 50
-MIN_LOT_SIZE         = 0.01
-MAX_LOT_SIZE         = 10.0
+MIN_LOT_SIZE          = 0.01
+MAX_LOT_SIZE          = 10.0
+MIN_LOT_FOR_PARTIAL   = 0.02   # Minimum lot that allows a 50% partial close without sub-minimum remainder
 MAX_CURRENCY_EXPOSURE = 3
 
 # ==================== GOOGLE GEMINI LLM ====================

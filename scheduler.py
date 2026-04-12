@@ -539,6 +539,10 @@ class NixTradesScheduler:
 
             now_utc = datetime.now(timezone.utc)
 
+            from payment_handler import get_subscription_manager as _gsm
+            _sub_mgr   = _gsm()
+            subscribed = db.get_subscribed_users()
+
             for event in events:
                 ev_ts = event.timestamp
                 if ev_ts.tzinfo is None:
@@ -567,9 +571,6 @@ class NixTradesScheduler:
                 if len(self._reminded_events) > 300:
                     self._reminded_events = set(list(self._reminded_events)[-200:])
 
-                from payment_handler import get_subscription_manager as _gsm
-                _sub_mgr   = _gsm()
-                subscribed = db.get_subscribed_users()
                 for user in subscribed:
                     if _sub_mgr.get_tier(user['telegram_id']) in ('basic', 'pro', 'admin'):
                         try:
@@ -1129,14 +1130,6 @@ class NixTradesScheduler:
             else:
                 _llm_context = ''
 
-            # Determine the single entry POI for chart display.
-            # Use the most refined POI so the zone box starts at the
-            # exact bar where the entry was sourced, on the same TF
-            # as the chart data (M15). H1 zones are NOT drawn because
-            # their timestamps do not align precisely with M15 bars.
-            _chart_entry_poi = dict(refined_pois[-1]) if refined_pois else dict(h1_poi)
-            _chart_entry_poi['role'] = 'PRIMARY'
-
             # Build all M15-timeframe markups for chart rendering.
             # All detections use m15_df.tail(80) so timestamps align
             # exactly with the chart bars and zone boxes are accurate.
@@ -1213,13 +1206,22 @@ class NixTradesScheduler:
                 'news_event':    news_event_payload,
                 'llm_context':   _llm_context,
                 'chart_data': {
-                    'm15_df':          _chart_m15,
-                    'poi':             _chart_entry_poi,
-                    'refined_pois':    [],
-                    'additional_pois': _chart_secondary[:6],
-                    'fvgs':            _chart_fvgs,
-                    'bos_events':      bos_events[:3],
-                    'swing_levels':    _chart_swings,
+                    'm15_df':           _chart_m15,
+                    'poi':              _chart_entry_poi,
+                    'refined_pois':     [],
+                    'additional_pois':  _chart_secondary[:6],
+                    'fvgs':             _chart_fvgs,
+                    'bos_events':       bos_events[:3],
+                    'swing_levels':     _chart_swings,
+                    'htf_swing_high':   float(htf_trend.get('swing_high', 0)),
+                    'htf_swing_low':    float(htf_trend.get('swing_low', 0)),
+                    'direction':        _smc_direction_str,
+                    'chart_timeframe':  (
+                        'M5'
+                        if refined_pois
+                        and str(refined_pois[-1].get('timeframe', '')).upper() == 'M5'
+                        else 'M15'
+                    ),
                 },
             }
 
@@ -1251,8 +1253,13 @@ class NixTradesScheduler:
             if signal_row:
                 setup_data['signal_number'] = signal_row.get('signal_number', 0)
                 setup_data['signal_id']     = signal_row.get('id')
-                auto_execute = self.ml.should_auto_execute(
-                    consensus, ml_result['agreement'])
+                # Every setup that passes the ML send threshold (STANDARD or PREMIUM)
+                # is eligible for auto-execution on behalf of users who have MT5
+                # connected and auto-execution enabled in their account settings.
+                # The per-user gate inside _broadcast_setup handles the individual check.
+                # DISCRETIONARY setups (55-59%) are notification-only — they use the
+                # heuristic range and carry insufficient model confidence for execution.
+                auto_execute = tier in ('PREMIUM', 'STANDARD')
                 await self._broadcast_setup(setup_data, auto_execute)
                 self.logger.info(
                     "Setup generated and broadcast: %s %s | Score: %d%% | "
@@ -1404,7 +1411,7 @@ class NixTradesScheduler:
                 days=config.FREE_SETUP_ALERT_WINDOW_DAYS
             )
             free_limit_reached = (
-                free_signal_window_count > config.FREE_SETUP_ALERT_LIMIT
+                free_signal_window_count >= config.FREE_SETUP_ALERT_LIMIT
             )
             if free_limit_reached:
                 self.logger.info(
@@ -1427,8 +1434,9 @@ class NixTradesScheduler:
             if chart_data is not None and self._chart_gen is not None:
                 _live_raw = None
                 try:
+                    _chart_tf_fetch = chart_data.get('chart_timeframe', 'M15')
                     _live_raw = await self.mt5.get_historical_data(
-                        _symbol, 'M15', bars=100)
+                        _symbol, _chart_tf_fetch, bars=100)
                 except Exception as _live_err:
                     self.logger.debug(
                         "Live M15 fetch for chart failed (%s): %s",
@@ -1439,13 +1447,16 @@ class NixTradesScheduler:
                         _live_df   = self._candles_to_df(_live_raw)
                         _loop      = asyncio.get_running_loop()
                         # Capture loop-local variables before passing to executor
-                        _poi      = chart_data.get('poi')
-                        _add_pois = list(chart_data.get('additional_pois', []))
-                        _fvgs     = list(chart_data.get('fvgs', []))
-                        _bos      = list(chart_data.get('bos_events', []))
-                        _swings   = list(chart_data.get('swing_levels', []))
-                        _sd       = dict(setup_data)
-                        _df_snap  = _live_df.tail(80).copy()
+                        _poi         = chart_data.get('poi')
+                        _add_pois    = list(chart_data.get('additional_pois', []))
+                        _fvgs        = list(chart_data.get('fvgs', []))
+                        _bos         = list(chart_data.get('bos_events', []))
+                        _swings      = list(chart_data.get('swing_levels', []))
+                        _htf_sh      = float(chart_data.get('htf_swing_high', 0))
+                        _htf_sl      = float(chart_data.get('htf_swing_low', 0))
+                        _chart_dir   = chart_data.get('direction', setup_data.get('direction', 'BUY'))
+                        _sd          = dict(setup_data)
+                        _df_snap     = _live_df.tail(80).copy()
                         chart_bytes = await _loop.run_in_executor(
                             None,
                             lambda: self._chart_gen.generate_setup_chart(
@@ -1457,6 +1468,8 @@ class NixTradesScheduler:
                                 fvgs=_fvgs,
                                 bos_events=_bos,
                                 swing_levels=_swings,
+                                htf_swing_high=_htf_sh,
+                                htf_swing_low=_htf_sl,
                             )
                         )
                         if chart_bytes:
@@ -1722,7 +1735,7 @@ class NixTradesScheduler:
                     # Fetch account currency for accurate P&L display.
                     _acct_ccy = 'USD'
                     try:
-                        _ok2, _acct2 = self.mt5.get_account_info(tid)
+                        _ok2, _acct2 = await self.mt5.get_account_info(tid)
                         if _ok2 and _acct2:
                             _acct_ccy = _acct2.get('currency', 'USD')
                     except Exception:
@@ -1783,7 +1796,7 @@ class NixTradesScheduler:
 
             for symbol in major_pairs:
                 try:
-                    raw = await self.mt5.get_historical_data(symbol, 'D1', bars=50)
+                    raw = await self.mt5.get_historical_data(symbol, 'D1', bars=150)
                     if not raw:
                         continue
                     df = self._candles_to_df(raw)
@@ -2068,7 +2081,7 @@ class NixTradesScheduler:
             # ── Collect technical analysis for all pairs ─────────────────
             _analysis_symbols = [
                 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
-                'USDCAD', 'NZDUSD', 'XAUUSD', 'GBPJPY', 'EURJPY',
+                'USDCAD', 'NZDUSD', 'XAUUSD', 'XAGUSD', 'BTCUSD', 'GBPJPY', 'EURJPY',
             ]
             pair_results = {}
 
@@ -2346,36 +2359,71 @@ class NixTradesScheduler:
         daily_ctx = self._last_daily_context[:600] if self._last_daily_context else ''
 
         system_prompt = (
-            "You are an institutional forex and commodity market analyst "
-            "for Nixie Trades, an algorithmic trading education platform "
-            "that uses Smart Money Concepts (SMC). "
-            "You combine macro fundamentals, central bank policy, market "
-            "sentiment, and SMC technical structure in your commentary. "
-            "Never guarantee returns or give direct financial advice. "
-            "Frame everything as educational analysis only. "
-            "No markdown. No bullet symbols. No asterisks. "
-            "Short paragraphs. Plain English for Telegram. "
-            "Maximum 110 words per section."
+            "You are a senior institutional desk analyst with 15 years of G10 FX, "
+            "gold, and macro flow experience. You brief professional traders at "
+            "Nixie Trades, an algorithmic trading education platform using Smart "
+            "Money Concepts. Your commentary translates central bank forward guidance, "
+            "rate differentials, DXY positioning, cross-asset correlation, and "
+            "liquidity sweep patterns into precise market intelligence. "
+            "You write as if delivering a 7am Monday pre-market briefing to an "
+            "institutional trading desk: specific, technically grounded, and direct. "
+            "You may state directional bias explicitly — for example: "
+            "'EURUSD structure remains bearish on the daily' or "
+            "'USDJPY is exhibiting bullish continuation above the weekly demand zone' "
+            "or 'Gold is compressing inside a premium zone ahead of CPI' — "
+            "because this is technical structural observation, not a trading instruction. "
+            "You must never say 'buy', 'sell', 'go long', 'go short', 'enter a trade', "
+            "'place an order', 'I recommend', or 'you should'. "
+            "The distinction: stating that a pair is bearish is analysis. "
+            "Telling someone to sell it is advice. You do the former, never the latter. "
+            "Reference pair names, central banks, and scheduled releases precisely. "
+            "No markdown. No bullets. No asterisks. No em dashes. "
+            "Paragraph form only. Plain English for Telegram. "
+            "Maximum 130 words per section."
         )
         user_prompt = (
-            f"Today is {date_str}.\n\n"
-            f"SMC TECHNICAL STRUCTURE (multi-timeframe):\n{tech_summary}\n\n"
-            f"HIGH-IMPACT ECONOMIC EVENTS THIS WEEK:\n{news_summary}\n\n"
-            + (f"RECENT DAILY BRIEFING CONTEXT:\n{daily_ctx}\n\n"
+            f"Date: {date_str}.\n\n"
+            f"SMC MULTI-TIMEFRAME STRUCTURE:\n{tech_summary}\n\n"
+            f"HIGH-IMPACT RELEASES THIS WEEK:\n{news_summary}\n\n"
+            + (f"CARRY-OVER CONTEXT FROM LAST BRIEFING:\n{daily_ctx}\n\n"
                if daily_ctx else "")
-            + "Provide TWO sections:\n\n"
-            "SECTION 1 - MACRO AND SENTIMENT (max 110 words):\n"
-            "Describe the macro backdrop, central bank tone (Fed, ECB, BOE, BOJ), "
-            "risk sentiment, USD direction, and commodity drivers for Gold. "
-            "Explain how scheduled news could shift institutional order flow.\n\n"
-            "SECTION 2 - WEEKLY TRADE PLAN (max 110 words):\n"
-            "Based on SMC alignment and the macro backdrop, describe the "
-            "highest-probability setups, which pairs to avoid, and why. "
-            "Mention London and New York session timing. "
-            "Do not give specific entry prices. Educational analysis only.\n\n"
-            "Format EXACTLY as:\n"
-            "MACRO_OVERVIEW: [section 1 text]\n"
-            "TRADE_PLAN: [section 2 text]"
+            + "Write exactly TWO sections. No preamble before MACRO_OVERVIEW.\n\n"
+            "SECTION 1 - MACRO AND SENTIMENT (max 130 words):\n"
+            "Address the following in order, as a continuous paragraph: "
+            "(a) The current DXY trajectory this week and what it implies for "
+            "commodity currencies and euro-dollar specifically. "
+            "(b) The rate differential most relevant to this week's releases — "
+            "state which two central banks and whether the spread is narrowing or "
+            "widening and why that matters for order flow. "
+            "(c) Whether risk appetite is risk-on or risk-off based on equity "
+            "futures and bond yields, and what that means for safe-haven pairs, "
+            "growth-sensitive currencies, and Bitcoin specifically — state whether "
+            "BTC is acting as a risk asset or a macro hedge this week and what "
+            "the SMC structure on the daily timeframe is indicating. "
+            "Also address Gold and Silver: state the key driver — whether it is "
+            "rate expectations, dollar strength, or geopolitical premium — "
+            "and describe the current structural position of XAUUSD and XAGUSD. "
+            "(d) The single most important scheduled release this week and the "
+            "specific directional scenario it could trigger if it surprises. "
+            "Speak about institutional positioning and liquidity sweep risk. "
+            "Never say buy, sell, go long, go short, enter, place, or recommend.\n\n"
+            "SECTION 2 - WEEKLY TRADE PLAN (max 130 words):\n"
+            "Identify the two pairs where SMC structure and macro backdrop are most "
+            "aligned this week. For each pair, state the directional bias explicitly "
+            "using structural language — for example: 'GBPJPY remains in a bullish "
+            "continuation phase above the H4 demand zone' or 'EURUSD structure is "
+            "bearish below the weekly supply cluster'. Then name the specific session "
+            "(London open, New York open, or London-New York overlap) where the "
+            "institutional flow for that pair is most likely to materialise, and "
+            "describe the price action condition that would confirm the structure is "
+            "playing out, such as a liquidity sweep of a prior swing low followed by "
+            "displacement back above a key level. Then identify one pair where "
+            "structure is unclear and state the single reason why in one sentence. "
+            "Never say buy, sell, go long, go short, enter, or place. "
+            "Frame everything as structural technical analysis only.\n\n"
+            "Respond in exactly this format with no extra text:\n"
+            "MACRO_OVERVIEW: [section 1 here]\n"
+            "TRADE_PLAN: [section 2 here]"
         )
 
         # ── Try Groq first ────────────────────────────────────────────────

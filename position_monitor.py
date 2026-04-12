@@ -365,8 +365,9 @@ class PositionMonitor:
         position.status     = 'TP1_HIT'
 
         # Minimum lot for a valid 50% partial close.
-        # Half of 0.01 = 0.005, which brokers reject.
-        MIN_LOT_FOR_PARTIAL = 0.02
+        # Half of MIN_LOT_FOR_PARTIAL must be >= the broker's minimum volume.
+        # Read from config so it can be adjusted per broker without code changes.
+        MIN_LOT_FOR_PARTIAL = float(getattr(config, 'MIN_LOT_FOR_PARTIAL', 0.02))
 
         if position.volume < MIN_LOT_FOR_PARTIAL:
             # Cannot split - move SL to breakeven and run to TP2
@@ -773,22 +774,23 @@ class PositionMonitor:
 
         profit_value = float(position.profit)
 
-        if profit_value > 0:
+        # Use TP1 flag as primary WIN signal — TP1 being hit is definitively
+        # profitable regardless of what the last polled profit value shows.
+        # For positions where TP1 was never confirmed, use profit sign.
+        if position.tp1_closed:
             outcome = 'WIN'
-            if position.direction == 'BUY':
-                pips = (position.current_price - position.entry_price) / pip_size
-            else:
-                pips = (position.entry_price - position.current_price) / pip_size
-            pips = max(pips, 0.0)
+        elif profit_value > 0:
+            outcome = 'WIN'
         elif profit_value < 0:
             outcome = 'LOSS'
-            if position.direction == 'BUY':
-                pips = (position.current_price - position.entry_price) / pip_size
-            else:
-                pips = (position.entry_price - position.current_price) / pip_size
         else:
             outcome = 'BREAKEVEN'
-            pips = 0.0
+
+        if position.direction == 'BUY':
+            pips = (position.current_price - position.entry_price) / pip_size
+        else:
+            pips = (position.entry_price - position.current_price) / pip_size
+        pips = round(pips, 1)
 
         self.logger.info(
             "Position %d (%s) is no longer in MT5. "
@@ -912,6 +914,11 @@ class PositionMonitor:
             if pip_size <= 0:
                 pip_size = 0.0001
 
+            # current_price is the last polled live price, not the actual MT5 close
+            # price. The reconciliation job in scheduler._reconcile_open_trades will
+            # query the MT5 history and overwrite profit_pips and close_price with the
+            # exact fill price. We record an approximation here so the row is not left
+            # with null values if reconciliation runs after a bot restart.
             if position.direction == 'BUY':
                 pips = (position.current_price - position.entry_price) / pip_size
             else:

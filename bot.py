@@ -1791,12 +1791,17 @@ class NixTradesBot:
                 close_pct=0.5,
             )
             if success:
+                position.tp1_closed               = True
+                position.awaiting_partial_confirm  = False
+                position.status                   = 'TP1_HIT'
+                asyncio.create_task(
+                    self._move_position_sl_to_breakeven(telegram_id, position))
                 await query.edit_message_text(
                     utils.validate_user_message(
                         "PARTIAL CLOSE CONFIRMED\n\n"
                         "Symbol:    %s\n"
                         "Ticket:    %d\n"
-                        "Closed:    %.2f lots\n\n"
+                        "Closed:    %.2f lots at TP1\n\n"
                         "Remaining position is running to TP2.\n"
                         "Stop loss is being moved to breakeven.\n\n"
                         "EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.\n\n"
@@ -1805,9 +1810,8 @@ class NixTradesBot:
                         )
                     )
                 )
-                asyncio.create_task(
-                    self._move_position_sl_to_breakeven(telegram_id, position))
             else:
+                position.awaiting_partial_confirm = False
                 await query.edit_message_text(
                     utils.validate_user_message(
                         "PARTIAL CLOSE FAILED\n\n"
@@ -2054,13 +2058,18 @@ class NixTradesBot:
                     else:
                         caption_lines.append("ML models: not yet trained (heuristic mode active).")
 
+                _ml_caption = (
+                    "\n".join(caption_lines)
+                    if caption_lines
+                    else "Automated setup records. Generated: %s UTC" % now_str
+                )
                 await context.bot.send_document(
                     chat_id=telegram_id,
                     document=InputFile(
                         io.BytesIO(signal_buf.getvalue().encode('utf-8')),
                         filename="nixie_ml_setups_%s.csv" % now_str
                     ),
-                    caption="\n".join(caption_lines),
+                    caption=_ml_caption,
                 )
                 self.logger.info(
                     "Admin download sent to user %d: %d trades, %d setups.",

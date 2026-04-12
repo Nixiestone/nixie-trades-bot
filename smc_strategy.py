@@ -918,8 +918,6 @@ class SMCStrategy:
                     'timestamp':         mss_time,
                 }
 
-            return None
-
         except Exception as e:
             self.logger.error("Error detecting MSS: %s", e)
             return None
@@ -1062,7 +1060,11 @@ class SMCStrategy:
                         
                         # Wick swept, but body stayed above
                         if candle['close'] > liquidity_level:
-                            sweep_pips = abs(candle['low'] - liquidity_level) / 0.0001
+                            _ind_pip_sz = utils.get_pip_value(
+                                recent_swing.get('symbol', 'EURUSD'))
+                            if _ind_pip_sz <= 0:
+                                _ind_pip_sz = 0.0001
+                            sweep_pips = abs(candle['low'] - liquidity_level) / _ind_pip_sz
                             
                             # Check quality criteria
                             if config.INDUCEMENT_WICK_MIN_PIPS <= sweep_pips <= config.INDUCEMENT_WICK_MAX_PIPS:
@@ -1088,7 +1090,11 @@ class SMCStrategy:
                         body_size = abs(candle['close'] - candle['open'])
                         
                         if candle['close'] < liquidity_level:
-                            sweep_pips = abs(candle['high'] - liquidity_level) / 0.0001
+                            _ind_pip_sz = utils.get_pip_value(
+                                recent_swing.get('symbol', 'EURUSD'))
+                            if _ind_pip_sz <= 0:
+                                _ind_pip_sz = 0.0001
+                            sweep_pips = abs(candle['high'] - liquidity_level) / _ind_pip_sz
                             
                             if config.INDUCEMENT_WICK_MIN_PIPS <= sweep_pips <= config.INDUCEMENT_WICK_MAX_PIPS:
                                 if body_size > 0:
@@ -1433,11 +1439,11 @@ class SMCStrategy:
             # TP1 must offer at least 0.8R — if the structural level is too close,
             # fall back to the fixed 1.5R level which is always adequate.
             tp1_pips = utils.calculate_pips(symbol, entry, tp1)
-            if tp1_pips < risk_pips * 0.8:
+            if tp1_pips < risk_pips * 1.0:
                 tp1 = (
-                    entry + risk_price * float(config.MIN_RR_RATIO)
+                    entry + risk_price * 1.5
                     if is_buy_dir
-                    else entry - risk_price * float(config.MIN_RR_RATIO)
+                    else entry - risk_price * 1.5
                 )
                 tp1_pips = utils.calculate_pips(symbol, entry, tp1)
 
@@ -1589,7 +1595,7 @@ class SMCStrategy:
         if config.AVOID_ASIAN_SESSION and session == 'Asian':
             return False, "Asian session - lower liquidity"
 
-            # London/New York overlap window: 13:00-16:00 UTC
+        # London/New York overlap window: 13:00-16:00 UTC
         is_overlap = 13 <= utc_hour < 16
         if config.PREFER_LONDON_NY_OVERLAP and is_overlap:
             return True, "London/NY overlap - optimal liquidity"

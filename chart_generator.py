@@ -147,7 +147,8 @@ class ChartGenerator:
             self._style_main_ax(ax, y_min, y_max, n, x_right, decimals)
             self._style_vol_ax(ax_vol, n, x_right)
 
-            self._draw_watermark(ax, symbol)
+            _chart_tf_label = str(setup_data.get('chart_timeframe', 'M15')).upper()
+            self._draw_watermark(ax, symbol, _chart_tf_label)
 
             # Draw premium/discount zone background shading first so all
             # price structure sits on top of it.
@@ -186,8 +187,14 @@ class ChartGenerator:
                 self._draw_inducement(ax, inducement_data, time_index, n,
                                       x_right, y_min, y_max)
 
+            _entry_px  = float(setup_data.get('entry_price', 0))
+            _entry_dir = str(setup_data.get('direction', 'BUY'))
             position_anchor = self._resolve_position_anchor(
-                poi, refined_pois or [], time_index, n)
+                poi, refined_pois or [], time_index, n,
+                data=tail,
+                entry_price=_entry_px,
+                direction=_entry_dir,
+            )
             self._draw_price_levels(ax, setup_data, n, x_right,
                                     decimals, y_min, y_max,
                                     anchor_x=position_anchor,
@@ -371,10 +378,10 @@ class ChartGenerator:
 
         start_x = self._ts_to_bar_index(poi.get('timestamp'), time_index)
         if start_x is None:
-            # No timestamp in POI - place zone at the most recent 20 bars
-            # which keeps it visible without guessing the wrong position.
-            start_x = max(0, n - 20)
-        # Clamp to valid range
+            # Timestamp is outside the chart window — zone formed before
+            # visible bars. Draw from the left edge to show it as an
+            # established zone, not a recently formed one at the right edge.
+            start_x = 0
         start_x = max(0, min(start_x, n - 1))
 
         box_left  = float(start_x) - 0.5
@@ -459,55 +466,102 @@ class ChartGenerator:
         x_right: int,
     ):
         """
-        Draw BOS lines starting from the bar where the break occurred,
-        not full-width across the chart. The label is placed at the
-        break bar so the user can see exactly which candle confirmed the BOS.
+        Draw a short horizontal line precisely at the bar where the structure
+        broke. The line spans 10 bars before to 12 bars after the break candle
+        so the user can clearly see which candle caused the BOS and what level
+        was taken out. A faint dotted extension tracks the level to the right
+        edge without dominating the chart visually.
         """
-        seen: set = set()
+        seen:      set   = set()
+        ylim             = ax.get_ylim()
+        _y_range         = max(ylim[1] - ylim[0], 1e-10)
+        _tick_size       = _y_range * 0.012
+        _label_offset    = _y_range * 0.016
+
         for bos in bos_events[:4]:
             level = float(bos.get('level', 0))
             if level <= 0 or level in seen:
                 continue
             seen.add(level)
 
-            # Locate the BOS bar using its timestamp.
-            # Fall back to a position 30 bars from the right edge.
             bos_bar = self._ts_to_bar_index(bos.get('timestamp'), time_index)
             if bos_bar is None:
                 bos_bar = max(0, n - 30)
             bos_bar = max(0, min(bos_bar, n - 1))
 
-            # Horizontal dashed line from BOS bar to right edge.
+            direction = str(bos.get('direction', 'BULLISH')).upper()
+
+            # Short precise horizontal line centered on the break candle.
+            # 10 bars before shows the level that was holding as resistance/support.
+            # 12 bars after shows the confirmed break and close beyond it.
+            line_start = max(0, bos_bar - 10)
+            line_end   = min(n - 1, bos_bar + 12)
+
             ax.plot(
-                [float(bos_bar), float(x_right)],
+                [float(line_start), float(line_end)],
                 [level, level],
                 color=self.C_BOS_LINE,
-                linewidth=0.9,
-                linestyle=(0, (6, 3)),
-                alpha=0.75,
-                zorder=4,
+                linewidth=1.4,
+                linestyle='solid',
+                alpha=0.85,
+                zorder=5,
             )
-            # Vertical tick at the BOS bar to indicate the confirmation candle.
+
+            # Faint dotted extension to the right edge so the level can still
+            # be referenced against current price without being distracting.
+            if line_end < x_right:
+                ax.plot(
+                    [float(line_end), float(x_right)],
+                    [level, level],
+                    color=self.C_BOS_LINE,
+                    linewidth=0.5,
+                    linestyle=(0, (2, 5)),
+                    alpha=0.30,
+                    zorder=3,
+                )
+
+            # Vertical break marker — a thicker line at the exact break candle
+            # so the user's eye is drawn to the specific bar that confirmed BOS.
             ax.plot(
                 [float(bos_bar), float(bos_bar)],
-                [level - (level * 0.0003), level + (level * 0.0003)],
+                [level - _tick_size * 2.0, level + _tick_size * 2.0],
                 color=self.C_BOS_LINE,
-                linewidth=2.0,
-                alpha=0.90,
-                zorder=5,
+                linewidth=2.2,
+                alpha=0.92,
+                zorder=6,
                 solid_capstyle='round',
             )
-            # Label at the BOS bar.
-            ax.text(
-                bos_bar + 0.5,
-                level,
-                ' BOS',
+
+            # Small filled circle at the exact break bar for visual precision.
+            ax.plot(
+                float(bos_bar), level,
+                marker='o',
+                markersize=4.5,
                 color=self.C_BOS_LINE,
-                fontsize=7.0,
-                fontweight='bold',
-                va='bottom',
-                ha='left',
                 alpha=0.90,
+                zorder=7,
+                linestyle='none',
+            )
+
+            # Direction arrow + label placed ABOVE for bullish BOS, BELOW for bearish.
+            is_bull_bos  = direction == 'BULLISH'
+            arrow_symbol = 'BOS ▲' if is_bull_bos else 'BOS ▼'
+            label_y      = (
+                level + _label_offset if is_bull_bos
+                else level - _label_offset
+            )
+            va_anchor = 'bottom' if is_bull_bos else 'top'
+
+            ax.text(
+                float(bos_bar),
+                label_y,
+                arrow_symbol,
+                color=self.C_BOS_LINE,
+                fontsize=6.8,
+                fontweight='bold',
+                va=va_anchor,
+                ha='center',
+                alpha=0.92,
                 zorder=8,
             )
 
@@ -696,16 +750,19 @@ class ChartGenerator:
             zorder=2,
         )
 
-        # Label the equilibrium line at the right edge.
-        zone_label = 'EQ (DISCOUNT)' if is_buy else 'EQ (PREMIUM)'
+        # Label the equilibrium line at the horizontal midpoint of the chart.
+        # n is not in scope here — derive the midpoint from the axes x-limits.
+        zone_label  = 'EQ (DISCOUNT)' if is_buy else 'EQ (PREMIUM)'
+        _xlim       = ax.get_xlim()
+        _label_x    = (_xlim[0] + _xlim[1]) / 2.0
         ax.text(
-            0.5,
+            _label_x,
             equilibrium,
-            ' 50%% EQ',
+            ' 50% EQ',
             color='#ffffff',
             fontsize=5.5,
             va='bottom',
-            ha='left',
+            ha='center',
             alpha=0.38,
             zorder=8,
         )
@@ -811,10 +868,10 @@ class ChartGenerator:
         if min(entry, stop, tp1, tp2) <= 0:
             return
 
-        is_long = str(setup_data.get('direction', 'BUY')).upper() == 'BUY'
-        max_left = max(0.5, float(n) - self.POSITION_MIN_WIDTH - 0.7)
-        pos_left = max(0.5, min(float(anchor_x), max_left))
-        pos_right = pos_left + self.POSITION_MIN_WIDTH
+        is_long   = str(setup_data.get('direction', 'BUY')).upper() == 'BUY'
+        max_left  = max(0.5, float(n) - self.POSITION_MIN_WIDTH - 0.7)
+        pos_left  = max(0.5, min(float(anchor_x), max_left))
+        pos_right = min(pos_left + self.POSITION_MIN_WIDTH, float(n) - 0.5)
 
         reward_low = min(entry, tp2)
         reward_high = max(entry, tp2)
@@ -947,8 +1004,8 @@ class ChartGenerator:
     # WATERMARK
     # =========================================================================
 
-    def _draw_watermark(self, ax: plt.Axes, symbol: str = ''):
-        text = f'NIXIE TRADES\nM15  {symbol}' if symbol else 'NIXIE TRADES'
+    def _draw_watermark(self, ax: plt.Axes, symbol: str = '', timeframe: str = 'M15'):
+        text = f'NIXIE TRADES\n{timeframe}  {symbol}' if symbol else 'NIXIE TRADES'
         ax.text(
             0.5, 0.50, text,
             transform=ax.transAxes,
@@ -1009,9 +1066,10 @@ class ChartGenerator:
             color=self.C_TEXT, fontsize=9.5, fontweight='bold',
             ha='left', va='top', transform=fig.transFigure,
         )
+        chart_tf = str(setup_data.get('chart_timeframe', 'M15')).upper()
         fig.text(
             0.010, 0.966,
-            f'{symbol}   M15   {direction}   '
+            f'{symbol}   {chart_tf}   {direction}   '
             f'AI Score: {ml_score}%   Session: {session}',
             color=dir_color, fontsize=8.5,
             ha='left', va='top', transform=fig.transFigure,
@@ -1052,7 +1110,32 @@ class ChartGenerator:
         refined_pois: List[Dict],
         time_index: list,
         n: int,
+        data: Optional[pd.DataFrame] = None,
+        entry_price: float = 0.0,
+        direction: str = 'BUY',
     ) -> int:
+        """
+        Return the bar index where the position tool rectangle should start.
+        Priority:
+          1. Rightmost bar where price actually touched the entry level
+             (most recent candle whose range includes entry_price).
+             This shows the position tool at the TRUE entry bar.
+          2. Timestamp of the most refined POI (fallback when no price touch found).
+          3. n - 28 (last resort — well to the right of centre).
+        """
+        is_buy = direction.upper() in ('BUY', 'BULLISH', 'LONG')
+
+        if data is not None and entry_price > 0 and len(data) > 0:
+            search_start = max(0, len(data) - 50)
+            for i in range(len(data) - 1, search_start - 1, -1):
+                try:
+                    lo = float(data.iloc[i]['low'])
+                    hi = float(data.iloc[i]['high'])
+                    if lo <= entry_price <= hi:
+                        return max(1, min(i, n - self.POSITION_MIN_WIDTH))
+                except Exception:
+                    continue
+
         candidates = list(refined_pois or [])
         if poi:
             candidates.append(poi)
@@ -1139,14 +1222,24 @@ class ChartGenerator:
             )
 
     def _ts_to_bar_index(
-        self, ts, time_index: list
+        self,
+        ts,
+        time_index: list,
+        max_tolerance_seconds: float = 7200.0,
     ) -> Optional[int]:
+        """
+        Find the chart bar index closest to a given timestamp.
+        max_tolerance_seconds prevents matching completely unrelated bars
+        when the POI timestamp falls outside the chart window.
+        Default 7200s (2 hours) handles H1 zones on M15 charts:
+        every H1 open is always within 15 minutes of an M15 bar.
+        """
         if ts is None or not time_index:
             return None
         try:
+            import pytz
             ts_pd = pd.Timestamp(ts)
             if ts_pd.tzinfo is None:
-                import pytz
                 ts_pd = pytz.utc.localize(ts_pd)
             else:
                 ts_pd = ts_pd.tz_convert('UTC')
@@ -1157,7 +1250,6 @@ class ChartGenerator:
                 try:
                     t_pd = pd.Timestamp(t)
                     if t_pd.tzinfo is None:
-                        import pytz
                         t_pd = pytz.utc.localize(t_pd)
                     else:
                         t_pd = t_pd.tz_convert('UTC')
@@ -1167,7 +1259,10 @@ class ChartGenerator:
                         best_i    = i
                 except Exception:
                     continue
-            return best_i
+
+            if best_i is not None and best_diff is not None and best_diff <= max_tolerance_seconds:
+                return best_i
+            return None
         except Exception:
             return None
 
@@ -1186,7 +1281,7 @@ class ChartGenerator:
         if not _PIL_AVAILABLE:
             return raw_buf.read()
         try:
-            img     = _PIL_Image.open(raw_buf).convert('RGB')
+            img     = _PIL_Image.open(raw_buf)
             out_buf = io.BytesIO()
             img.save(out_buf, 'PNG', optimize=True, compress_level=7)
             out_buf.seek(0)

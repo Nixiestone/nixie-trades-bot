@@ -744,63 +744,7 @@ def calculate_lot_size(
     except Exception as e:
         logger.error("Error calculating lot size for %s: %s", symbol, e)
         return config.MIN_LOT_SIZE
-    """
-    Calculate lot size from account balance, risk percentage, and stop-loss pips.
-
-    Standard formula:
-        risk_amount   = balance * risk_percent / 100
-        pip_val_per_lot = pip_value_in_account_currency per standard lot
-        lots          = risk_amount / (sl_pips * pip_val_per_lot)
-
-    Args:
-        account_balance:   Account balance in account_currency
-        risk_percent:      Risk per trade as a percentage (e.g. 1.0 = 1%)
-        sl_pips:           Stop-loss distance in pips
-        symbol:            Trading symbol
-        account_currency:  Account base currency ('USD', 'GBP', etc.)
-        exchange_rates:    Dict of rates like {'EURUSD': 1.0850} for currency conversion
-
-    Returns:
-        float: Lot size rounded to 2 decimal places, clamped to MIN/MAX
-    """
-    try:
-        if account_balance <= 0 or risk_percent <= 0 or sl_pips <= 0:
-            return config.MIN_LOT_SIZE
-
-        risk_amount = account_balance * risk_percent / 100.0
-        pip_val     = get_pip_value(symbol)
-
-        # Approximate pip value per lot in account currency
-        # For USD-quoted pairs (EURUSD, GBPUSD): $10 per pip per standard lot
-        # For JPY pairs (USDJPY, EURJPY, GBPJPY): varies by rate
-        # Simplified formula that is accurate enough for lot sizing
-        if symbol.endswith('JPY') or symbol.endswith('JPY.pro'):
-            # 1 lot = 100,000 units; pip = 0.01; pip_value = 1000 JPY / rate
-            rate = (exchange_rates or {}).get('USDJPY', 150.0)
-            pip_value_per_lot = 1000.0 / rate
-        elif symbol.startswith('XAU') or 'GOLD' in symbol.upper():
-            # Gold: 1 lot = 100 oz; pip = 1.0 ($1 per pip); pip_value = $100 per lot
-            # 100 oz * $1.00/pip = $100 per pip per standard lot
-            pip_value_per_lot = 100.0
-        elif symbol.startswith('XAG'):
-            # Silver: 1 lot = 5000 oz; pip = 0.01; pip_value = $50
-            pip_value_per_lot = 50.0
-        elif symbol[:3] == account_currency:
-            # e.g. USDCAD with USD account: pip_value needs rate conversion
-            rate = (exchange_rates or {}).get(symbol[:6], 1.0)
-            pip_value_per_lot = (pip_val * 100000) / rate
-        else:
-            # Default: assume USD-quoted pair ($10 per pip per lot)
-            pip_value_per_lot = 10.0
-
-        lots = risk_amount / (sl_pips * pip_value_per_lot)
-        lots = round(lots, 2)
-        lots = max(config.MIN_LOT_SIZE, min(lots, config.MAX_LOT_SIZE))
-        return lots
-
-    except Exception as e:
-        logger.error("Error calculating lot size: %s", e)
-        return config.MIN_LOT_SIZE
+    
 
 
 # ==================== RETRY UTILITY ====================

@@ -653,7 +653,7 @@ class MLEnsemble:
                 'reg_alpha':        0.5,
                 'reg_lambda':       3.0,
                 'eval_metric':      'auc',
-                'scale_pos_weight': float(np.sum(y_tr == 0)) / max(float(np.sum(y_tr == 1)), 1.0),
+                'scale_pos_weight': float(np.sum(np.round(y_tr) == 0)) / max(float(np.sum(np.round(y_tr) == 1)), 1.0),
                 'seed':             42,
                 }
             self.xgboost_model = xgb.train(
@@ -841,8 +841,11 @@ class MLEnsemble:
             vol_sg   = min(rec_vol / avg_vol, 5.0) / 5.0
             imp_p    = min(float(poi.get('impulse_pips', 0)) / 100.0, 2.0)
 
-            # 9: Freshness
-            bars_ago = max(0, len(data) - int(poi.get('index', len(data) - 1)))
+            # 9: Freshness — POI index is relative to the data window passed in.
+            # Clamp to [0, len(data)-1] to guard against cross-timeframe index values.
+            _poi_idx = int(poi.get('index', len(data) - 1))
+            _poi_idx = max(0, min(_poi_idx, len(data) - 1))
+            bars_ago = max(0, (len(data) - 1) - _poi_idx)
             fresh    = 1.0 / (1.0 + bars_ago)
 
             # 10-11: Bollinger Bands
@@ -1050,7 +1053,7 @@ class MLEnsemble:
             bars_ago = len(data) - int(poi.get('index', len(data) - 1))
             if bars_ago <= 20: score += 5
         except Exception: score = 50
-        return max(38, min(score, 78))
+        return max(38, min(score, 59))
 
     # ==================== INDICATOR HELPERS ====================
 

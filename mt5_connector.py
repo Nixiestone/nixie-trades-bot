@@ -156,8 +156,11 @@ class MT5Connector:
                 if resp.status_code == 413:
                     return False, "Request too large."
                 if resp.status_code == 503:
+                    _503_sleep = _RETRY_DELAYS[min(attempt + 1, len(_RETRY_DELAYS) - 1)]
                     self.logger.warning(
-                        "Worker busy (attempt %d/4) %s", attempt + 1, endpoint)
+                        "Worker busy (attempt %d/4) %s — sleeping %ds",
+                        attempt + 1, endpoint, _503_sleep)
+                    time.sleep(_503_sleep)
                     continue
                 data = resp.json()
                 if data.get('success'):

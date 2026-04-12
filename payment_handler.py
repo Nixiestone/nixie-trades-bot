@@ -557,20 +557,23 @@ class SubscriptionManager:
             "currencyType": "crypto",
             "orderAmount": str(amount_usd),
             "goods": [{
-                "goodsName": f"Nixie Trades {tier_name} Plan",
-                "goodsDetail": f"Monthly {tier_name} subscription",
+                "goodsName": "Nixie Trades %s Plan" % tier_name,
+                "goodsDetail": "Monthly %s subscription" % tier_name,
             }],
             "successUrl": success_url,
             "failedUrl": cancel_url,
             "webhookUrl": callback_url,
-            "orderExpireTime": int(time.time()) + 3600,
-            "remark": f"Nixie Trades {tier_name} monthly subscription",
+            "orderExpireTime": time.strftime(
+                '%Y-%m-%dT%H:%M:%SZ',
+                time.gmtime(int(time.time()) + 3600)
+            ),
+            "remark": "Nixie Trades %s monthly subscription" % tier_name,
             "env": {
                 "terminalType": "WEB",
                 "device": "Telegram Bot",
                 "ip": source_ip,
             },
-        }, separators=(',', ':'))
+        }, separators=(',', ':'), sort_keys=True)
 
         sign_str  = f"{timestamp}{api_key}{recv_window}{body}"
         signature = _hmac.new(
@@ -591,7 +594,7 @@ class SubscriptionManager:
         for base_url in base_urls:
             try:
                 resp = requests.post(
-                    f"{base_url}/v5/bybitpay/create_pay",
+                    f"{base_url}/v5/bybitpay/create-pay",
                     data=body, headers=headers, timeout=15,
                 )
             except requests.RequestException as exc:
@@ -612,16 +615,19 @@ class SubscriptionManager:
                 continue
 
             data = resp.json()
-            ret_code = data.get('retCode', data.get('ret_code', -1))
-            if str(ret_code) not in ('0', '100000'):
+            ret_code = int(data.get('retCode', data.get('ret_code', -1)))
+            if ret_code != 0:
                 last_error = RuntimeError(
-                    f"{ret_code}: {data.get('retMsg', data.get('ret_msg'))}"
+                    "%d: %s" % (
+                        ret_code,
+                        data.get('retMsg', data.get('ret_msg', 'Unknown error')),
+                    )
                 )
                 self.logger.warning(
-                    "Crypto checkout error via %s %s: %s",
+                    "Crypto checkout error via %s retCode=%d: %s",
                     base_url,
                     ret_code,
-                    data.get('retMsg', data.get('ret_msg')),
+                    data.get('retMsg', data.get('ret_msg', '')),
                 )
                 continue
 
@@ -653,10 +659,20 @@ class SubscriptionManager:
         return urls
 
     def _extract_crypto_checkout_url(self, payload: dict) -> Optional[str]:
-        """Extract the best usable checkout URL from a Bybit Pay response."""
+        """
+        Extract the checkout URL from a Bybit Pay response.
+        Bybit Pay v5 returns the URL under result.checkoutUrl.
+        Older sandbox responses used checkoutLink or payUrl.
+        Also check the top-level payload in case the result wrapper is missing.
+        """
         result = payload.get('result', {}) or {}
-        for key in ('checkoutLink', 'checkoutUrl', 'payUrl', 'url'):
+        for key in ('checkoutUrl', 'checkoutLink', 'payUrl', 'url'):
             value = (result.get(key) or '').strip()
+            if value:
+                return value
+        # Fallback: search the top-level payload
+        for key in ('checkoutUrl', 'checkoutLink', 'payUrl', 'url'):
+            value = (payload.get(key) or '').strip()
             if value:
                 return value
         return None
@@ -750,7 +766,7 @@ class SubscriptionManager:
             payload,
             hashlib.sha512,
         ).hexdigest()
-        return _hmac.compare_digest(expected, header_sig)
+        return _hmac.compare_digest(expected, header_sig.lower().strip())
 
     def verify_stripe_webhook(
         self, payload: bytes, sig_header: str
