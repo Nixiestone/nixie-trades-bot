@@ -444,6 +444,9 @@ class ChartGenerator:
 
         start_x = self._ts_to_bar_index(fvg.get('timestamp'), time_index)
         if start_x is None:
+            # FVG timestamp has no matching bar in the chart window.
+            # This occurs when the FVG formed before the visible candles
+            # or during a weekend gap. Skip to avoid phantom zone boxes.
             return
 
         width = float(x_right) - float(start_x) + 0.5
@@ -486,7 +489,11 @@ class ChartGenerator:
 
             bos_bar = self._ts_to_bar_index(bos.get('timestamp'), time_index)
             if bos_bar is None:
-                bos_bar = max(0, n - 30)
+                # No matching candle in the chart window for this BOS timestamp.
+                # This happens when the BOS occurred during a weekend gap or
+                # before the visible chart window. Skip it entirely rather than
+                # placing the line at an arbitrary bar that has no structural meaning.
+                continue
             bos_bar = max(0, min(bos_bar, n - 1))
 
             direction = str(bos.get('direction', 'BULLISH')).upper()
@@ -791,7 +798,14 @@ class ChartGenerator:
             if pos is None:
                 continue
             pos = int(pos)
+            # Swing indices from _identify_swings are relative to the slice
+            # passed to the function (tail(40) in the scanner). They must
+            # fall within [0, n-1] of the chart's reset index.
             if pos < 0 or pos >= n:
+                continue
+            # Additional guard: skip if the swing price is not within the
+            # visible price range to avoid markers floating outside the axes.
+            if price < y_min or price > y_max:
                 continue
 
             if direction == 'HIGH':
@@ -899,29 +913,37 @@ class ChartGenerator:
             zorder=5.34,
         ))
 
+        # Entry, SL, TP1, TP2 span the full chart width so users can see
+        # exactly which candles are above or below each level. The position
+        # rectangle drawn above provides the coloured background context.
+        # Drawing lines only inside pos_left..pos_right was hiding levels
+        # from the candle history and making entries unverifiable visually.
         for y_val, color, lw, ls in (
             (entry, self.C_ENTRY, 1.6, 'solid'),
             (stop, self.C_SL, 1.1, (0, (5, 3))),
             (tp2, self.C_TP2, 1.1, (0, (5, 3))),
+            (tp1, self.C_TP1, 1.0, (0, (1.2, 2.2))),
         ):
             ax.plot(
-                [pos_left, pos_right],
+                [-0.5, float(x_right)],
                 [y_val, y_val],
                 color=color,
                 linewidth=lw,
                 linestyle=ls,
-                alpha=0.95,
+                alpha=0.90,
                 zorder=6.2,
             )
 
+        # Bright segment inside the position rectangle to make the entry
+        # line stand out against the coloured background.
         ax.plot(
-            [-0.5, x_right],
-            [tp1, tp1],
-            color=self.C_TP1,
-            linewidth=1.0,
-            linestyle=(0, (1.2, 2.2)),
-            alpha=0.95,
-            zorder=6.1,
+            [pos_left, pos_right],
+            [entry, entry],
+            color=self.C_ENTRY,
+            linewidth=2.2,
+            linestyle='solid',
+            alpha=1.0,
+            zorder=6.6,
         )
 
         live_color = self.C_UP if last_close >= last_open else self.C_DOWN
@@ -1115,18 +1137,29 @@ class ChartGenerator:
         direction: str = 'BUY',
     ) -> int:
         """
-        Return the bar index where the position tool rectangle should start.
-        Priority:
-          1. Rightmost bar where price actually touched the entry level
-             (most recent candle whose range includes entry_price).
-             This shows the position tool at the TRUE entry bar.
-          2. Timestamp of the most refined POI (fallback when no price touch found).
-          3. n - 28 (last resort — well to the right of centre).
-        """
-        is_buy = direction.upper() in ('BUY', 'BULLISH', 'LONG')
+        Return the bar index where the left edge of the position tool starts.
 
+        For a filled MARKET order: the tool starts at the bar where price
+        last touched the entry level within the final 12 bars of the chart.
+        Only the rightmost 12 bars are searched — anything earlier is a
+        historical touch unrelated to this setup and would incorrectly
+        place the tool in the middle of the chart.
+
+        For a pending LIMIT order (entry not yet touched): the tool is
+        anchored to the right edge of the chart so it sits flush against
+        the most recent candles, accurately showing where the order is
+        waiting relative to current price.
+
+        The position tool right edge is always capped at n - 0.5 by
+        _draw_price_levels so it never overflows past the last bar.
+        """
         if data is not None and entry_price > 0 and len(data) > 0:
-            search_start = max(0, len(data) - 50)
+            # Only search the last 12 bars. A LIMIT order pending fill will
+            # not have touched entry in this window. A MARKET order that just
+            # opened will appear here. Searching further back was finding
+            # irrelevant historical price levels and placing the tool at bar
+            # 30-40 of an 80-bar chart, appearing in the middle of the screen.
+            search_start = max(0, len(data) - 12)
             for i in range(len(data) - 1, search_start - 1, -1):
                 try:
                     lo = float(data.iloc[i]['low'])
@@ -1136,16 +1169,11 @@ class ChartGenerator:
                 except Exception:
                     continue
 
-        candidates = list(refined_pois or [])
-        if poi:
-            candidates.append(poi)
-
-        for candidate in reversed(candidates):
-            idx = self._ts_to_bar_index(candidate.get('timestamp'), time_index)
-            if idx is not None:
-                return max(1, min(idx, n - self.POSITION_MIN_WIDTH))
-
-        return max(1, n - 28)
+        # No recent price touch found: the order is pending.
+        # Anchor the left edge so the right edge lands on the last bar.
+        # n - POSITION_MIN_WIDTH puts pos_right at exactly n,
+        # which _draw_price_levels caps at n - 0.5 (the last candle).
+        return max(1, n - self.POSITION_MIN_WIDTH)
 
     def _draw_right_price_markers(
         self,

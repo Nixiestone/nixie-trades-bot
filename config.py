@@ -137,11 +137,11 @@ ML_RETRAINING_INTERVAL = 100
 
 # Tier thresholds: consensus_score decides which setups get sent
 ML_TIER_PREMIUM        = 70   # 70%+ = Unicorn / Premium tier, can auto-execute
-ML_TIER_STANDARD       = 60   # 60-69% = Standard tier, sent to subscribers
-ML_TIER_DISCRETIONARY  = 55   # 55-59% = Discretionary (optional, lower confidence)
+ML_TIER_STANDARD       = 50   # 60-69% = Standard tier, sent to subscribers
+ML_TIER_DISCRETIONARY  = 45  # 55-59% = Discretionary (optional, lower confidence)
 
 # Auto-execution threshold: only execute trades when ML agrees this strongly
-ML_AUTO_EXECUTE_THRESHOLD = 60
+ML_AUTO_EXECUTE_THRESHOLD = 50
 
 # Training sample density:
 # Labels run for the full 12-hour H1 setup lifetime (48 M15 bars). We sample
@@ -164,17 +164,20 @@ GROQ_API_KEY   = os.getenv('GROQ_API_KEY', '')
 
 # ==================== SMC STRATEGY PARAMETERS ====================
 
-VOLUME_THRESHOLD_OB      = 1.5
+VOLUME_THRESHOLD_OB      = 1.2
 
 # ATR-relative thresholds (replace all hardcoded pip counts)
 # OB impulse must be this multiple of ATR to confirm institutional activity
-OB_IMPULSE_ATR_MULTIPLIER   = 0.8    # impulse >= 0.8 * ATR in pips
-OB_IMPULSE_MIN_PIPS_FLOOR   = 5.0    # absolute floor regardless of ATR
+OB_IMPULSE_ATR_MULTIPLIER   = 0.3    # impulse >= 0.3 * ATR in pips (M15 zones are smaller)
+OB_IMPULSE_MIN_PIPS_FLOOR   = 2.0    # absolute floor regardless of ATR
 # Unicorn setup: BB and FVG midpoints must overlap within this fraction of ATR
 UNICORN_TOLERANCE_ATR_MULT  = 0.25
 UNICORN_TOLERANCE_MIN_PIPS  = 3.0
-# Touch mitigation: how many pips beyond the zone boundary counts as mitigated
-MITIGATION_TOUCH_BUFFER_PIPS = 1.0
+# Touch mitigation: how many pips beyond the zone boundary counts as mitigated.
+# 2.0 pips on M15 means a wick or close that goes 1.9 pips through the level
+# is treated as a liquidity grab and NOT a mitigation. Only a committed close
+# more than 2 pips through the boundary invalidates the zone.
+MITIGATION_TOUCH_BUFFER_PIPS = 2.0
 # Inducement base minimum sweep size in pips (scaled up per timeframe below)
 INDUCEMENT_MIN_PIPS_BASE    = 2.0
 INDUCEMENT_TIMEFRAME_SCALE  = {

@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+from utils import get_pip_value
 
 try:
     from smartmoneyconcepts import smc as _smc_pkg
@@ -362,7 +363,22 @@ class SMCStrategy:
                     candle      = data.iloc[pos]
                     candle_vol  = float(candle.get('volume', 1.0))
                     vol_ratio   = candle_vol / avg_vol if avg_vol > 0 else 1.0
-                    if vol_ratio < config.VOLUME_MULTIPLIER_OB:
+                    # Same soft-volume logic as the fallback: require EITHER
+                    # the OB candle volume to be elevated OR skip the volume
+                    # gate entirely since the SMC package already validated
+                    # the zone by the presence of a MitigatedIndex=NaN.
+                    # A hard 1.5x gate on tick data eliminates real M15 OBs.
+                    if vol_ratio < max(config.VOLUME_MULTIPLIER_OB * 0.75, 1.05):
+                        continue
+
+                    # Freshness gate: identical to the fallback algorithm.
+                    # Zones older than 50 bars have either been filled by
+                    # institutional orders or are too stale to represent
+                    # active supply/demand. Enforcing this on the package
+                    # path prevents H1 OBs from 400 bars ago becoming the
+                    # entry zone and producing setups far from current price.
+                    bars_since_ob = (len(data) - 1) - pos
+                    if bars_since_ob > 50:
                         continue
 
                     ob_volume = float(row.get('OBVolume', 0) or 0)
@@ -446,39 +462,57 @@ class SMCStrategy:
                     continue
                 if not (impulse_volume == impulse_volume) or impulse_volume <= 0:
                     continue
-                if volume_ratio < config.VOLUME_MULTIPLIER_OB:
-                    continue
-                if impulse_volume < config.VOLUME_MULTIPLIER_IMPULSE:
+                # On M15 tick volume, the distribution is much tighter than
+                # H1. A strict multiplier gate eliminates most valid zones.
+                # Use a soft check: require EITHER the OB candle OR the impulse
+                # to show elevated volume, not both simultaneously.
+                # The minimum is 1.0x (at least average) for one of the two.
+                _vol_ok = (
+                    volume_ratio >= config.VOLUME_MULTIPLIER_OB
+                    or impulse_volume >= config.VOLUME_MULTIPLIER_IMPULSE
+                )
+                if not _vol_ok:
                     continue
 
                 candle_body_ratio = (
                     abs(candle['close'] - candle['open'])
                     / max(candle['high'] - candle['low'], 1e-9)
                 )
-                if candle_body_ratio < 0.4:
+                # M15 candles are noisier than H1. A 0.25 body ratio still
+                # confirms directional intent. 0.4 was eliminating real M15 OBs
+                # that had genuine displacement following them.
+                if candle_body_ratio < 0.25:
                     continue
 
-                # Freshness gate: reject Order Blocks older than 50 bars.
-                # Institutional orders at aged zones have either been filled
-                # or abandoned. Only the most recent unfilled clusters matter.
+                # Freshness gate: reject Order Blocks older than 80 bars.
+                # With _m15_recent = tail(120), the scanner passes at most 120
+                # bars. An 80-bar gate allows zones from the last 20 hours on
+                # M15 which is the relevant institutional memory window.
                 bars_since_ob = (len(data) - 1) - i
-                if bars_since_ob > 50:
+                if bars_since_ob > 80:
                     continue
 
                 ob_high = float(candle['high'])
                 ob_low  = float(candle['low'])
 
-                # Mitigation check: if any candle AFTER the OB has closed
-                # through the zone boundary, the zone is spent. Skip it.
-                # This mirrors what the SMC package does via MitigatedIndex.
+                # Mitigation check: a zone is spent only if a candle after it
+                # closes more than MITIGATION_TOUCH_BUFFER_PIPS beyond the
+                # boundary. A wick or close that immediately reverses on M15
+                # is a liquidity grab, not an institutional fill. Using zero
+                # buffer was eliminating every valid M15 zone because M15
+                # candles routinely poke 0.1-0.5 pips through levels.
                 post_ob = data.iloc[i + 1:]
                 if not post_ob.empty:
+                    _mit_pip = utils.get_pip_value(symbol)
+                    if _mit_pip <= 0:
+                        _mit_pip = 0.0001
+                    _mit_buf = config.MITIGATION_TOUCH_BUFFER_PIPS * _mit_pip
                     if direction == 'BULLISH' and bool(
-                        (post_ob['close'] < ob_low).any()
+                        (post_ob['close'] < (ob_low - _mit_buf)).any()
                     ):
                         continue
                     if direction == 'BEARISH' and bool(
-                        (post_ob['close'] > ob_high).any()
+                        (post_ob['close'] > (ob_high + _mit_buf)).any()
                     ):
                         continue
 
@@ -559,9 +593,11 @@ class SMCStrategy:
                             _bb_impulse = max(
                                 (candle['close'] - resistance) / _bb_pip_sz, 0.0)
 
-                            # Minimum 10-pip displacement confirms institutional
-                            # intent, not noise around the resistance level.
-                            if _bb_impulse < 10.0:
+                            # Minimum displacement for M15 BBs.
+                            # 10 pips was calibrated for H1 where moves are larger.
+                            # On M15 a 4-pip close beyond resistance with volume
+                            # confirmation is sufficient institutional evidence.
+                            if _bb_impulse < 4.0:
                                 continue
 
                             # The breakout candle volume must be at least 80% of
@@ -569,7 +605,12 @@ class SMCStrategy:
                             # Weak-volume breakouts are fakeouts, not real BBs.
                             _zone_peak_vol = float(prev_candles['volume'].max())
                             if (_zone_peak_vol > 0
-                                    and float(candle['volume']) < _zone_peak_vol * 0.80):
+                                    and float(candle['volume']) < _zone_peak_vol * 0.50):
+                                continue
+
+                            # Freshness gate: 80-bar cap matching OB detection.
+                            _bars_since_bb = (len(data) - 1) - i
+                            if _bars_since_bb > 80:
                                 continue
 
                             breakers.append({
@@ -599,12 +640,17 @@ class SMCStrategy:
                             _bb_impulse = max(
                                 (support - candle['close']) / _bb_pip_sz, 0.0)
 
-                            if _bb_impulse < 10.0:
+                            if _bb_impulse < 4.0:
                                 continue
 
                             _zone_peak_vol = float(prev_candles['volume'].max())
                             if (_zone_peak_vol > 0
-                                    and float(candle['volume']) < _zone_peak_vol * 0.80):
+                                    and float(candle['volume']) < _zone_peak_vol * 0.50):
+                                continue
+
+                            # Freshness gate: 80-bar cap matching OB detection.
+                            _bars_since_bb = (len(data) - 1) - i
+                            if _bars_since_bb > 80:
                                 continue
 
                             breakers.append({

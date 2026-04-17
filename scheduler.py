@@ -747,79 +747,82 @@ class NixTradesScheduler:
                 h4_trend_data = self.smc.determine_htf_trend(h4_df)
                 h4_aligned    = h4_trend_data.get('trend') == htf_trend.get('trend')
                 
-            # Phase 2: Intermediate structure (H1)
+            # Phase 2: Structure confirmation on H1, entry detection on M15.
+            #
+            # Top-down flow:
+            #   D1  — trend direction (already done above)
+            #   H4  — intermediate alignment (already done above)
+            #   H1  — BOS/MSS to confirm the trend is still active
+            #   M15 — primary entry POI (OB, BB, FVG detected here)
+            #   M5  — optional precision refinement of M15 POI
+            #
+            # Only the last 120 M15 bars (~30 hours) are used for detection.
+            # This prevents the scanner from picking up zones formed days ago
+            # that have no relevance to the current market session.
+            _m15_recent = m15_df.tail(120).copy()
+
             bos_events = self.smc.detect_break_of_structure(h1_df, htf_trend['trend'])
             mss_event  = self.smc.detect_market_structure_shift(
                 h1_df, htf_trend['trend'], symbol=symbol)
 
             setup_type      = None
-            poi             = None
+            trade_dir_from_structure = None
             all_candidates: list = []
 
             if len(bos_events) >= 2:
-                # BOS continuation: Priority 1 = Breaker Block, Fallback = Order Block.
-                # Per PRD 3.2: in a strong double-BOS trend, BBs are more reliable.
-                # OBs are only used when no valid BBs exist.
-                setup_type = 'BOS'
-                breakers   = self.smc.detect_breaker_blocks(
-                    h1_df, htf_trend['trend'],
-                    htf_trend.get('swing_high', 0),
-                    htf_trend.get('swing_low', 0),
-                    symbol=symbol)
-                if breakers:
-                    all_candidates = breakers
-                    self.logger.debug(
-                        "%s BOS: %d Breaker Block(s) found. "
-                        "Using BB as primary candidates.",
-                        symbol, len(breakers))
-                else:
-                    obs = self.smc.detect_order_blocks(
-                        h1_df, htf_trend['trend'], symbol=symbol)
-                    all_candidates = obs
-                    self.logger.info(
-                        "%s BOS: No Breaker Blocks found. "
-                        "Falling back to %d Order Block(s).",
-                        symbol, len(obs))
-
+                setup_type              = 'BOS'
+                trade_dir_from_structure = htf_trend['trend']
             elif mss_event:
-                # MSS reversal: Priority 1 = Order Block, Fallback = Breaker Block.
-                # Per PRD 3.1: algorithm prioritizes the extreme OB candle responsible
-                # for the MSS displacement. BB is only used if no valid OB exists.
-                setup_type = 'MSS'
-                obs = self.smc.detect_order_blocks(
-                    h1_df, mss_event['direction'], symbol=symbol)
-                if obs:
-                    all_candidates = obs
-                    self.logger.debug(
-                        "%s MSS: %d Order Block(s) found. "
-                        "Using OB as primary candidates.",
-                        symbol, len(obs))
-                else:
-                    breakers = self.smc.detect_breaker_blocks(
-                        h1_df, mss_event['direction'],
-                        htf_trend.get('swing_high', 0),
-                        htf_trend.get('swing_low', 0),
-                        symbol=symbol)
-                    all_candidates = breakers
-                    self.logger.info(
-                        "%s MSS: No Order Blocks found. "
-                        "Falling back to %d Breaker Block(s).",
-                        symbol, len(breakers))
+                setup_type              = 'MSS'
+                trade_dir_from_structure = mss_event['direction']
 
-            if not all_candidates or setup_type is None:
+            if setup_type is None or trade_dir_from_structure is None:
                 self.logger.info(
-                    "%s: no valid structure or POI candidates found.", symbol)
+                    "%s: no H1 BOS or MSS confirmed. Skipping.", symbol)
                 return
 
-            # Apply the H4 alignment gate now that setup_type is known.
-            # BOS is a trend continuation trade and requires H4 to agree.
-            # MSS is a reversal trade; requiring H4 alignment on a reversal
-            # is a logical contradiction and must be skipped.
+            # Detect POI candidates directly on M15 in the recent window.
+            # POI impulse does not need to be large on M15 — the H1 BOS/MSS
+            # already confirms institutional intent. The M15 zone just needs
+            # to be the last opposing candle before the displacement move.
+            _m15_breakers = self.smc.detect_breaker_blocks(
+                _m15_recent,
+                trade_dir_from_structure,
+                float(htf_trend.get('swing_high', 0)),
+                float(htf_trend.get('swing_low', 0)),
+                symbol=symbol,
+            )
+            _m15_obs = self.smc.detect_order_blocks(
+                _m15_recent,
+                trade_dir_from_structure,
+                symbol=symbol,
+            )
+
+            # Priority: BB first (former support/resistance now flipped),
+            # then OB. Both are detected on M15 for precision entries.
+            if _m15_breakers:
+                all_candidates = _m15_breakers
+                self.logger.debug(
+                    "%s %s M15: %d Breaker Block(s) found.",
+                    symbol, setup_type, len(_m15_breakers))
+            elif _m15_obs:
+                all_candidates = _m15_obs
+                self.logger.info(
+                    "%s %s M15: No BBs found, using %d Order Block(s).",
+                    symbol, setup_type, len(_m15_obs))
+
+            if not all_candidates:
+                self.logger.info(
+                    "%s: no valid M15 POI candidates found for %s structure. Skipping.",
+                    symbol, setup_type)
+                return
+
+            # Apply H4 alignment gate for BOS continuation setups only.
+            # MSS is a reversal — requiring H4 alignment is a contradiction.
             if setup_type == 'BOS' and h4_trend_data is not None:
                 if not h4_aligned and h4_trend_data.get('trend') != 'RANGING':
                     self.logger.info(
-                        "%s BOS: H4 trend (%s) opposes D1 trend (%s). "
-                        "BOS setups require HTF alignment. Skipping.",
+                        "%s BOS: H4 trend (%s) opposes D1 trend (%s). Skipping.",
                         symbol,
                         h4_trend_data.get('trend'),
                         htf_trend.get('trend'),
@@ -827,20 +830,19 @@ class NixTradesScheduler:
                     return
             elif setup_type == 'MSS':
                 self.logger.debug(
-                    "%s MSS: H4 alignment check skipped. "
-                    "MSS is a reversal trade.", symbol)
+                    "%s MSS: H4 alignment check skipped (reversal trade).", symbol)
 
-            # Filter out any POI that has already been mitigated by price action.
-            # A mitigated zone means institutions already filled their orders there;
-            # there is no point targeting an empty well.
-            # Breaker Blocks use touch_mitigation=True: a wick into the zone
-            # followed by a rejection does NOT invalidate it.
-            # Order Blocks use the default strict boundary rule.
+            # Update trade_direction from the confirmed structure direction.
+            trade_direction = trade_dir_from_structure
+
+            # Filter out mitigated zones using M15 data.
+            # Since POIs are now detected on M15, mitigation must also be
+            # checked against M15 price action, not H1.
             unmitigated = []
             for _cand in all_candidates:
                 _is_bb = str(_cand.get('type', 'OB')).upper() in ('BB', 'BREAKER')
                 if not self.smc.is_poi_mitigated(
-                    _cand, h1_df,
+                    _cand, _m15_recent,
                     touch_mitigation=_is_bb,
                     symbol=symbol,
                 ):
@@ -848,16 +850,51 @@ class NixTradesScheduler:
 
             if not unmitigated:
                 self.logger.info(
-                    "%s: all %d detected POI(s) are mitigated. "
-                    "No valid entry zone remaining. Skipping.",
+                    "%s: all %d M15 POI(s) are mitigated. Skipping.",
                     symbol, len(all_candidates))
+                return
+
+            # Define current_price here so the distance filter, ranking,
+            # and all logging below share the same reference without
+            # a forward-reference error.
+            current_price = float(m15_df.iloc[-1]['close'])
+
+            # Distance filter using M15 ATR.
+            # Reject POIs more than 2x M15 ATR from current price.
+            # M15 ATR is tighter than H1 ATR — this keeps entries close
+            # to current price and prevents stale zone selection.
+            _m15_atr = self.smc._calculate_atr(_m15_recent.tail(20))
+            if _m15_atr > 0:
+                _max_poi_distance = _m15_atr * 2.0
+                _before_dist      = len(unmitigated)
+                unmitigated = [
+                    _p for _p in unmitigated
+                    if abs(
+                        (float(_p.get('high', 0)) + float(_p.get('low', 0))) / 2.0
+                        - current_price
+                    ) <= _max_poi_distance
+                ]
+                if len(unmitigated) < _before_dist:
+                    self.logger.info(
+                        "%s: distance filter removed %d POI(s) more than %.5f "
+                        "(2x M15 ATR) from current price %.5f. %d remain.",
+                        symbol,
+                        _before_dist - len(unmitigated),
+                        _max_poi_distance,
+                        current_price,
+                        len(unmitigated),
+                    )
+
+            if not unmitigated:
+                self.logger.info(
+                    "%s: all M15 POI(s) are too far from current price. Skipping.",
+                    symbol)
                 return
 
             # Rank multiple valid POIs before inducement checks.
             # Previously the scheduler tested only the single highest-confidence
             # zone, which allowed an old or distant H1 POI to block the symbol
             # even when a nearer valid zone existed.
-            current_price = float(m15_df.iloc[-1]['close'])
             ranked_anchors = self._rank_inducement_candidates(
                 unmitigated,
                 current_price=current_price,
@@ -875,11 +912,14 @@ class NixTradesScheduler:
             for candidate in ranked_anchors[:4]:
                 checked_count += 1
                 candidate_direction = str(candidate.get('direction', 'BULLISH')).upper()
+                # Use _m15_recent for inducement so the sweep is searched in
+                # the same 120-bar window as the POI detection.
+                # This prevents the bot from accepting sweeps from days ago.
                 candidate_inducement = self.smc.detect_inducement_post_structure(
-                    m15_df,
+                    _m15_recent,
                     candidate,
                     candidate_direction,
-                    lookback_bars=config.INDUCEMENT_LOOKBACK_BARS_M15,
+                    lookback_bars=min(config.INDUCEMENT_LOOKBACK_BARS_M15, 80),
                     symbol=symbol,
                     timeframe='M15',
                 )
@@ -930,11 +970,9 @@ class NixTradesScheduler:
             # to the sweep level. This is the real entry zone — the nearest
             # institutional block to where the stop hunt just occurred.
             poi = self.smc.get_closest_unmitigated_poi(
-                unmitigated, sweep_level, trade_direction, h1_df
+                unmitigated, sweep_level, trade_direction, _m15_recent
             )
             if poi is None:
-                # Fallback: no POI is optimally positioned relative to the sweep,
-                # so use the anchor that we already validated above.
                 poi = anchor_poi
                 self.logger.info(
                     "%s: No POI closer to sweep %.5f found. "
@@ -956,7 +994,7 @@ class NixTradesScheduler:
 
             # Phase 3: ML validation
             ml_result     = self.ml.get_ensemble_prediction(
-                m15_df, poi, htf_trend, setup_type)
+                _m15_recent, poi, htf_trend, setup_type)
             consensus     = ml_result['consensus_score']
             should_send, tier = self.ml.should_send_setup(consensus)
 
@@ -965,54 +1003,42 @@ class NixTradesScheduler:
                     "%s: ML consensus %d%% below threshold. Rejected.", symbol, consensus)
                 return
 
-            # ATR and session filters
-            if not self._check_filters(symbol, m15_df, htf_trend, poi, tier):
+            # ATR and session filters run on M15 data
+            if not self._check_filters(symbol, _m15_recent, htf_trend, poi, tier):
                 return
 
-            # Phase 4: Entry / SL / TP calculation
-            entry_cfg = self.smc.calculate_entry_price(
-                poi, 'UNICORN' if tier == 'PREMIUM' else 'STANDARD', consensus)
-            sl_cfg    = self.smc.calculate_stop_loss(
-                poi, poi['direction'], symbol,
-                self.smc._calculate_atr(m15_df.tail(20)))
-            
-            # Multi-timeframe sniper refinement:
-            # H1 parent zone -> M15 nested zone -> optional M5 nested zone.
-            h1_poi = dict(poi)
-            h1_poi['timeframe'] = 'H1'
-            h1_poi['role'] = 'PRIMARY'
-            _poi_high   = float(h1_poi.get('high', entry_cfg['entry_price']))
-            _poi_low    = float(h1_poi.get('low',  entry_cfg['entry_price']))
-            _is_buy     = h1_poi['direction'] == 'BULLISH'
-            _refined    = False
-            _refined_poi = None
-            refined_pois: List[dict] = []
-            _current_parent = h1_poi
-            _htf_swing_high = float(htf_trend.get('swing_high', 0))
-            _htf_swing_low  = float(htf_trend.get('swing_low', 0))
+            # Phase 4: Entry / SL / TP calculation.
+            # POI is already on M15 — mark it correctly and optionally
+            # refine further to M5 for a tighter entry.
+            m15_poi = dict(poi)
+            m15_poi['timeframe'] = 'M15'
+            m15_poi['role']      = 'PRIMARY'
+            _is_buy              = trade_direction in ('BULLISH',)
+            _htf_swing_high      = float(htf_trend.get('swing_high', 0))
+            _htf_swing_low       = float(htf_trend.get('swing_low',  0))
+            _m15_atr_for_sl      = self.smc._calculate_atr(_m15_recent.tail(20))
 
-            if m15_df is not None and len(m15_df) >= 50:
-                try:
-                    m15_refined = self.smc.find_nested_refinement(
-                        _current_parent,
-                        m15_df.tail(80),
-                        symbol=symbol,
-                        timeframe='M15',
-                        htf_swing_high=_htf_swing_high,
-                        htf_swing_low=_htf_swing_low,
-                    )
-                    if m15_refined is not None:
-                        refined_pois.append(m15_refined)
-                        _current_parent = m15_refined
-                except Exception as m15_err:
-                    self.logger.debug(
-                        "M15 refinement skipped for %s: %s", symbol, m15_err)
+            entry_cfg = self.smc.calculate_entry_price(
+                m15_poi,
+                'UNICORN' if tier == 'PREMIUM' else 'STANDARD',
+                consensus,
+            )
+            sl_cfg = self.smc.calculate_stop_loss(
+                m15_poi, trade_direction, symbol, _m15_atr_for_sl
+            )
+
+            # Optional M5 refinement of the M15 POI for sniper entries.
+            refined_pois:    List[dict] = []
+            _current_parent              = m15_poi
+            _refined                     = False
+            _refined_poi                 = None
 
             if m5_df is not None and len(m5_df) >= 50:
+                _m5_recent = m5_df.tail(80).copy()
                 try:
                     m5_refined = self.smc.find_nested_refinement(
                         _current_parent,
-                        m5_df.tail(80),
+                        _m5_recent,
                         symbol=symbol,
                         timeframe='M5',
                         htf_swing_high=_htf_swing_high,
@@ -1021,6 +1047,13 @@ class NixTradesScheduler:
                     if m5_refined is not None:
                         refined_pois.append(m5_refined)
                         _current_parent = m5_refined
+                        self.logger.info(
+                            "M5 refinement active for %s: %s [%.5f - %.5f].",
+                            symbol,
+                            str(m5_refined.get('type', 'OB')).upper(),
+                            float(m5_refined.get('low', 0)),
+                            float(m5_refined.get('high', 0)),
+                        )
                 except Exception as m5_err:
                     self.logger.debug(
                         "M5 refinement skipped for %s: %s", symbol, m5_err)
@@ -1035,43 +1068,24 @@ class NixTradesScheduler:
                 if _entry_boundary > 0:
                     entry_cfg['entry_price'] = round(_entry_boundary, 5)
                     _refined = True
-
-            # Recalculate SL from the most precise nested zone selected for entry.
-            if _refined and _refined_poi is not None:
-                _refinement_atr = self.smc._calculate_atr(m15_df.tail(20))
-                sl_cfg = self.smc.calculate_stop_loss(
-                    _refined_poi,
-                    h1_poi['direction'],
-                    symbol,
-                    _refinement_atr,
-                )
-                self.logger.info(
-                    "Nested refinement active for %s: %s %s [%.5f - %.5f] -> entry %.5f, SL %.5f.",
-                    symbol,
-                    str(_refined_poi.get('timeframe', 'M15')).upper(),
-                    str(_refined_poi.get('type', 'OB')).upper(),
-                    float(_refined_poi.get('low', 0)),
-                    float(_refined_poi.get('high', 0)),
-                    entry_cfg['entry_price'],
-                    sl_cfg['stop_loss'],
-                )
-            else:
-                self.logger.debug(
-                    "No fully nested lower-TF zone found inside H1 POI [%.5f - %.5f] for %s. "
-                    "Using H1 zone entry %.5f with H1 POI SL %.5f.",
-                    _poi_low, _poi_high, symbol,
-                    entry_cfg['entry_price'], sl_cfg['stop_loss'])
+                    _m5_atr = self.smc._calculate_atr(
+                        (m5_df.tail(20) if m5_df is not None and len(m5_df) >= 20
+                         else _m15_recent.tail(20))
+                    )
+                    sl_cfg = self.smc.calculate_stop_loss(
+                        _refined_poi, trade_direction, symbol, _m5_atr
+                    )
             try:
                 tp_cfg = self.smc.calculate_take_profits(
                     entry_cfg['entry_price'],
                     sl_cfg['stop_loss'],
-                    h1_poi['direction'],
+                    trade_direction,
                     htf_trend.get(
-                        'swing_high' if h1_poi['direction'] == 'BULLISH' else 'swing_low',
+                        'swing_high' if trade_direction == 'BULLISH' else 'swing_low',
                         0
                     ),
                     symbol,
-                    m15_data=m15_df,
+                    m15_data=_m15_recent,
                 )
             except ValueError as rr_err:
                 self.logger.info(
@@ -1111,7 +1125,7 @@ class NixTradesScheduler:
             # Advisory LLM context from the Sunday weekly analysis.
             # If the stored bias conflicts with the SMC direction, flag it
             # in the alert. Never block a valid setup on LLM alone.
-            _smc_direction_str = 'BUY' if h1_poi['direction'] == 'BULLISH' else 'SELL'
+            _smc_direction_str = 'BUY' if trade_direction == 'BULLISH' else 'SELL'
             _llm_bias          = self._llm_weekly_bias.get(symbol, '')
             if _llm_bias and _llm_bias not in ('NEUTRAL', ''):
                 if _llm_bias == _smc_direction_str:
@@ -1130,11 +1144,11 @@ class NixTradesScheduler:
             else:
                 _llm_context = ''
 
-            # Build all M15-timeframe markups for chart rendering.
-            # All detections use m15_df.tail(80) so timestamps align
-            # exactly with the chart bars and zone boxes are accurate.
-            _chart_m15 = m15_df.tail(80).copy()
-            _chart_direction = h1_poi['direction']
+            # Build chart markups. Use the same _m15_recent window (120 bars)
+            # for all detections so zone timestamps align with chart bars.
+            # The chart displays the last 80 bars of this window.
+            _chart_m15       = _m15_recent.tail(80).copy()
+            _chart_direction = trade_direction
 
             try:
                 _chart_obs = self.smc.detect_order_blocks(
@@ -1157,17 +1171,43 @@ class NixTradesScheduler:
             except Exception:
                 _chart_fvgs = []
 
+            # Swings: only the last 40 bars to avoid cluttering the chart
+            # with swing markers from days ago.
             try:
-                _chart_swings = self.smc._identify_swings(_chart_m15, lookback=2)
+                _chart_swings = self.smc._identify_swings(
+                    _chart_m15.tail(40), lookback=2)
             except Exception:
                 _chart_swings = []
 
-            # The entry POI is the most refined zone available.
-            _chart_entry_poi = dict(refined_pois[-1]) if refined_pois else dict(h1_poi)
+            # BOS events: filter to only those whose timestamp falls within
+            # the chart window. BOS events outside the window have no matching
+            # bar and would be placed at the weekend gap or left edge.
+            _chart_window_start = _chart_m15.index[0] if len(_chart_m15) > 0 else None
+            _chart_bos_filtered = []
+            if _chart_window_start is not None:
+                for _bev in bos_events[:6]:
+                    _bts = _bev.get('timestamp')
+                    if _bts is None:
+                        continue
+                    try:
+                        import pytz
+                        _bts_pd = pd.Timestamp(_bts)
+                        if _bts_pd.tzinfo is None:
+                            _bts_pd = pytz.utc.localize(_bts_pd)
+                        _ws_pd = pd.Timestamp(_chart_window_start)
+                        if _ws_pd.tzinfo is None:
+                            _ws_pd = pytz.utc.localize(_ws_pd)
+                        if _bts_pd >= _ws_pd:
+                            _chart_bos_filtered.append(_bev)
+                    except Exception:
+                        continue
+
+            # The primary entry POI is M15 (or M5 if refined).
+            _chart_entry_poi = dict(refined_pois[-1]) if refined_pois else dict(m15_poi)
             _chart_entry_poi['role'] = 'PRIMARY'
             _entry_idx = _chart_entry_poi.get('index', -1)
 
-            # All other M15 zones excluding the entry zone itself.
+            # Secondary zones: all other unmitigated zones excluding the entry zone.
             _chart_secondary = []
             for _z in (_chart_obs + _chart_bbs):
                 if abs(_z.get('index', -999) - _entry_idx) > 2:
@@ -1194,11 +1234,11 @@ class NixTradesScheduler:
                 'lstm_score':    0,
                 'xgboost_score': ml_result['xgboost_score'],
                 'session':       utils.get_session(),
-                'timeframe':     'H1',
+                'timeframe':     'M15',
                 'expiry_hours':  config.H1_SETUP_EXPIRY_HOURS,
                 'order_type':    await self._determine_order_type(
                     symbol,
-                    'BUY' if h1_poi['direction'] == 'BULLISH' else 'SELL',
+                    'BUY' if m15_poi['direction'] == 'BULLISH' else 'SELL',
                     entry_cfg['entry_price']
                 ),
                 'ml_features':   ml_result['features'],
@@ -1211,7 +1251,7 @@ class NixTradesScheduler:
                     'refined_pois':     [],
                     'additional_pois':  _chart_secondary[:6],
                     'fvgs':             _chart_fvgs,
-                    'bos_events':       bos_events[:3],
+                    'bos_events':       _chart_bos_filtered[:3],
                     'swing_levels':     _chart_swings,
                     'htf_swing_high':   float(htf_trend.get('swing_high', 0)),
                     'htf_swing_low':    float(htf_trend.get('swing_low', 0)),
