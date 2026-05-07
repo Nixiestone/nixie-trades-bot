@@ -1293,13 +1293,10 @@ class NixTradesScheduler:
             if signal_row:
                 setup_data['signal_number'] = signal_row.get('signal_number', 0)
                 setup_data['signal_id']     = signal_row.get('id')
-                # Every setup that passes the ML send threshold (STANDARD or PREMIUM)
-                # is eligible for auto-execution on behalf of users who have MT5
-                # connected and auto-execution enabled in their account settings.
-                # The per-user gate inside _broadcast_setup handles the individual check.
-                # DISCRETIONARY setups (55-59%) are notification-only — they use the
-                # heuristic range and carry insufficient model confidence for execution.
-                auto_execute = tier in ('PREMIUM', 'STANDARD')
+                # Every generated setup is eligible for auto-execution on behalf
+                # of users who have MT5 connected. The per-user gate inside
+                # _broadcast_setup handles account-specific execution checks.
+                auto_execute = True
                 await self._broadcast_setup(setup_data, auto_execute)
                 self.logger.info(
                     "Setup generated and broadcast: %s %s | Score: %d%% | "
@@ -1438,7 +1435,7 @@ class NixTradesScheduler:
     async def _broadcast_setup(self, setup_data: dict, auto_execute: bool):
         """
         Send the setup alert to all subscribed users.
-        Users with MT5 connected are auto-executed if score meets threshold.
+        Users with MT5 connected are auto-executed for generated setups.
         Rate-limited to stay within Telegram's 30 messages/second limit.
         """
         try:
@@ -1539,11 +1536,14 @@ class NixTradesScheduler:
                         continue
 
                     # Calculate lot size per user's risk setting if MT5 connected.
-                    # mt5_connected flag checked first, then credentials as fallback
+                    # mt5_connected flag checked first, then stored account fields
                     # so a user who connected but whose flag was not set still executes.
                     lot_size = None
-                    mt5_flag    = bool(user.get('mt5_connected'))
-                    can_execute = mt5_flag
+                    mt5_flag          = bool(user.get('mt5_connected'))
+                    mt5_account_saved = bool(
+                        user.get('mt5_login') and user.get('mt5_server')
+                    )
+                    can_execute = mt5_flag or mt5_account_saved
 
                     if not auto_execute:
                         self.logger.info(
@@ -1551,9 +1551,10 @@ class NixTradesScheduler:
                             "(consensus below threshold or agreement=WEAK)", tid)
                     elif not can_execute:
                         self.logger.info(
-                            "AUTO-EXECUTE SKIP | user %d | reason: mt5_connected=%s. "
+                            "AUTO-EXECUTE SKIP | user %d | reason: mt5_connected=%s "
+                            "mt5_account_saved=%s. "
                             "User has not linked MT5 account.",
-                            tid, mt5_flag)
+                            tid, mt5_flag, mt5_account_saved)
                     else:
                         lot_size = await self._calculate_user_lot_size(user, setup_data)
                         if lot_size is None:
@@ -1729,10 +1730,14 @@ class NixTradesScheduler:
             )
             daily_loss = db.get_daily_loss_percent(tid, since=day_start_utc)
             if daily_loss is not None and daily_loss >= config.MAX_DAILY_LOSS_PERCENT:
+                message = (
+                    "Daily loss limit reached (%.1f%%). Auto-execution skipped."
+                    % daily_loss
+                )
                 self.logger.warning(
                     "User %d has reached daily loss limit (%.1f%%). "
                     "Skipping auto-execution.", tid, daily_loss)
-                return
+                return False, None, message
 
             # Determine order type (LIMIT vs MARKET) based on current price
             bid, ask = await self.mt5.get_current_price(symbol)
@@ -1811,14 +1816,17 @@ class NixTradesScheduler:
                     order_type=order_type,
                     ticket=ticket,
                 )
+                return True, ticket, "Order placed successfully."
             else:
                 self.logger.error(
                     "Auto-execution failed for user %d (%s %s): %s",
                     tid, direction, symbol, message)
+                return False, None, message
 
         except Exception as e:
             self.logger.error(
                 "Auto-execution error for user %d: %s", tid, e, exc_info=True)
+            return False, None, str(e)
 
     # ==================== MARKET OVERVIEW ====================
 

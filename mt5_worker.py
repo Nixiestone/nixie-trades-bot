@@ -707,13 +707,28 @@ def _place_order(
     if expiration:
         request_dict['expiration'] = expiration
 
+    terminal = mt5.terminal_info()
+    if terminal is not None and not getattr(terminal, 'trade_allowed', True):
+        return False, {
+            'error': (
+                'Automated trading is disabled in the MetaTrader 5 terminal. '
+                'Enable Algo Trading / AutoTrading in MT5, then try again.'
+            ),
+            'retcode': 10027,
+        }
+
     result = mt5.order_send(request_dict)
 
     if result is None:
         error = mt5.last_error()
         return False, {'error': f"Order submission failed: {error}"}
 
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
+    success_codes = {
+        mt5.TRADE_RETCODE_DONE,
+        getattr(mt5, 'TRADE_RETCODE_PLACED', 10008),
+        getattr(mt5, 'TRADE_RETCODE_DONE_PARTIAL', 10010),
+    }
+    if result.retcode not in success_codes:
         return False, {
             'error':   _translate_retcode(result.retcode, result.comment),
             'retcode': result.retcode,
@@ -741,10 +756,20 @@ def _translate_retcode(retcode: int, raw_comment: str) -> str:
         10014: "Invalid lot size. Check your risk settings.",
         10015: "Invalid price. The market may have moved significantly.",
         10016: "The signal prices may have shifted. Check the latest setup.",
+        10017: "Trading is disabled for this symbol or account.",
+        10018: "The market is closed for this symbol. Try again when the symbol is tradable.",
         10019: "Insufficient free margin to open this trade.",
+        10026: "Automated trading is disabled by the broker or trade server.",
+        10027: (
+            "Automated trading is disabled in your MetaTrader 5 terminal. "
+            "Enable Algo Trading / AutoTrading in MT5, then try again."
+        ),
         10030: "Your broker does not support this order type. Please contact your broker.",
     }
-    return _MAP.get(retcode, f"Order could not be placed. Please try again. ({retcode})")
+    message = _MAP.get(retcode, f"Order could not be placed. Please try again. ({retcode})")
+    if raw_comment:
+        return f"{message} Broker comment: {raw_comment}"
+    return message
 
 
 # ==================== API ENDPOINTS ====================

@@ -463,7 +463,11 @@ class NixTradesBot:
         app.add_handler(CommandHandler('test_news',     self.cmd_test_news))
         app.add_handler(CommandHandler('test_weekly',   self.cmd_test_weekly))
         app.add_handler(CommandHandler('test_scan',     self.cmd_test_scan))
+        app.add_handler(CommandHandler('admin_execute_latest', self.cmd_admin_execute_latest))
         app.add_handler(CommandHandler('upgrade',       self.cmd_upgrade))
+        app.add_handler(CallbackQueryHandler(
+            self.callback_admin_execute_latest, pattern='^admin_execute_latest$'
+        ))
         app.add_handler(CallbackQueryHandler(
             self.callback_upgrade_plan, pattern=r'^(upgrade|renew)_(basic|pro)_(paystack|crypto|bybit|stripe)$'
         ))
@@ -1218,8 +1222,13 @@ class NixTradesBot:
         try:
             telegram_id = update.effective_user.id
             user        = db.get_user(telegram_id)
+            is_admin    = telegram_id in config.ADMIN_USER_IDS
 
-            if not user or user.get('subscription_status') != 'active':
+            if not user:
+                await self._reply(update, "Please use /start first.")
+                return
+
+            if user.get('subscription_status') != 'active' and not is_admin:
                 await self._reply(update, config.ERROR_MESSAGES['not_subscribed'])
                 return
 
@@ -1247,7 +1256,15 @@ class NixTradesBot:
                         signal.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)
                     ),
                 )
-                await self._reply(update, msg)
+                reply_markup = None
+                if is_admin:
+                    reply_markup = InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "Execute Latest on Admin MT5",
+                            callback_data='admin_execute_latest',
+                        )
+                    ]])
+                await self._reply(update, msg, reply_markup=reply_markup)
             else:
                 await self._reply(
                     update,
@@ -1261,6 +1278,114 @@ class NixTradesBot:
         except Exception as e:
             self.logger.error("Error in /latest: %s", e)
             await self._reply(update, config.ERROR_MESSAGES['general_error'])
+
+    @staticmethod
+    def _setup_data_from_signal(signal: dict) -> dict:
+        """Convert a saved signal row into the scheduler execution payload."""
+        return {
+            'signal_id':     signal.get('id'),
+            'signal_number': signal.get('signal_number', 0),
+            'symbol':        signal['symbol'],
+            'direction':     signal['direction'],
+            'setup_type':    signal.get('setup_type', 'STANDARD'),
+            'setup_label':   signal.get('setup_type', 'STANDARD'),
+            'entry_price':   float(signal['entry_price']),
+            'stop_loss':     float(signal['stop_loss']),
+            'take_profit_1': float(signal['take_profit_1']),
+            'take_profit_2': float(signal['take_profit_2']),
+            'sl_pips':       float(signal.get('sl_pips') or 0.0),
+            'tp1_pips':      float(signal.get('tp1_pips') or 0.0),
+            'tp2_pips':      float(signal.get('tp2_pips') or 0.0),
+            'rr_tp1':        float(signal.get('rr_tp1') or 0.0),
+            'rr_tp2':        float(signal.get('rr_tp2') or 0.0),
+            'ml_score':      int(signal.get('ml_score') or 0),
+            'session':       signal.get('session', 'N/A'),
+            'order_type':    signal.get('order_type', 'LIMIT'),
+            'timeframe':     signal.get('timeframe', 'H1'),
+            'expiry_hours':  int(signal.get('expiry_hours') or config.H1_SETUP_EXPIRY_HOURS),
+        }
+
+    async def _execute_latest_for_admin(self, admin_id: int) -> str:
+        """Execute the latest saved setup against the requesting admin account."""
+        if admin_id not in config.ADMIN_USER_IDS:
+            return "This command is for administrators only."
+
+        if self.scheduler_obj is None:
+            return "Scheduler is not running yet. Please try again in a moment."
+
+        user = db.get_user(admin_id)
+        if not user:
+            return "Admin user record was not found. Use /start first."
+
+        signal = db.get_latest_signal()
+        if not signal:
+            return "No saved setup found yet."
+
+        setup_data = self._setup_data_from_signal(signal)
+        lot_size = await self.scheduler_obj._calculate_user_lot_size(user, setup_data)
+        if lot_size is None:
+            return (
+                "Latest setup found, but lot size could not be calculated. "
+                "Check the admin MT5 credentials, account balance, and MT5 worker connection."
+            )
+
+        ok, ticket, message = await self.scheduler_obj._auto_execute_trade(
+            user, setup_data, lot_size
+        )
+        if ok:
+            return (
+                "Admin execution submitted.\n\n"
+                f"Setup #{setup_data['signal_number']}: "
+                f"{setup_data['symbol']} {setup_data['direction']}\n"
+                f"Lot size: {lot_size:.2f}\n"
+                f"Ticket: {ticket}"
+            )
+
+        return (
+            "Admin execution failed.\n\n"
+            f"Setup #{setup_data['signal_number']}: "
+            f"{setup_data['symbol']} {setup_data['direction']}\n"
+            f"Reason: {message}"
+        )
+
+    async def cmd_admin_execute_latest(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Admin-only: manually execute the latest saved setup on the admin MT5 account."""
+        if not self._check_rate_limit(update):
+            await self._reply(update, "You are sending commands too quickly. Please wait a moment.")
+            return
+
+        try:
+            admin_id = update.effective_user.id
+            response = await self._execute_latest_for_admin(admin_id)
+            await self._reply(update, utils.validate_user_message(response))
+        except Exception as e:
+            self.logger.error("Error in /admin_execute_latest: %s", e, exc_info=True)
+            await self._reply(update, config.ERROR_MESSAGES['general_error'])
+
+    async def callback_admin_execute_latest(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Inline-button version of /admin_execute_latest."""
+        query = update.callback_query
+        try:
+            await query.answer("Triggering latest setup...")
+        except TelegramError:
+            pass
+
+        try:
+            admin_id = query.from_user.id
+            response = await self._execute_latest_for_admin(admin_id)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except BadRequest as br:
+                if "Message is not modified" not in str(br):
+                    raise
+            await query.message.reply_text(utils.validate_user_message(response))
+        except Exception as e:
+            self.logger.error("Error in admin execute latest callback: %s", e, exc_info=True)
+            await query.message.reply_text(config.ERROR_MESSAGES['general_error'])
 
     async def cmd_settings(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
