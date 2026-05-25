@@ -36,6 +36,19 @@ def _db_retry(max_attempts: int = 4, base_delay: float = 1.0):
                     return func(*args, **kwargs)
                 except Exception as e:
                     last_error = e
+                    err_code = ''
+                    try:
+                        err_code = str(getattr(e, 'code', '') or '')
+                    except Exception:
+                        err_code = ''
+                    if not err_code:
+                        err_code = str(e)
+                    if '23514' in err_code:
+                        logger.error(
+                            "Database call %s failed due to a check constraint: %s",
+                            func.__name__, e
+                        )
+                        raise
                     if attempt < max_attempts - 1:
                         delay = base_delay * (2 ** attempt)
                         logger.warning(
@@ -634,6 +647,21 @@ def update_trade(
     if closed_at is not None:
         update_data['closed_at'] = closed_at
 
+    _client().table('trades').update(update_data).eq('mt5_ticket', ticket).execute()
+    return True
+
+@_db_retry()
+def update_trade_management_flags(
+    ticket: int,
+    tp1_hit: Optional[bool] = None,
+    breakeven_set: Optional[bool] = None,
+) -> bool:
+    """Update TP1/breakeven management flags for history exports."""
+    update_data = {'updated_at': datetime.now(timezone.utc).isoformat()}
+    if tp1_hit is not None:
+        update_data['tp1_hit'] = bool(tp1_hit)
+    if breakeven_set is not None:
+        update_data['breakeven_set'] = bool(breakeven_set)
     _client().table('trades').update(update_data).eq('mt5_ticket', ticket).execute()
     return True
 

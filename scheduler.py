@@ -970,7 +970,7 @@ class NixTradesScheduler:
             # to the sweep level. This is the real entry zone — the nearest
             # institutional block to where the stop hunt just occurred.
             poi = self.smc.get_closest_unmitigated_poi(
-                unmitigated, sweep_level, trade_direction, _m15_recent
+                unmitigated, sweep_level, trade_direction, _m15_recent, symbol=symbol
             )
             if poi is None:
                 poi = anchor_poi
@@ -1119,8 +1119,22 @@ class NixTradesScheduler:
                         )
                     )
 
-            setup_tier  = 'UNICORN' if tier == 'PREMIUM' else 'STANDARD'
-            setup_label = f"{setup_tier} {setup_type}"
+            setup_tier = 'UNICORN' if tier == 'PREMIUM' else 'STANDARD'
+            entry_style = str(entry_cfg.get('entry_type', '')).upper()
+            chart_timeframe = (
+                'M5'
+                if refined_pois
+                and str(refined_pois[-1].get('timeframe', '')).upper() == 'M5'
+                else 'M15'
+            )
+            if _refined and chart_timeframe == 'M5':
+                entry_style = 'SNIPER'
+                entry_cfg['entry_type'] = entry_style
+            setup_label = (
+                f"{entry_style} {setup_tier} {setup_type}"
+                if entry_style == 'SNIPER'
+                else f"{setup_tier} {setup_type}"
+            )
 
             # Advisory LLM context from the Sunday weekly analysis.
             # If the stored bias conflicts with the SMC direction, flag it
@@ -1215,6 +1229,14 @@ class NixTradesScheduler:
                     _zc['role'] = 'SECONDARY'
                     _chart_secondary.append(_zc)
 
+            if chart_timeframe == 'M5':
+                # M15 overlays do not share the same bar index space as an M5
+                # chart. Keep the parent zone as context, then let broadcast
+                # recompute live M5 overlays for the final image.
+                _parent_ctx = dict(m15_poi)
+                _parent_ctx['role'] = 'SECONDARY'
+                _chart_secondary = [_parent_ctx]
+
             setup_data = {
                 'symbol':        symbol,
                 'direction':     _smc_direction_str,
@@ -1234,7 +1256,9 @@ class NixTradesScheduler:
                 'lstm_score':    0,
                 'xgboost_score': ml_result['xgboost_score'],
                 'session':       utils.get_session(),
-                'timeframe':     'M15',
+                'timeframe':     chart_timeframe,
+                'chart_timeframe': chart_timeframe,
+                'entry_type':    entry_cfg.get('entry_type', ''),
                 'expiry_hours':  config.H1_SETUP_EXPIRY_HOURS,
                 'order_type':    await self._determine_order_type(
                     symbol,
@@ -1256,12 +1280,7 @@ class NixTradesScheduler:
                     'htf_swing_high':   float(htf_trend.get('swing_high', 0)),
                     'htf_swing_low':    float(htf_trend.get('swing_low', 0)),
                     'direction':        _smc_direction_str,
-                    'chart_timeframe':  (
-                        'M5'
-                        if refined_pois
-                        and str(refined_pois[-1].get('timeframe', '')).upper() == 'M5'
-                        else 'M15'
-                    ),
+                    'chart_timeframe':  chart_timeframe,
                 },
             }
 
@@ -1401,15 +1420,15 @@ class NixTradesScheduler:
         self, symbol: str, direction: str, entry_price: float
     ) -> str:
         """
-        Determine correct order type by comparing current market price
-        to the calculated entry price.
+        Determine correct order type by comparing current market price to
+        the calculated entry price, allowing a tiny market-fill tolerance.
 
         For BUY:
-          - Current ask <= entry: price is already at or below entry -> MARKET
-          - Current ask > entry:  price needs to pull back to entry -> LIMIT
+          - Ask <= entry + threshold: execute MARKET
+          - Ask >  entry + threshold: wait for pullback with LIMIT
         For SELL:
-          - Current bid >= entry: price is already at or above entry -> MARKET
-          - Current bid < entry:  price needs to rally to entry -> LIMIT
+          - Bid >= entry - threshold: execute MARKET
+          - Bid <  entry - threshold: wait for rally with LIMIT
 
         Falls back to LIMIT on any error to ensure the order is placed
         as a pending order rather than executing at a worse price.
@@ -1419,10 +1438,18 @@ class NixTradesScheduler:
             if bid is None or ask is None:
                 return 'LIMIT'
 
+            pip_size = utils.get_pip_value(symbol)
+            if pip_size <= 0:
+                pip_size = 0.0001
+            market_tolerance = (
+                float(getattr(config, 'MARKET_ORDER_THRESHOLD_PIPS', 2.0))
+                * pip_size
+            )
+
             if direction == 'BUY':
-                return 'MARKET' if ask <= entry_price else 'LIMIT'
+                return 'MARKET' if ask <= entry_price + market_tolerance else 'LIMIT'
             else:
-                return 'MARKET' if bid >= entry_price else 'LIMIT'
+                return 'MARKET' if bid >= entry_price - market_tolerance else 'LIMIT'
 
         except Exception as e:
             self.logger.debug(
@@ -1471,12 +1498,13 @@ class NixTradesScheduler:
             if chart_data is not None and self._chart_gen is not None:
                 _live_raw = None
                 try:
-                    _chart_tf_fetch = chart_data.get('chart_timeframe', 'M15')
+                    _chart_tf_fetch = str(chart_data.get('chart_timeframe', 'M15')).upper()
                     _live_raw = await self.mt5.get_historical_data(
                         _symbol, _chart_tf_fetch, bars=100)
                 except Exception as _live_err:
                     self.logger.debug(
-                        "Live M15 fetch for chart failed (%s): %s",
+                        "Live %s fetch for chart failed (%s): %s",
+                        _chart_tf_fetch,
                         _symbol, _live_err)
 
                 if _live_raw and len(_live_raw) >= 20:
@@ -1493,7 +1521,45 @@ class NixTradesScheduler:
                         _htf_sl      = float(chart_data.get('htf_swing_low', 0))
                         _chart_dir   = chart_data.get('direction', setup_data.get('direction', 'BUY'))
                         _sd          = dict(setup_data)
+                        _sd['chart_timeframe'] = _chart_tf_fetch
                         _df_snap     = _live_df.tail(80).copy()
+                        if _chart_tf_fetch == 'M5':
+                            try:
+                                _live_obs = self.smc.detect_order_blocks(
+                                    _df_snap, 'BULLISH' if _chart_dir == 'BUY' else 'BEARISH',
+                                    symbol=_symbol)
+                            except Exception:
+                                _live_obs = []
+                            try:
+                                _live_bbs = self.smc.detect_breaker_blocks(
+                                    _df_snap,
+                                    'BULLISH' if _chart_dir == 'BUY' else 'BEARISH',
+                                    _htf_sh,
+                                    _htf_sl,
+                                    symbol=_symbol)
+                            except Exception:
+                                _live_bbs = []
+                            try:
+                                _fvgs = self.smc.detect_fair_value_gaps(_df_snap)
+                            except Exception:
+                                _fvgs = []
+                            try:
+                                _swings = self.smc._identify_swings(
+                                    _df_snap.tail(40), lookback=2)
+                            except Exception:
+                                _swings = []
+                            _primary_idx = int(_poi.get('index', -999)) if _poi else -999
+                            _parent_ctx = _add_pois[:1]
+                            _live_secondary = []
+                            for _z in (_live_obs + _live_bbs):
+                                if abs(int(_z.get('index', -999)) - _primary_idx) <= 2:
+                                    continue
+                                _zc = dict(_z)
+                                _zc['timeframe'] = 'M5'
+                                _zc['role'] = 'SECONDARY'
+                                _live_secondary.append(_zc)
+                            _add_pois = (_parent_ctx + _live_secondary)[:6]
+                            _bos = []
                         chart_bytes = await _loop.run_in_executor(
                             None,
                             lambda: self._chart_gen.generate_setup_chart(
@@ -1739,15 +1805,25 @@ class NixTradesScheduler:
                     "Skipping auto-execution.", tid, daily_loss)
                 return False, None, message
 
-            # Determine order type (LIMIT vs MARKET) based on current price
+            # Determine order type (LIMIT vs MARKET) using the same small
+            # near-entry tolerance used when the signal is generated.
             bid, ask = await self.mt5.get_current_price(symbol)
             current = ask if direction == 'BUY' else bid
             entry   = setup_data['entry_price']
 
-            if direction == 'BUY':
-                order_type = 'MARKET' if (current is not None and current <= entry) else 'LIMIT'
-            else:
-                order_type = 'MARKET' if (current is not None and current >= entry) else 'LIMIT'
+            order_type = setup_data.get('order_type', 'LIMIT')
+            if current is not None:
+                pip_size = utils.get_pip_value(symbol)
+                if pip_size <= 0:
+                    pip_size = 0.0001
+                market_tolerance = (
+                    float(getattr(config, 'MARKET_ORDER_THRESHOLD_PIPS', 2.0))
+                    * pip_size
+                )
+                if direction == 'BUY':
+                    order_type = 'MARKET' if current <= entry + market_tolerance else 'LIMIT'
+                else:
+                    order_type = 'MARKET' if current >= entry - market_tolerance else 'LIMIT'
 
             expiry_minutes = int(
                 setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)

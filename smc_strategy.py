@@ -392,7 +392,7 @@ class SMCStrategy:
                         'type':         'OB',
                         'direction':    direction,
                         'index':        pos,
-                        'timestamp':    idx,
+                        'timestamp':    data.index[pos],
                         'high':         top,
                         'low':          bottom,
                         'open':         float(candle.get('open',  bottom)),
@@ -726,7 +726,7 @@ class SMCStrategy:
                         'type':      'FVG',
                         'direction': direction,
                         'index':     pos,
-                        'timestamp': idx,
+                        'timestamp': data.index[pos],
                         'high':      top,
                         'low':       bottom,
                         'gap_size':  round(top - bottom, 8),
@@ -1404,6 +1404,17 @@ class SMCStrategy:
             is_buy_dir  = direction_u in ('BULLISH', 'BUY')
             risk_price  = abs(entry - stop_loss)
             risk_pips   = utils.calculate_pips(symbol, entry, stop_loss)
+            if risk_pips > 0:
+                tp1 = entry + risk_price * 3.0 if is_buy_dir else entry - risk_price * 3.0
+                tp2 = entry + risk_price * 5.0 if is_buy_dir else entry - risk_price * 5.0
+                return {
+                    'tp1':      round(tp1, 5),
+                    'tp2':      round(tp2, 5),
+                    'tp1_pips': round(utils.calculate_pips(symbol, entry, tp1), 1),
+                    'tp2_pips': round(utils.calculate_pips(symbol, entry, tp2), 1),
+                    'tp1_rr':   3.0,
+                    'tp2_rr':   5.0,
+                }
 
             if risk_pips <= 0:
                 raise ValueError("Risk pips is zero — entry equals stop loss.")
@@ -2208,6 +2219,27 @@ class SMCStrategy:
             poi_low   = float(poi.get('low',  0))
             direction = str(poi.get('direction', 'BULLISH')).upper()
 
+            if poi_index < 0 or poi_index >= len(data):
+                poi_ts = poi.get('timestamp')
+                if poi_ts is not None:
+                    try:
+                        raw_pos = data.index.get_loc(pd.Timestamp(poi_ts))
+                        if isinstance(raw_pos, slice):
+                            poi_index = int(raw_pos.start)
+                        elif isinstance(raw_pos, np.ndarray):
+                            poi_index = int(np.where(raw_pos)[0][0])
+                        else:
+                            poi_index = int(raw_pos)
+                    except Exception:
+                        try:
+                            ts_arr = pd.to_datetime(data.index)
+                            ts_val = pd.to_datetime(poi_ts)
+                            poi_index = int(np.argmin(np.abs(ts_arr - ts_val)))
+                        except Exception:
+                            poi_index = max(0, min(poi_index, len(data) - 1))
+                else:
+                    poi_index = max(0, min(poi_index, len(data) - 1))
+
             post_poi = data.iloc[poi_index + 1:]
             if post_poi.empty:
                 return False
@@ -2238,6 +2270,7 @@ class SMCStrategy:
         sweep_level: float,
         direction: str,
         data: pd.DataFrame,
+        symbol: str = 'EURUSD',
     ) -> Optional[Dict]:
         """
         From a list of POIs, return the CLOSEST unmitigated zone to the
@@ -2247,17 +2280,18 @@ class SMCStrategy:
         institutional zone to where liquidity was swept. A distant zone
         is less likely to be the real order origin.
 
-        For BUY setups: find the unmitigated bullish POI whose MID is
-        nearest to (and at or above) the sweep_level.
+        For BUY setups: find the unmitigated bullish POI whose lower edge
+        is nearest to (and at or above) the sweep_level.
 
-        For SELL setups: find the unmitigated bearish POI whose MID is
-        nearest to (and at or below) the sweep_level.
+        For SELL setups: find the unmitigated bearish POI whose upper edge
+        is nearest to (and at or below) the sweep_level.
 
         Args:
             pois:        All POI candidates (already filtered for direction).
             sweep_level: Price level where the inducement sweep occurred.
             direction:   'BULLISH' or 'BEARISH'.
             data:        OHLCV DataFrame for mitigation checks.
+            symbol:      Trading symbol for pip-aware mitigation buffers.
 
         Returns:
             The closest valid POI dict, or None if nothing qualifies.
@@ -2267,25 +2301,31 @@ class SMCStrategy:
             scored = []
 
             for p in pois:
-                if self.is_poi_mitigated(p, data):
+                is_breaker = str(p.get('type', 'OB')).upper() in ('BB', 'BREAKER')
+                if self.is_poi_mitigated(
+                    p,
+                    data,
+                    touch_mitigation=is_breaker,
+                    symbol=symbol,
+                ):
                     continue   # Already dug — skip
 
-                p_mid  = (float(p.get('high', 0)) + float(p.get('low', 0))) / 2
                 p_high = float(p.get('high', 0))
                 p_low  = float(p.get('low',  0))
 
                 if is_buy:
-                    # Demand zone must sit at or above the sweep so price
-                    # can return UP into it after the stop hunt.
-                    if p_mid < sweep_level:
+                    # Demand zone must sit above the swept liquidity. Score by
+                    # its lower edge, which is the side nearest the stop hunt.
+                    if p_low < sweep_level:
                         continue
+                    distance = abs(p_low - sweep_level)
                 else:
-                    # Supply zone must sit at or below the sweep so price
-                    # can return DOWN into it after the stop hunt.
-                    if p_mid > sweep_level:
+                    # Supply zone must sit below the swept liquidity. Score by
+                    # its upper edge, which is the side nearest the stop hunt.
+                    if p_high > sweep_level:
                         continue
+                    distance = abs(p_high - sweep_level)
 
-                distance = abs(p_mid - sweep_level)
                 scored.append((distance, p))
 
             if not scored:

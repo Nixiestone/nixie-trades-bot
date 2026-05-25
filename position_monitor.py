@@ -363,6 +363,13 @@ class PositionMonitor:
 
         position.tp1_closed = True
         position.status     = 'TP1_HIT'
+        try:
+            db.update_trade_management_flags(position.ticket, tp1_hit=True)
+        except Exception as flag_err:
+            self.logger.debug(
+                "Could not persist TP1 flag for ticket %d: %s",
+                position.ticket, flag_err,
+            )
 
         # Minimum lot for a valid 50% partial close.
         # Half of MIN_LOT_FOR_PARTIAL must be >= the broker's minimum volume.
@@ -587,9 +594,21 @@ class PositionMonitor:
             )
             if success:
                 position.status = 'TP2_HIT'
+                close_result = self._get_broker_closed_result(position)
+                close_price = position.take_profit_2
+                realized_pnl = position.profit
+                broker_pips = None
+                if close_result:
+                    close_price = float(close_result.get('close_price') or close_price)
+                    realized_pnl = float(close_result.get('realized_pnl') or realized_pnl)
+                    broker_pips = close_result.get('profit_pips')
+                    position.current_price = close_price
+                    position.profit = realized_pnl
                 pips            = utils.calculate_pips(
-                    position.symbol, position.entry_price, position.take_profit_2
+                    position.symbol, position.entry_price, close_price
                 )
+                if broker_pips is not None:
+                    pips = abs(float(broker_pips))
                 duration = self._trade_duration(position)
                 _ccy = position.account_currency
                 self._send_notification(
@@ -598,21 +617,21 @@ class PositionMonitor:
                     "Ticket:   %d\n"
                     "Symbol:   %s\n"
                     "Entry:    %s\n"
-                    "TP2:      %s\n"
+                    "Close:    %s\n"
                     "P&L:      +%.2f %s    +%.1f pips\n"
                     "Duration: %s\n\n"
                     "Full position closed. Trade complete." % (
                         position.ticket,
                         position.symbol,
                         utils.format_price(position.symbol, position.entry_price),
-                        utils.format_price(position.symbol, position.take_profit_2),
-                        position.profit,
+                        utils.format_price(position.symbol, close_price),
+                        realized_pnl,
                         _ccy,
                         pips,
                         duration,
                     )
                 )
-                self._log_trade_completion(position, 'WIN', position.profit)
+                self._log_trade_completion(position, 'WIN', realized_pnl)
                 self.logger.info(
                     "TP2 processed for ticket %d: +%.1f pips, trade logged as WIN.",
                     position.ticket, pips,
@@ -645,6 +664,14 @@ class PositionMonitor:
             if success:
                 position.stop_loss    = be_price
                 position.be_activated = True
+                try:
+                    db.update_trade_management_flags(
+                        position.ticket, breakeven_set=True)
+                except Exception as flag_err:
+                    self.logger.debug(
+                        "Could not persist breakeven flag for ticket %d: %s",
+                        position.ticket, flag_err,
+                    )
                 self.logger.info(
                     "Breakeven set for ticket %d at %.5f.", position.ticket, be_price
                 )
@@ -772,6 +799,15 @@ class PositionMonitor:
         if pip_size <= 0:
             pip_size = 0.0001
 
+        close_result = self._get_broker_closed_result(position)
+        broker_pips = None
+        if close_result:
+            position.current_price = float(
+                close_result.get('close_price') or position.current_price)
+            position.profit = float(
+                close_result.get('realized_pnl') or position.profit)
+            broker_pips = close_result.get('profit_pips')
+
         profit_value = float(position.profit)
 
         # Use TP1 flag as primary WIN signal — TP1 being hit is definitively
@@ -786,7 +822,9 @@ class PositionMonitor:
         else:
             outcome = 'BREAKEVEN'
 
-        if position.direction == 'BUY':
+        if broker_pips is not None:
+            pips = float(broker_pips)
+        elif position.direction == 'BUY':
             pips = (position.current_price - position.entry_price) / pip_size
         else:
             pips = (position.entry_price - position.current_price) / pip_size
@@ -852,6 +890,22 @@ class PositionMonitor:
             )
 
     # ==================== NOTIFICATIONS ====================
+
+    def _get_broker_closed_result(self, position: MonitoredPosition) -> Optional[dict]:
+        """Fetch exact close price, signed pips, and realized P&L from broker history."""
+        try:
+            status_info = self._run_mt5_sync(
+                self.mt5.check_ticket_status(position.telegram_id, position.ticket),
+                timeout=20,
+            )
+            if status_info and status_info.get('status') == 'CLOSED':
+                return status_info
+        except Exception as e:
+            self.logger.debug(
+                "Could not fetch broker close result for ticket %d: %s",
+                position.ticket, e,
+            )
+        return None
 
     def _send_notification(self, telegram_id: int, message: str):
         """

@@ -51,6 +51,12 @@ MT5_WAITING_SERVER         = 2
 SETTINGS_WAITING_RISK      = 0
 SETTINGS_WAITING_TZ        = 1
 
+RISK_SCHEMA_ERROR = (
+    "The bot allows this risk value, but the database still has the old 5% "
+    "risk limit. Run the risk_percent constraint migration in create_tables.sql, "
+    "then try again."
+)
+
 # ==================== RATE LIMITER ====================
 
 class _RateLimiter:
@@ -431,6 +437,9 @@ class NixTradesBot:
             self.callback_settings_risk, pattern=r'^risk_\d+\.?\d*$'
         ))
         app.add_handler(CallbackQueryHandler(
+            self.callback_settings_custom_risk, pattern='^settings_custom_risk$'
+        ))
+        app.add_handler(CallbackQueryHandler(
             self.callback_settings_done, pattern='^settings_done$'
         ))
         app.add_handler(CallbackQueryHandler(
@@ -467,6 +476,9 @@ class NixTradesBot:
         app.add_handler(CommandHandler('upgrade',       self.cmd_upgrade))
         app.add_handler(CallbackQueryHandler(
             self.callback_admin_execute_latest, pattern='^admin_execute_latest$'
+        ))
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, self.handle_custom_risk_message
         ))
         app.add_handler(CallbackQueryHandler(
             self.callback_upgrade_plan, pattern=r'^(upgrade|renew)_(basic|pro)_(paystack|crypto|bybit|stripe)$'
@@ -1461,6 +1473,11 @@ class NixTradesBot:
                 ],
                 [
                     InlineKeyboardButton(
+                        "Custom Risk %",
+                        callback_data='settings_custom_risk'),
+                ],
+                [
+                    InlineKeyboardButton(
                         "Set Timezone",
                         callback_data='settings_tz_prompt'),
                 ],
@@ -1519,7 +1536,17 @@ class NixTradesBot:
                     )
                 )
                 return
-            db.update_risk_percent(telegram_id, risk)
+            try:
+                db.update_risk_percent(telegram_id, risk)
+            except Exception as db_err:
+                if 'telegram_users_risk_percent_check' in str(db_err) or '23514' in str(db_err):
+                    await query.edit_message_text(
+                        utils.validate_user_message(
+                            f"{RISK_SCHEMA_ERROR}\n\n{config.FOOTER}"
+                        )
+                    )
+                    return
+                raise
             await query.edit_message_text(
                 utils.validate_user_message(
                     f"Risk per trade set to {risk}%.\n\n"
@@ -1531,6 +1558,77 @@ class NixTradesBot:
         except Exception as e:
             self.logger.error("Error in callback_settings_risk: %s", e)
             await query.edit_message_text(config.ERROR_MESSAGES['general_error'])
+
+    async def callback_settings_custom_risk(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Prompt user to type a custom risk percentage."""
+        query = update.callback_query
+        await query.answer()
+        context.user_data['awaiting_custom_risk'] = True
+        await query.edit_message_text(
+            utils.validate_user_message(
+                "CUSTOM RISK PERCENT\n\n"
+                f"Reply with a number between {config.MIN_RISK_PERCENT}% "
+                f"and {config.MAX_RISK_PERCENT}%.\n\n"
+                "Example: 0.75 or 1.25\n\n"
+                f"{config.FOOTER}"
+            )
+        )
+
+    async def handle_custom_risk_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Save a custom risk percentage after the settings prompt."""
+        if not context.user_data.get('awaiting_custom_risk'):
+            return
+
+        context.user_data['awaiting_custom_risk'] = False
+        telegram_id = update.effective_user.id
+        raw = (update.message.text or '').strip().replace('%', '')
+        try:
+            risk = round(float(raw), 2)
+        except ValueError:
+            await self._reply(
+                update,
+                utils.validate_user_message(
+                    "That is not a valid risk percentage. Use /settings and try again.\n\n"
+                    f"{config.FOOTER}"
+                ),
+            )
+            return
+
+        if not utils.validate_risk_percent(risk):
+            await self._reply(
+                update,
+                utils.validate_user_message(
+                    f"Risk must be between {config.MIN_RISK_PERCENT}% "
+                    f"and {config.MAX_RISK_PERCENT}%.\n\n"
+                    f"{config.FOOTER}"
+                ),
+            )
+            return
+
+        try:
+            db.update_risk_percent(telegram_id, risk)
+        except Exception as db_err:
+            if 'telegram_users_risk_percent_check' in str(db_err) or '23514' in str(db_err):
+                await self._reply(
+                    update,
+                    utils.validate_user_message(
+                        f"{RISK_SCHEMA_ERROR}\n\n{config.FOOTER}"
+                    ),
+                )
+                return
+            raise
+        await self._reply(
+            update,
+            utils.validate_user_message(
+                f"Risk per trade set to {risk}%.\n\n"
+                "This custom risk will be used for your future automated trades.\n\n"
+                f"{config.FOOTER}"
+            ),
+        )
 
     async def callback_settings_tz_prompt(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1647,7 +1745,18 @@ class NixTradesBot:
             )
             return SETTINGS_WAITING_RISK
 
-        db.update_risk_percent(telegram_id, risk)
+        try:
+            db.update_risk_percent(telegram_id, risk)
+        except Exception as db_err:
+            if 'telegram_users_risk_percent_check' in str(db_err) or '23514' in str(db_err):
+                await self._reply(
+                    update,
+                    utils.validate_user_message(
+                        f"{RISK_SCHEMA_ERROR}\n\n{config.FOOTER}"
+                    ),
+                )
+                return ConversationHandler.END
+            raise
         await self._reply(
             update,
             utils.validate_user_message(
@@ -1919,6 +2028,10 @@ class NixTradesBot:
                 position.tp1_closed               = True
                 position.awaiting_partial_confirm  = False
                 position.status                   = 'TP1_HIT'
+                try:
+                    db.update_trade_management_flags(ticket, tp1_hit=True)
+                except Exception:
+                    pass
                 asyncio.create_task(
                     self._move_position_sl_to_breakeven(telegram_id, position))
                 await query.edit_message_text(
@@ -2004,6 +2117,11 @@ class NixTradesBot:
             if success:
                 position.be_activated = True
                 position.stop_loss    = be_price
+                try:
+                    db.update_trade_management_flags(
+                        position.ticket, breakeven_set=True)
+                except Exception:
+                    pass
             else:
                 self.logger.warning(
                     "Could not move SL to breakeven for ticket %d: %s",
@@ -2077,6 +2195,80 @@ class NixTradesBot:
             )
 
 
+    def _trade_history_export_rows(self, trades: list) -> list:
+        """Return clean, derived trade-history rows for CSV download."""
+        def _truthy(value) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() in ('true', '1', 'yes', 'y')
+
+        rows = []
+        for t in trades or []:
+            symbol = t.get('symbol', '')
+            direction = str(t.get('direction', '')).upper()
+            entry = float(t.get('fill_price') or t.get('entry_price') or 0.0)
+            signal_entry = float(t.get('entry_price') or 0.0)
+            stop = float(t.get('stop_loss') or 0.0)
+            tp1 = float(t.get('take_profit_1') or 0.0)
+            tp2 = float(t.get('take_profit_2') or 0.0)
+            close = float(t.get('close_price') or 0.0)
+            profit_pips = t.get('profit_pips')
+            realized_pnl = t.get('realized_pnl')
+            status = t.get('status', '')
+            outcome = t.get('outcome', '')
+
+            risk_pips = utils.calculate_pips(symbol, entry, stop) if entry and stop else 0.0
+            close_pips = ''
+            if profit_pips not in (None, ''):
+                try:
+                    close_pips = round(float(profit_pips), 2)
+                except (TypeError, ValueError):
+                    close_pips = ''
+            elif close and entry:
+                raw = utils.calculate_pips(symbol, entry, close)
+                close_pips = round(raw if direction == 'BUY' and close >= entry
+                                   or direction == 'SELL' and close <= entry
+                                   else -raw, 2)
+
+            stored_tp1 = _truthy(t.get('tp1_hit'))
+            close_reached_tp1 = (
+                close > 0 and tp1 > 0 and (
+                    (direction == 'BUY' and close >= tp1)
+                    or (direction == 'SELL' and close <= tp1)
+                )
+            )
+            breakeven_set = _truthy(t.get('breakeven_set'))
+            tp1_hit = stored_tp1 or close_reached_tp1 or breakeven_set
+            if outcome == 'WIN' and close_pips != '' and float(close_pips) > 0:
+                tp1_hit = True
+
+            rows.append({
+                'ticket': t.get('mt5_ticket', ''),
+                'symbol': symbol,
+                'direction': direction,
+                'lot_size': t.get('lot_size', ''),
+                'order_type': t.get('order_type', ''),
+                'status': status,
+                'outcome': outcome,
+                'signal_entry': signal_entry,
+                'fill_price': entry,
+                'stop_loss': stop,
+                'take_profit_1': tp1,
+                'take_profit_2': tp2,
+                'tp1_hit': 'YES' if tp1_hit else 'NO',
+                'breakeven_set': 'YES' if breakeven_set else 'NO',
+                'close_price': close if close else '',
+                'risk_pips': round(risk_pips, 2) if risk_pips else '',
+                'profit_pips': close_pips,
+                'realized_pnl': realized_pnl if realized_pnl is not None else '',
+                'rr_achieved': t.get('rr_achieved', ''),
+                'opened_at': t.get('opened_at', ''),
+                'closed_at': t.get('closed_at', ''),
+            })
+        return rows
+
     async def cmd_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         /download - Generate and send two CSV files to the user:
@@ -2126,17 +2318,21 @@ class NixTradesBot:
 
             # ---- 1. Trading history CSV ----
             trades = db.get_all_trades_for_csv(telegram_id)
+            trade_rows = self._trade_history_export_rows(trades)
             trade_buf = io.StringIO()
             w = csv.writer(trade_buf)
-            if trades:
-                w.writerow(list(trades[0].keys()))
-                for row in trades:
+            if trade_rows:
+                w.writerow(list(trade_rows[0].keys()))
+                for row in trade_rows:
                     w.writerow(list(row.values()))
             else:
-                w.writerow(['telegram_id', 'symbol', 'direction', 'lot_size',
-                            'entry_price', 'stop_loss', 'take_profit_1', 'take_profit_2',
-                            'order_type', 'status', 'realized_pnl', 'rr_achieved',
-                            'opened_at', 'closed_at'])
+                w.writerow([
+                    'ticket', 'symbol', 'direction', 'lot_size', 'order_type',
+                    'status', 'outcome', 'signal_entry', 'fill_price', 'stop_loss',
+                    'take_profit_1', 'take_profit_2', 'tp1_hit', 'breakeven_set',
+                    'close_price', 'risk_pips', 'profit_pips', 'realized_pnl',
+                    'rr_achieved', 'opened_at', 'closed_at'
+                ])
                 w.writerow(['No trades yet.'])
 
             await context.bot.send_document(

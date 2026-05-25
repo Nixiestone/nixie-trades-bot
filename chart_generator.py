@@ -194,6 +194,7 @@ class ChartGenerator:
                 data=tail,
                 entry_price=_entry_px,
                 direction=_entry_dir,
+                order_type=str(setup_data.get('order_type', 'LIMIT')),
             )
             self._draw_price_levels(ax, setup_data, n, x_right,
                                     decimals, y_min, y_max,
@@ -931,7 +932,7 @@ class ChartGenerator:
                 linewidth=lw,
                 linestyle=ls,
                 alpha=0.90,
-                zorder=6.2,
+                zorder=8.2,
             )
 
         # Bright segment inside the position rectangle to make the entry
@@ -943,7 +944,7 @@ class ChartGenerator:
             linewidth=2.2,
             linestyle='solid',
             alpha=1.0,
-            zorder=6.6,
+            zorder=8.6,
         )
 
         live_color = self.C_UP if last_close >= last_open else self.C_DOWN
@@ -954,7 +955,7 @@ class ChartGenerator:
             linewidth=0.9,
             linestyle=(0, (3, 2)),
             alpha=0.75,
-            zorder=6.0,
+            zorder=8.0,
         )
 
         rr = abs(tp2 - entry) / max(abs(entry - stop), 1e-10)
@@ -972,7 +973,7 @@ class ChartGenerator:
             ha='left',
             va='center',
             alpha=0.96,
-            zorder=6.5,
+            zorder=8.5,
         )
         ax.text(
             pos_left + 0.7,
@@ -983,7 +984,7 @@ class ChartGenerator:
             ha='left',
             va='center',
             alpha=0.90,
-            zorder=6.5,
+            zorder=8.5,
         )
 
         levels = [
@@ -1072,11 +1073,17 @@ class ChartGenerator:
         direction = ('LONG'
                      if setup_data.get('direction', 'BUY') == 'BUY'
                      else 'SHORT')
-        tier_lbl  = (
-            'UNICORN SETUP'
-            if 'UNICORN' in str(setup_data.get('setup_type', '')).upper()
-            else 'STANDARD SETUP'
-        )
+        setup_text = ' '.join([
+            str(setup_data.get('setup_type', '')),
+            str(setup_data.get('setup_label', '')),
+            str(setup_data.get('entry_type', '')),
+        ]).upper()
+        if 'SNIPER' in setup_text:
+            tier_lbl = 'SNIPER SETUP'
+        elif 'UNICORN' in setup_text:
+            tier_lbl = 'UNICORN SETUP'
+        else:
+            tier_lbl = 'STANDARD SETUP'
         sig_num   = setup_data.get('signal_number', 0)
         ml_score  = setup_data.get('ml_score', 0)
         session   = setup_data.get('session', 'N/A')
@@ -1135,6 +1142,7 @@ class ChartGenerator:
         data: Optional[pd.DataFrame] = None,
         entry_price: float = 0.0,
         direction: str = 'BUY',
+        order_type: str = 'LIMIT',
     ) -> int:
         """
         Return the bar index where the left edge of the position tool starts.
@@ -1145,7 +1153,7 @@ class ChartGenerator:
         historical touch unrelated to this setup and would incorrectly
         place the tool in the middle of the chart.
 
-        For a pending LIMIT order (entry not yet touched): the tool is
+        For a pending LIMIT/STOP order: the tool is
         anchored to the right edge of the chart so it sits flush against
         the most recent candles, accurately showing where the order is
         waiting relative to current price.
@@ -1153,10 +1161,13 @@ class ChartGenerator:
         The position tool right edge is always capped at n - 0.5 by
         _draw_price_levels so it never overflows past the last bar.
         """
+        order_type_u = str(order_type or 'LIMIT').upper()
+        if order_type_u != 'MARKET':
+            return max(1, n - self.POSITION_MIN_WIDTH)
+
         if data is not None and entry_price > 0 and len(data) > 0:
-            # Only search the last 12 bars. A LIMIT order pending fill will
-            # not have touched entry in this window. A MARKET order that just
-            # opened will appear here. Searching further back was finding
+            # Only search the last 12 bars for MARKET orders. Searching
+            # further back was finding
             # irrelevant historical price levels and placing the tool at bar
             # 30-40 of an 80-bar chart, appearing in the middle of the screen.
             search_start = max(0, len(data) - 12)

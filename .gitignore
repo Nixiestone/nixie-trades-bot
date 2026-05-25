@@ -55,6 +55,8 @@ mt5_worker.log
 *.db
 *.sqlite
 *.sqlite3
+create_tables.sql
+
 
 # ==================== ML MODELS ====================
 models/*.h5

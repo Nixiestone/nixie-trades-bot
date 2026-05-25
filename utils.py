@@ -451,7 +451,13 @@ def format_setup_message(
         'LIMIT':  'LIMIT ORDER - waits for pullback to entry',
         'STOP':   'STOP ORDER - breakout entry',
     }.get(order_type, order_type)
-    tier_label = 'UNICORN SETUP' if 'UNICORN' in setup_type.upper() or 'PREMIUM' in setup_type.upper() else 'STANDARD SETUP'
+    setup_upper = setup_type.upper()
+    if 'SNIPER' in setup_upper:
+        tier_label = 'SNIPER SETUP'
+    elif 'UNICORN' in setup_upper or 'PREMIUM' in setup_upper:
+        tier_label = 'UNICORN SETUP'
+    else:
+        tier_label = 'STANDARD SETUP'
 
     fp = format_price
     lines = [

@@ -57,7 +57,7 @@ MAGIC_NUMBER = 234567    # Unique identifier for all orders placed by this bot
 
 DEFAULT_RISK_PERCENT  = 1.0
 MIN_RISK_PERCENT      = 0.1
-MAX_RISK_PERCENT      = 5.0
+MAX_RISK_PERCENT      = 50.0
 MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios

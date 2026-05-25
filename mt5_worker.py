@@ -5,7 +5,7 @@ import time
 import hmac
 import hashlib
 import contextlib
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
 from functools import wraps
@@ -520,6 +520,127 @@ def _normalise_symbol(base_symbol: str) -> Optional[str]:
 
 # ==================== LOT SIZE CALCULATION ====================
 
+def _get_pip_size_from_symbol_info(symbol: str, symbol_info) -> float:
+    """Return the bot's display pip size for a broker symbol."""
+    symbol_upper = (symbol or '').upper()
+    point = float(getattr(symbol_info, 'point', 0) or 0)
+    if point <= 0:
+        point = 0.00001
+
+    if 'XAU' in symbol_upper or 'GOLD' in symbol_upper:
+        return point * 100
+    if 'XAG' in symbol_upper or 'SILVER' in symbol_upper:
+        return point * 10
+    if 'BTC' in symbol_upper:
+        return point * 100
+    if 'ETH' in symbol_upper:
+        return point * 10
+    return point * 10
+
+
+def _deal_total_pnl(deal) -> float:
+    """Return realized account-currency P&L including common broker charges."""
+    return float(getattr(deal, 'profit', 0.0) or 0.0) + float(
+        getattr(deal, 'swap', 0.0) or 0.0
+    ) + float(getattr(deal, 'commission', 0.0) or 0.0) + float(
+        getattr(deal, 'fee', 0.0) or 0.0
+    )
+
+
+def _weighted_price(deals: List[Any]) -> float:
+    total_volume = sum(float(getattr(d, 'volume', 0.0) or 0.0) for d in deals)
+    if total_volume <= 0:
+        return float(getattr(deals[-1], 'price', 0.0) or 0.0) if deals else 0.0
+    return sum(
+        float(getattr(d, 'price', 0.0) or 0.0)
+        * float(getattr(d, 'volume', 0.0) or 0.0)
+        for d in deals
+    ) / total_volume
+
+
+def _int_attr(obj, name: str, default: int = -1) -> int:
+    value = getattr(obj, name, default)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _closed_trade_summary(ticket: int, history) -> Optional[dict]:
+    """Build close-price, pips, and realized P&L from MT5 deal history."""
+    if not history:
+        return None
+
+    related = [
+        d for d in history
+        if _int_attr(d, 'position_id', 0) == ticket
+        or _int_attr(d, 'order', 0) == ticket
+    ]
+    if not related:
+        return None
+
+    related.sort(key=lambda d: _int_attr(d, 'time', 0))
+
+    entry_in = getattr(mt5, 'DEAL_ENTRY_IN', 0)
+    entry_inout = getattr(mt5, 'DEAL_ENTRY_INOUT', 2)
+    entry_out = getattr(mt5, 'DEAL_ENTRY_OUT', 1)
+    entry_out_by = getattr(mt5, 'DEAL_ENTRY_OUT_BY', 3)
+
+    open_deals = [
+        d for d in related
+        if _int_attr(d, 'entry') in (entry_in, entry_inout)
+    ]
+    close_deals = [
+        d for d in related
+        if _int_attr(d, 'entry') in (entry_out, entry_inout, entry_out_by)
+    ]
+    if not close_deals:
+        close_deals = [d for d in related if abs(_deal_total_pnl(d)) > 0]
+    if not close_deals:
+        return None
+
+    entry_price = _weighted_price(open_deals) if open_deals else float(
+        getattr(related[0], 'price', 0.0) or 0.0
+    )
+    close_price = _weighted_price(close_deals)
+
+    direction = ''
+    if open_deals:
+        open_type = _int_attr(open_deals[0], 'type')
+        if open_type == getattr(mt5, 'DEAL_TYPE_BUY', 0):
+            direction = 'BUY'
+        elif open_type == getattr(mt5, 'DEAL_TYPE_SELL', 1):
+            direction = 'SELL'
+
+    symbol = getattr(close_deals[-1], 'symbol', '') or getattr(related[-1], 'symbol', '')
+    symbol_info = mt5.symbol_info(symbol) if symbol else None
+    pip_size = _get_pip_size_from_symbol_info(symbol, symbol_info) if symbol_info else 0.0001
+    if pip_size <= 0:
+        pip_size = 0.0001
+
+    realized_pnl = sum(_deal_total_pnl(d) for d in related)
+    if direction == 'BUY':
+        profit_pips = (close_price - entry_price) / pip_size
+    elif direction == 'SELL':
+        profit_pips = (entry_price - close_price) / pip_size
+    else:
+        raw_pips = abs(close_price - entry_price) / pip_size
+        profit_pips = raw_pips if realized_pnl >= 0 else -raw_pips
+
+    closed_at = datetime.fromtimestamp(
+        _int_attr(close_deals[-1], 'time', 0),
+        tz=timezone.utc,
+    ).isoformat()
+
+    return {
+        'close_price':  round(close_price, 5),
+        'profit_pips':  round(profit_pips, 1),
+        'realized_pnl': round(realized_pnl, 2),
+        'closed_at':    closed_at,
+    }
+
 def _calculate_lot_size(
     symbol: str,
     risk_percent: float,
@@ -562,29 +683,7 @@ def _calculate_lot_size(
     if tick_size == 0 or point == 0:
         return lot_min
 
-    # Pip size definition varies by instrument class.
-    # Standard FX pairs (e.g. EURUSD): point=0.00001, pip=0.0001 (10 points).
-    # JPY pairs (e.g. USDJPY):          point=0.001,   pip=0.01   (10 points).
-    # Gold (XAUUSD):                     point=0.01,    pip=1.00   (100 points).
-    # Silver (XAGUSD):                   point=0.001,   pip=0.01   (10 points).
-    # Index CFDs and Crypto may differ; fall back to 10 points as a safe default.
-    symbol_upper = symbol.upper()
-    if 'XAU' in symbol_upper or 'GOLD' in symbol_upper:
-        # Gold: point = 0.01; pip = $1.00 = point * 100
-        # Consistent with config.PIP_SIZES['XAUUSD'] = 1.0
-        pip_size = point * 100
-    elif 'XAG' in symbol_upper or 'SILVER' in symbol_upper:
-        # Silver: point = 0.001; pip = $0.01 = point * 10
-        pip_size = point * 10
-    elif 'BTC' in symbol_upper:
-        # Bitcoin: point = 0.01; pip = $1.00 = point * 100
-        pip_size = point * 100
-    elif 'ETH' in symbol_upper:
-        # Ethereum: point = 0.01; pip = $0.10 = point * 10
-        pip_size = point * 10
-    else:
-        # Standard FX: point = 0.00001; pip = 0.0001 = point * 10
-        pip_size = point * 10
+    pip_size = _get_pip_size_from_symbol_info(symbol, symbol_info)
 
     # price_distance in price units
     price_distance = sl_pips * pip_size
@@ -1627,61 +1726,14 @@ def ticket_status(ticket: int):
         from_date = datetime.now(timezone.utc) - timedelta(days=90)
         history   = mt5.history_deals_get(from_date, datetime.now(timezone.utc))
 
-        if history:
-            for deal in history:
-                if deal.order == ticket or deal.position_id == ticket:
-                    # Calculate pip size using the same instrument-aware
-                    # logic as _calculate_lot_size to ensure consistency.
-                    symbol_upper = deal.symbol.upper() if deal.symbol else ''
-                    symbol_info  = mt5.symbol_info(deal.symbol) if deal.symbol else None
-                    point        = symbol_info.point if symbol_info else 0.00001
-
-                    if 'XAU' in symbol_upper:
-                        pip_size = point * 100
-                    elif symbol_upper.endswith('JPY'):
-                        pip_size = point * 10
-                    else:
-                        pip_size = point * 10
-
-                    if pip_size <= 0:
-                        pip_size = 0.0001
-
-                    # Convert account currency profit to pips using the
-                    # symbol's tick value so the result is instrument-agnostic.
-                    # Fallback: use the sign of deal.profit with a magnitude
-                    # of 0.0 so the reconciliation outcome (WIN/LOSS) is always
-                    # correct even if the pip count cannot be determined.
-                    try:
-                        if (symbol_info is not None
-                                and symbol_info.trade_tick_value > 0
-                                and deal.volume > 0):
-                            profit_pips = round(
-                                deal.profit
-                                / (symbol_info.trade_tick_value
-                                   * (symbol_info.trade_tick_size / pip_size)
-                                   * deal.volume),
-                                1
-                            )
-                        else:
-                            # Cannot calculate — preserve sign for outcome,
-                            # use 0.0 magnitude to avoid misleading statistics.
-                            profit_pips = 1.0 if deal.profit > 0 else (-1.0 if deal.profit < 0 else 0.0)
-                    except Exception:
-                        profit_pips = 1.0 if deal.profit > 0 else (-1.0 if deal.profit < 0 else 0.0)
-
-                    closed_at = datetime.fromtimestamp(
-                        deal.time, tz=timezone.utc
-                    ).isoformat()
-
-                    return jsonify({
-                        'success':      True,
-                        'status':       'CLOSED',
-                        'ticket':       ticket,
-                        'close_price':  round(deal.price, 5),
-                        'profit_pips':  profit_pips,
-                        'realized_pnl': round(float(deal.profit), 2),
-                        'closed_at':    closed_at,
-                    })
+        summary = _closed_trade_summary(ticket, history)
+        if summary is not None:
+            return jsonify({
+                'success': True,
+                'status':  'CLOSED',
+                'ticket':  ticket,
+                **summary,
+            })
 
         # 4. Not found anywhere
         return jsonify({'success': True, 'status': 'NOT_FOUND', 'ticket': ticket})

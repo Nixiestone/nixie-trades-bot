@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS telegram_users (
 
     -- Risk management
     risk_percent                NUMERIC(4,2)    NOT NULL DEFAULT 1.0
-                                                CHECK (risk_percent >= 0.1 AND risk_percent <= 5.0),
+                                                CHECK (risk_percent >= 0.1 AND risk_percent <= 50.0),
 
     -- Autonomous position management
     -- When TRUE, the bot automatically manages TP1 partial close and breakeven
@@ -492,6 +492,17 @@ $$;
 
 ALTER TABLE telegram_users
     ADD COLUMN IF NOT EXISTS metaapi_account_id TEXT;
+
+-- ==================== RISK PERCENT CAP MIGRATION ====================
+-- Existing databases created with the old 5% cap keep that CHECK constraint
+-- until it is explicitly replaced. This block is safe to rerun.
+
+ALTER TABLE telegram_users
+    DROP CONSTRAINT IF EXISTS telegram_users_risk_percent_check;
+
+ALTER TABLE telegram_users
+    ADD CONSTRAINT telegram_users_risk_percent_check
+    CHECK (risk_percent >= 0.1 AND risk_percent <= 50.0);
 
 -- ==================== SUBSCRIPTION TIER ====================
 -- Stores which payment plan the user is on.

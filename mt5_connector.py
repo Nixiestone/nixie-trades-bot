@@ -1072,6 +1072,15 @@ class MT5Connector:
                 last_order  = history['historyOrders'][-1]
                 profit      = float(last_order.get('profit', 0) or 0)
                 close_price = float(last_order.get('currentPrice', 0) or 0)
+                profit_pips = (
+                    last_order.get('profitPips')
+                    or last_order.get('pips')
+                    or last_order.get('profitInPips')
+                )
+                try:
+                    profit_pips = float(profit_pips) if profit_pips is not None else 0.0
+                except (TypeError, ValueError):
+                    profit_pips = 0.0
                 done_time   = last_order.get('doneTime') or last_order.get('time')
                 if isinstance(done_time, datetime):
                     closed_at = done_time.astimezone(timezone.utc).isoformat()
@@ -1083,7 +1092,7 @@ class MT5Connector:
                     'status':       'CLOSED',
                     'ticket':       ticket,
                     'close_price':  close_price,
-                    'profit_pips':  profit,
+                    'profit_pips':  profit_pips,
                     'realized_pnl': profit,
                     'closed_at':    closed_at,
                 }
