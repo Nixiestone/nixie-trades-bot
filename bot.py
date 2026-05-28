@@ -472,6 +472,7 @@ class NixTradesBot:
         app.add_handler(CommandHandler('test_news',     self.cmd_test_news))
         app.add_handler(CommandHandler('test_weekly',   self.cmd_test_weekly))
         app.add_handler(CommandHandler('test_scan',     self.cmd_test_scan))
+        app.add_handler(CommandHandler('test_chart',    self.cmd_test_chart))
         app.add_handler(CommandHandler('admin_execute_latest', self.cmd_admin_execute_latest))
         app.add_handler(CommandHandler('upgrade',       self.cmd_upgrade))
         app.add_handler(CallbackQueryHandler(
@@ -2461,6 +2462,196 @@ class NixTradesBot:
             await self._reply(update, "Market scan complete. Check your messages for any setups found.")
         else:
             await self._reply(update, "Scheduler is not running.")
+
+    async def cmd_test_chart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Admin only: generate and send a diagnostic setup chart.
+        Usage: /test_chart [SYMBOL] [M15|M5]
+        With no symbol, uses the latest saved signal across all pairs.
+        """
+        telegram_id = update.effective_user.id
+        if telegram_id not in config.ADMIN_USER_IDS:
+            await self._reply(update, "This command is for administrators only.")
+            return
+
+        args = [str(a).upper() for a in (getattr(context, 'args', []) or [])]
+        symbol_filter = None
+        timeframe = 'M15'
+        if args:
+            if args[0] in ('M5', 'M15'):
+                timeframe = args[0]
+            else:
+                symbol_filter = args[0]
+                if len(args) > 1:
+                    timeframe = args[1]
+        if timeframe not in ('M5', 'M15'):
+            await self._reply(update, "Usage: /test_chart [SYMBOL] [M15|M5]")
+            return
+
+        symbol = symbol_filter or 'latest signal'
+        try:
+            signal = db.get_latest_signal(symbol_filter)
+            symbol = (
+                str(signal.get('symbol')).upper()
+                if signal and signal.get('symbol')
+                else (symbol_filter or 'EURJPY')
+            )
+
+            await self._reply(
+                update,
+                f"Testing chart generation for {symbol} {timeframe}..."
+            )
+
+            raw = await self.mt5.get_historical_data(symbol, timeframe, bars=100)
+            if not raw:
+                await self._reply(
+                    update,
+                    f"No candle data returned for {symbol} {timeframe}."
+                )
+                return
+
+            df = NixTradesScheduler._candles_to_df(raw).tail(80).copy()
+            if len(df) < 20:
+                await self._reply(
+                    update,
+                    f"Only {len(df)} valid candle(s) returned for {symbol} {timeframe}; need at least 20."
+                )
+                return
+
+            setup_data, poi = self._diagnostic_chart_payload(
+                symbol, timeframe, df, signal)
+
+            try:
+                fvgs = self.smc.detect_fair_value_gaps(df)
+            except Exception:
+                fvgs = []
+            try:
+                swings = self.smc._identify_swings(df.tail(40), lookback=2)
+            except Exception:
+                swings = []
+
+            chart_gen = _ChartGenerator()
+            loop = asyncio.get_running_loop()
+            chart_bytes = await loop.run_in_executor(
+                None,
+                lambda: chart_gen.generate_setup_chart(
+                    data=df,
+                    setup_data=setup_data,
+                    poi=poi,
+                    refined_pois=[],
+                    additional_pois=[],
+                    fvgs=fvgs,
+                    bos_events=[],
+                    swing_levels=swings,
+                    htf_swing_high=float(df['high'].max()),
+                    htf_swing_low=float(df['low'].min()),
+                )
+            )
+
+            if not chart_bytes:
+                await self._reply(
+                    update,
+                    f"Chart generator returned no image for {symbol} {timeframe}."
+                )
+                return
+
+            from telegram import InputFile as _InputFile
+            await update.effective_message.reply_photo(
+                photo=_InputFile(
+                    io.BytesIO(chart_bytes),
+                    filename=f'test_chart_{symbol}_{timeframe}.png',
+                ),
+                caption=(
+                    f"Diagnostic chart OK: {symbol} {timeframe}\n"
+                    f"Candles: {len(df)} | Image: {len(chart_bytes) // 1024} KB\n"
+                    f"Signal source: {'latest saved signal' if signal else 'synthetic levels'}"
+                ),
+            )
+        except Exception as e:
+            self.logger.error("Error in /test_chart: %s", e, exc_info=True)
+            await self._reply(
+                update,
+                f"Chart test failed for {symbol} {timeframe}: {e}"
+            )
+
+    @staticmethod
+    def _diagnostic_chart_payload(
+        symbol: str,
+        timeframe: str,
+        df,
+        signal: Optional[dict],
+    ) -> tuple[dict, dict]:
+        """Build a minimal setup payload for admin chart diagnostics."""
+        last_close = float(df.iloc[-1]['close'])
+        pip_size = utils.get_pip_value(symbol) or 0.0001
+
+        if signal:
+            direction = str(signal.get('direction', 'BUY')).upper()
+            entry = float(signal.get('entry_price') or last_close)
+            stop_loss = float(
+                signal.get('stop_loss')
+                or (entry - 20 * pip_size if direction == 'BUY' else entry + 20 * pip_size)
+            )
+            tp1 = float(
+                signal.get('take_profit_1')
+                or (entry + 30 * pip_size if direction == 'BUY' else entry - 30 * pip_size)
+            )
+            tp2 = float(
+                signal.get('take_profit_2')
+                or (entry + 50 * pip_size if direction == 'BUY' else entry - 50 * pip_size)
+            )
+            setup_type = signal.get('setup_type', 'DIAGNOSTIC')
+            signal_number = signal.get('signal_number', 0)
+            ml_score = int(signal.get('ml_score') or 0)
+            order_type = signal.get('order_type', 'LIMIT')
+            expiry_hours = int(
+                signal.get('expiry_hours') or config.H1_SETUP_EXPIRY_HOURS)
+        else:
+            direction = 'BUY'
+            entry = last_close
+            stop_loss = entry - 20 * pip_size
+            tp1 = entry + 30 * pip_size
+            tp2 = entry + 50 * pip_size
+            setup_type = 'DIAGNOSTIC'
+            signal_number = 0
+            ml_score = 0
+            order_type = 'LIMIT'
+            expiry_hours = config.H1_SETUP_EXPIRY_HOURS
+
+        zone_half = max(abs(entry - stop_loss) * 0.15, 5 * pip_size)
+        poi = {
+            'type': 'OB',
+            'direction': 'BULLISH' if direction == 'BUY' else 'BEARISH',
+            'timeframe': timeframe,
+            'role': 'PRIMARY',
+            'timestamp': df.index[max(0, len(df) - 20)],
+            'high': entry + zone_half,
+            'low': entry - zone_half,
+            'index': max(0, len(df) - 20),
+        }
+        setup_data = {
+            'signal_number': signal_number,
+            'symbol': symbol,
+            'direction': direction,
+            'setup_type': setup_type,
+            'setup_label': f'DIAGNOSTIC {setup_type}',
+            'entry_price': entry,
+            'stop_loss': stop_loss,
+            'take_profit_1': tp1,
+            'take_profit_2': tp2,
+            'sl_pips': utils.calculate_pips(symbol, entry, stop_loss),
+            'tp1_pips': utils.calculate_pips(symbol, entry, tp1),
+            'tp2_pips': utils.calculate_pips(symbol, entry, tp2),
+            'rr_tp1': 0.0,
+            'rr_tp2': 0.0,
+            'ml_score': ml_score,
+            'session': utils.get_session(),
+            'order_type': order_type,
+            'timeframe': timeframe,
+            'chart_timeframe': timeframe,
+            'expiry_hours': expiry_hours,
+        }
+        return setup_data, poi
 
 
     async def send_setup_alert(

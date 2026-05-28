@@ -1423,12 +1423,9 @@ class NixTradesScheduler:
         Determine correct order type by comparing current market price to
         the calculated entry price, allowing a tiny market-fill tolerance.
 
-        For BUY:
-          - Ask <= entry + threshold: execute MARKET
-          - Ask >  entry + threshold: wait for pullback with LIMIT
-        For SELL:
-          - Bid >= entry - threshold: execute MARKET
-          - Bid <  entry - threshold: wait for rally with LIMIT
+        For BUY and SELL, execute MARKET only when the executable side
+        price is within the configured pip threshold of the entry price.
+        Otherwise keep the setup as LIMIT and wait for price to return.
 
         Falls back to LIMIT on any error to ensure the order is placed
         as a pending order rather than executing at a worse price.
@@ -1446,10 +1443,12 @@ class NixTradesScheduler:
                 * pip_size
             )
 
-            if direction == 'BUY':
-                return 'MARKET' if ask <= entry_price + market_tolerance else 'LIMIT'
-            else:
-                return 'MARKET' if bid >= entry_price - market_tolerance else 'LIMIT'
+            current = ask if direction == 'BUY' else bid
+            return (
+                'MARKET'
+                if abs(current - entry_price) <= market_tolerance
+                else 'LIMIT'
+            )
 
         except Exception as e:
             self.logger.debug(
@@ -1820,10 +1819,11 @@ class NixTradesScheduler:
                     float(getattr(config, 'MARKET_ORDER_THRESHOLD_PIPS', 2.0))
                     * pip_size
                 )
-                if direction == 'BUY':
-                    order_type = 'MARKET' if current <= entry + market_tolerance else 'LIMIT'
-                else:
-                    order_type = 'MARKET' if current >= entry - market_tolerance else 'LIMIT'
+                order_type = (
+                    'MARKET'
+                    if abs(current - entry) <= market_tolerance
+                    else 'LIMIT'
+                )
 
             expiry_minutes = int(
                 setup_data.get('expiry_hours', config.H1_SETUP_EXPIRY_HOURS)

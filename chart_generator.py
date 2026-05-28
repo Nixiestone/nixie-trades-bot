@@ -163,7 +163,9 @@ class ChartGenerator:
                                    y_min, y_max)
 
             if bos_events:
-                self._draw_bos_lines(ax, bos_events, time_index, n, x_right)
+                self._draw_bos_lines(
+                    ax, bos_events, time_index, n, x_right, _chart_tf_label,
+                    tail)
 
             # Draw secondary M15 zones (other OBs and BBs detected on the
             # same timeframe as the chart data — bar positions are accurate).
@@ -468,6 +470,8 @@ class ChartGenerator:
         time_index: list,
         n: int,
         x_right: int,
+        chart_timeframe: str = 'M15',
+        chart_data: Optional[pd.DataFrame] = None,
     ):
         """
         Draw a short horizontal line precisely at the bar where the structure
@@ -481,6 +485,8 @@ class ChartGenerator:
         _y_range         = max(ylim[1] - ylim[0], 1e-10)
         _tick_size       = _y_range * 0.012
         _label_offset    = _y_range * 0.016
+        _tf_minutes      = self._timeframe_minutes(chart_timeframe)
+        _bos_tolerance   = max(60.0, float(_tf_minutes) * 60.0 * 1.1)
 
         for bos in bos_events[:4]:
             level = float(bos.get('level', 0))
@@ -488,7 +494,11 @@ class ChartGenerator:
                 continue
             seen.add(level)
 
-            bos_bar = self._ts_to_bar_index(bos.get('timestamp'), time_index)
+            bos_bar = self._ts_to_bar_index(
+                bos.get('timestamp'),
+                time_index,
+                max_tolerance_seconds=_bos_tolerance,
+            )
             if bos_bar is None:
                 # No matching candle in the chart window for this BOS timestamp.
                 # This happens when the BOS occurred during a weekend gap or
@@ -498,6 +508,13 @@ class ChartGenerator:
             bos_bar = max(0, min(bos_bar, n - 1))
 
             direction = str(bos.get('direction', 'BULLISH')).upper()
+            bos_bar = self._resolve_bos_break_bar(
+                chart_data,
+                bos_bar,
+                level,
+                direction,
+                chart_timeframe,
+            )
 
             # Short precise horizontal line centered on the break candle.
             # 10 bars before shows the level that was holding as resistance/support.
@@ -572,6 +589,41 @@ class ChartGenerator:
                 alpha=0.92,
                 zorder=8,
             )
+
+    def _resolve_bos_break_bar(
+        self,
+        chart_data: Optional[pd.DataFrame],
+        anchor_bar: int,
+        level: float,
+        direction: str,
+        chart_timeframe: str,
+    ) -> int:
+        """
+        H1 BOS timestamps land on an H1 candle, while the rendered chart is
+        often M15. Place the marker on the first visible lower-timeframe candle
+        that actually closes through the broken level.
+        """
+        if chart_data is None or chart_data.empty:
+            return anchor_bar
+        try:
+            tf_minutes = self._timeframe_minutes(chart_timeframe)
+            search_bars = 1
+            if tf_minutes < 60:
+                search_bars = max(1, int(round(60 / max(tf_minutes, 1))) + 1)
+
+            start = max(0, min(int(anchor_bar), len(chart_data) - 1))
+            end = min(len(chart_data), start + search_bars)
+            close = chart_data['close'].astype(float)
+            is_bull = str(direction).upper() == 'BULLISH'
+
+            for i in range(start, end):
+                if is_bull and close.iloc[i] > level:
+                    return i
+                if not is_bull and close.iloc[i] < level:
+                    return i
+        except Exception:
+            pass
+        return anchor_bar
 
     # =========================================================================
     # SWING STRUCTURE LEVELS
@@ -1304,6 +1356,23 @@ class ChartGenerator:
             return None
         except Exception:
             return None
+
+    @staticmethod
+    def _timeframe_minutes(timeframe: str) -> int:
+        tf = str(timeframe or 'M15').upper().strip()
+        if tf.startswith('M'):
+            try:
+                return max(1, int(tf[1:]))
+            except Exception:
+                return 15
+        if tf.startswith('H'):
+            try:
+                return max(1, int(tf[1:]) * 60)
+            except Exception:
+                return 60
+        if tf.startswith('D'):
+            return 1440
+        return 15
 
     def _price_decimals(self, symbol: str) -> int:
         s = symbol.upper()

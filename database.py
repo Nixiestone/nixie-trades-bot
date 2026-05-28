@@ -553,16 +553,12 @@ def recent_signal_exists_by_direction(
 
 
 @_db_retry()
-def get_latest_signal() -> Optional[dict]:
-    """Return the most recently created signal."""
-    result = (
-        _client()
-        .table('signals')
-        .select('*')
-        .order('created_at', desc=True)
-        .limit(1)
-        .execute()
-    )
+def get_latest_signal(symbol: Optional[str] = None) -> Optional[dict]:
+    """Return the most recently created signal, optionally filtered by symbol."""
+    query = _client().table('signals').select('*')
+    if symbol:
+        query = query.eq('symbol', str(symbol).upper())
+    result = query.order('created_at', desc=True).limit(1).execute()
     return result.data[0] if result.data else None
 
 

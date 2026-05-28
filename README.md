@@ -107,6 +107,35 @@ pip install -r requirements.oracle.txt
 python bot.py
 ```
 
+## Telegram Commands
+
+User commands:
+
+- `/start` - create or load the user profile, show the welcome message, and send a sample chart when available
+- `/help` - show the help guide and sample chart
+- `/status` - show account, subscription, MT5, risk, and automation status
+- `/latest` - show the most recent saved setup
+- `/subscribe` - start the subscription/disclaimer flow
+- `/upgrade` - show plan upgrade and renewal options
+- `/settings` - manage risk, timezone, and position-management settings
+- `/connect_mt5` - start the guided MT5 connection flow
+- `/disconnect_mt5` - disconnect stored MT5 credentials after confirmation
+- `/download` - download trade history CSV; admins also receive setup records
+- `/unsubscribe` - cancel subscription after confirmation
+- `/cancel` - cancel the active guided flow
+
+Admin commands:
+
+- `/test_briefing` - send the daily briefing to the requesting admin immediately
+- `/test_news` - send the daily news alert to the requesting admin immediately
+- `/test_weekly` - send the weekly analysis to the requesting admin immediately
+- `/test_scan` - run a full market scan immediately
+- `/test_chart` - generate a diagnostic chart for the latest saved signal across all pairs
+- `/test_chart M5` - generate the latest-signal diagnostic chart on M5 candles
+- `/test_chart SYMBOL` - generate a diagnostic chart for the latest saved signal for that symbol
+- `/test_chart SYMBOL M15` - generate a diagnostic chart for that symbol and timeframe; supported timeframes are `M15` and `M5`
+- `/admin_execute_latest` - execute the latest saved setup on the requesting admin MT5 account
+
 ## Operational Notes
 
 - The bot expects the required services and secrets to be available before startup.

@@ -1040,12 +1040,15 @@ class SMCStrategy:
                         swing_high    = swings[i]['price']
                         full_pos      = tail_start_pos + swings[i]['index']
                         later_candles = data.iloc[full_pos:]
-                        if later_candles['close'].max() > swing_high:
+                        break_candles = later_candles[
+                            later_candles['close'] > swing_high
+                        ]
+                        if not break_candles.empty:
                             bos_events.append({
                                 'type':      'BOS',
                                 'direction': 'BULLISH',
                                 'level':     swing_high,
-                                'timestamp': later_candles['close'].idxmax(),
+                                'timestamp': break_candles.index[0],
                             })
             else:
                 for i in range(len(swings) - 1):
@@ -1053,12 +1056,15 @@ class SMCStrategy:
                         swing_low     = swings[i]['price']
                         full_pos      = tail_start_pos + swings[i]['index']
                         later_candles = data.iloc[full_pos:]
-                        if later_candles['close'].min() < swing_low:
+                        break_candles = later_candles[
+                            later_candles['close'] < swing_low
+                        ]
+                        if not break_candles.empty:
                             bos_events.append({
                                 'type':      'BOS',
                                 'direction': 'BEARISH',
                                 'level':     swing_low,
-                                'timestamp': later_candles['close'].idxmin(),
+                                'timestamp': break_candles.index[0],
                             })
 
             if len(bos_events) >= 2:
