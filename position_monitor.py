@@ -48,11 +48,12 @@ class PositionMonitor:
     Sends Telegram notifications for every event.
     """
 
-    def __init__(self, mt5_connector, database=None, telegram_bot=None):
+    def __init__(self, mt5_connector, database=None, telegram_bot=None, ml_ensemble=None):
         self.logger               = logging.getLogger(f"{__name__}.PositionMonitor")
         self.mt5                  = mt5_connector
         self.db                   = database       # database module
         self.bot                  = telegram_bot   # telegram.Bot instance
+        self.ml                   = ml_ensemble
         self.monitored_positions: Dict[int, MonitoredPosition] = {}
         self.running              = False
         self.monitor_thread: Optional[threading.Thread] = None
@@ -1009,7 +1010,14 @@ class PositionMonitor:
                         ticket=position.ticket,
                         features=position.ml_features,
                         outcome=1.0 if outcome == 'WIN' else 0.0,
+                        symbol=position.symbol,
                     )
+                    if self.ml is not None:
+                        self.ml.record_trade_outcome(
+                            position.ml_features,
+                            won=(outcome == 'WIN'),
+                            symbol=position.symbol,
+                        )
                     self.logger.info(
                         "ML training data saved for ticket %d (outcome: %s).",
                         position.ticket, outcome,

@@ -1,181 +1,54 @@
-# Nixie Trades Bot
+# Nixie Trades
 
-**Private and Confidential**
+Nixie Trades is an algorithmic trading operations platform that turns institutional-style market analysis into disciplined, automated execution and clear, plain-language alerts. It monitors instruments in real time, scores high-probability setups with a Smart Money Concepts (SMC) engine and machine-learning models, manages trades end to end, and delivers everything to users over Telegram.
 
-This repository contains internal trading automation software owned by Nixie Trades. It is for authorised use only. Do not distribute this codebase, documentation, credentials, screenshots, logs, or derived materials outside the approved team.
+> **Note:** A distributed, Kubernetes-based infrastructure layer (k3s + Kafka event streaming with in-cluster observability) is currently being built on top of this core. See the [Roadmap](#roadmap).
 
-## Overview
+---
 
-Nixie Trades Bot is a private Telegram-based trading operations system. At a high level, it:
+## What it does
 
-- monitors configured instruments
-- generates chart-based trade setups
-- sends Telegram alerts
-- supports MT5 account connectivity and assisted execution
-- manages trade lifecycle events and user notifications
-- stores operational state in the project database
-- trains and loads internal ML models used for setup scoring
+- Real-time monitoring of configured instruments
+- Setup detection via an SMC market-structure engine
+- Machine-learning setup scoring (training and inference)
+- Automated chart generation for alerts
+- MetaTrader 5 connectivity and assisted execution
+- Trade lifecycle management and user notifications
+- Subscription and payment handling
 
-This README is intentionally brief. It does not document proprietary strategy logic, internal decision rules, infrastructure topology, or deployment architecture in detail.
+## Architecture (high level)
 
-## Repository Structure
+| Component | Responsibility |
+|---|---|
+| `bot.py` | Telegram application entrypoint |
+| `scheduler.py` | Recurring scans, alerts, and scheduled jobs |
+| `smc_strategy.py` | Market-structure and setup logic |
+| `ml_models.py` / `train_models.py` | Model training, loading, and scoring |
+| `position_monitor.py` | Live trade and position management |
+| `mt5_connector.py` / `mt5_worker.py` | MT5 execution layer |
+| `database.py` | Encrypted credential storage and data access |
+| `payment_handler.py` | Subscription and payment flows |
 
-Main files:
+## Tech stack
 
-- `bot.py` - Telegram application entrypoint
-- `scheduler.py` - recurring scans, alerts, and scheduled jobs
-- `smc_strategy.py` - internal market structure and setup logic
-- `ml_models.py` - ML training, loading, and scoring
-- `position_monitor.py` - live trade and position management
-- `mt5_connector.py` - MT5 / worker / execution connectivity layer
-- `mt5_worker.py` - local MT5 worker service
-- `database.py` - encrypted credential storage and database access
-- `chart_generator.py` - chart rendering for alerts and sample images
-- `train_models.py` - historical model training entrypoint
-- `config.py` - project configuration
-- `create_tables.sql` - database schema bootstrap
+Python 3.11+ · MetaTrader 5 · scikit-learn (ML) · PostgreSQL (Supabase) · Telegram Bot API · Oracle Cloud (deployment)
 
-## Requirements
+## Roadmap
 
-Minimum local requirements:
+- [ ] **Distributed infrastructure** — a four-node k3s Kubernetes cluster with Kafka (Strimzi) event streaming and in-cluster observability (Prometheus / Grafana)
+- [ ] **Infrastructure as Code** — full provisioning with OpenTofu / Terraform
+- [ ] **CI/CD** — automated build, test, and deploy pipeline
 
-- Python 3.11+
-- a valid `.env` file
-- database access
-- Telegram bot token
-- MT5 worker access for MT5-backed flows
-
-Depending on how the environment is configured, some deployments may also use an external execution provider. That setup is intentionally not described here.
-
-Deployment-specific requirements files:
-
-- `requirements.oracle.txt` for the Oracle/Linux bot host
-- `requirements.mt5-worker.txt` for the separate Windows MT5 worker fallback
-
-## Environment
-
-Create a `.env` file with the required project secrets and connection settings.
-
-Common variables used by this project:
-
-- `TELEGRAM_BOT_TOKEN`
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-- `ENCRYPTION_KEY`
-- `ADMIN_USER_IDS`
-- `MT5_WORKER_URL`
-- `MT5_WORKER_API_KEY`
-- `METAAPI_TOKEN`
-- `NEWS_API_KEY`
-- `LOG_LEVEL`
-
-Notes:
-
-- keep all secrets out of source control
-- keep the encryption key backed up securely
-- do not paste live credentials into issues, chats, or screenshots
-- MT5 credentials must remain encrypted at rest
-
-## Initial Setup
+## Getting started
 
 1. Create and activate a virtual environment.
-2. Install dependencies with the requirements file for your target environment.
-3. Configure the `.env` file.
-4. Initialise the database schema with `create_tables.sql` if required.
-5. Start the MT5 worker if your environment uses worker-based MT5 access.
-6. Run model training if you need to refresh local models.
+2. Install dependencies — `requirements.oracle.txt` for the bot host, `requirements.mt5-worker.txt` for the MT5 worker.
+3. Copy `.env.example` to `.env` and fill in your configuration.
+4. Initialise the database schema (`create_tables.sql`).
+5. Start the MT5 worker (if used), then run `python bot.py`.
 
-## Run Commands
+All required configuration variables are listed in `.env.example`. **Secrets are never committed** — credentials are encrypted at rest and kept out of version control.
 
-Start the MT5 worker:
+## Status & license
 
-```powershell
-pip install -r requirements.mt5-worker.txt
-python mt5_worker.py
-```
-
-Train models:
-
-```powershell
-python train_models.py
-```
-
-Start the bot:
-
-```powershell
-pip install -r requirements.oracle.txt
-python bot.py
-```
-
-## Telegram Commands
-
-User commands:
-
-- `/start` - create or load the user profile, show the welcome message, and send a sample chart when available
-- `/help` - show the help guide and sample chart
-- `/status` - show account, subscription, MT5, risk, and automation status
-- `/latest` - show the most recent saved setup
-- `/subscribe` - start the subscription/disclaimer flow
-- `/upgrade` - show plan upgrade and renewal options
-- `/settings` - manage risk, timezone, and position-management settings
-- `/connect_mt5` - start the guided MT5 connection flow
-- `/disconnect_mt5` - disconnect stored MT5 credentials after confirmation
-- `/download` - download trade history CSV; admins also receive setup records
-- `/unsubscribe` - cancel subscription after confirmation
-- `/cancel` - cancel the active guided flow
-
-Admin commands:
-
-- `/test_briefing` - send the daily briefing to the requesting admin immediately
-- `/test_news` - send the daily news alert to the requesting admin immediately
-- `/test_weekly` - send the weekly analysis to the requesting admin immediately
-- `/test_scan` - run a full market scan immediately
-- `/test_chart` - generate a diagnostic chart for the latest saved signal across all pairs
-- `/test_chart M5` - generate the latest-signal diagnostic chart on M5 candles
-- `/test_chart SYMBOL` - generate a diagnostic chart for the latest saved signal for that symbol
-- `/test_chart SYMBOL M15` - generate a diagnostic chart for that symbol and timeframe; supported timeframes are `M15` and `M5`
-- `/admin_execute_latest` - execute the latest saved setup on the requesting admin MT5 account
-
-## Operational Notes
-
-- The bot expects the required services and secrets to be available before startup.
-- If MT5-backed features are in use, confirm the MT5 worker is healthy before running scans or training.
-- The bot and trainer read encrypted MT5 credentials from the database when needed.
-- Model files are stored locally under `models/`.
-- Logs are rotated automatically by the project logging configuration.
-
-## Security
-
-Treat the following as sensitive:
-
-- `.env`
-- database credentials
-- encryption keys
-- MT5 login details
-- API tokens
-- trade history exports
-- internal charts and signal screenshots
-
-Do not:
-
-- commit secrets
-- share internal strategy rules publicly
-- publish full operational architecture
-- expose private logs without review
-
-## Maintenance
-
-Routine tasks:
-
-- restart `mt5_worker.py` after worker-side code changes
-- restart `bot.py` after application code changes
-- rerun `train_models.py` when refreshing models
-- check logs when troubleshooting startup, database, MT5, or Telegram issues
-
-## Support
-
-For internal support, use the approved team channel and private maintainer workflow. Do not open public issues or publish operational details externally.
-
-## License / Access
-
-All rights reserved. Internal use only.
+Active development. © 2026 Nixie Trades. All rights reserved. Source published for portfolio and demonstration purposes.

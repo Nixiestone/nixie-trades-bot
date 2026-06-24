@@ -780,6 +780,7 @@ def save_trade_outcome_for_ml(
     ticket:   int,
     features: object,
     outcome:  float,
+    symbol:   Optional[str] = None,
 ) -> bool:
     """
     Store ML training data produced by a closed trade.
@@ -809,12 +810,21 @@ def save_trade_outcome_for_ml(
 
         row = {
             'mt5_ticket':    ticket,
+            'symbol':        symbol,
             'features_json': json.dumps(features_list),
             'outcome':       float(outcome),
             'created_at':    utils.get_current_utc_time().isoformat(),
         }
 
-        response = client.table('ml_training_data').insert(row).execute()
+        try:
+            response = client.table('ml_training_data').insert(row).execute()
+        except Exception as insert_err:
+            # Backward-compatible fallback for databases that have not yet run
+            # the symbol-column migration.
+            if 'symbol' not in str(insert_err).lower():
+                raise
+            row.pop('symbol', None)
+            response = client.table('ml_training_data').insert(row).execute()
         if response.data:
             logger.debug(
                 "ML training data saved: ticket=%d outcome=%.0f", ticket, outcome
@@ -827,6 +837,42 @@ def save_trade_outcome_for_ml(
             "Error saving ML training data for ticket %d: %s", ticket, e
         )
         return False
+
+
+
+def get_recent_ml_training_data(limit: int = 3000) -> List[Dict[str, Any]]:
+    """
+    Load durable live ML training examples newest-first from Supabase.
+
+    Returns rows with:
+      features_json: JSON encoded numeric feature vector
+      outcome:       1.0 = WIN, 0.0 = LOSS
+      created_at:    row timestamp
+    """
+    try:
+        client = _client()
+        try:
+            response = (
+                client.table('ml_training_data')
+                .select('symbol, features_json, outcome, created_at')
+                .order('created_at', desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+        except Exception as select_err:
+            if 'symbol' not in str(select_err).lower():
+                raise
+            response = (
+                client.table('ml_training_data')
+                .select('features_json, outcome, created_at')
+                .order('created_at', desc=True)
+                .limit(int(limit))
+                .execute()
+            )
+        return response.data or []
+    except Exception as e:
+        logger.error("Error loading ML training data: %s", e)
+        return []
 
 
 

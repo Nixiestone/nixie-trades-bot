@@ -329,6 +329,7 @@ class NixTradesBot:
             mt5_connector=self.mt5,
             database=db,
             telegram_bot=application.bot,
+            ml_ensemble=self.ml,
         )
         self.position_monitor.start()
 

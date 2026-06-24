@@ -61,10 +61,10 @@ MAX_RISK_PERCENT      = 50.0
 MAX_DAILY_LOSS_PERCENT = 5.0   # Stop auto-execution if daily loss exceeds this
 
 # Risk-Reward ratios
-# These are the live targets used by the bot and by historical labeling.
-MIN_RR_RATIO   = 1.0   
-MIN_RR_TP2     = 1.5   
-MIN_SETUP_QUALITY_SCORE = 55   # Setups scoring below this are rejected by _check_filters
+# The live high-R model is built around fixed 3R/5R targets.
+MIN_RR_RATIO   = 3.0
+MIN_RR_TP2     = 5.0
+MIN_SETUP_QUALITY_SCORE = 70   # Setups scoring below this are rejected by _check_filters
 
 # Legacy caps retained for backward compatibility with older code paths.
 MAX_RR_TP1 = 5.0
@@ -87,11 +87,18 @@ H1_SETUP_EXPIRY_BARS_M15     = H1_SETUP_EXPIRY_HOURS * 4
 
 # ==================== MONITORED SYMBOLS ====================
 
-MONITORED_SYMBOLS = [
+# High-R trend model universe.
+#
+# Research basis:
+# - majors keep execution cost/slippage lower;
+# - GBPJPY/EURJPY add enough directional range for 3R/5R targets;
+# - XAUUSD/BTCUSD are included only with separate stop caps and ML instrument flags.
+HIGH_RR_TRADING_PAIRS = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD',
-    'NZDUSD', 'USDCHF', 'EURGBP', 'EURJPY', 'GBPJPY',
-    'XAUUSD', 'XAGUSD', 'BTCUSD'
+    'EURJPY', 'GBPJPY', 'XAUUSD', 'BTCUSD'
 ]
+
+MONITORED_SYMBOLS = HIGH_RR_TRADING_PAIRS
 
 CURRENCY_PAIRS = MONITORED_SYMBOLS
 
@@ -136,12 +143,12 @@ ML_SEQUENCE_LENGTH    = 100
 ML_RETRAINING_INTERVAL = 100
 
 # Tier thresholds: consensus_score decides which setups get sent
-ML_TIER_PREMIUM        = 70   # 70%+ = Unicorn / Premium tier, can auto-execute
-ML_TIER_STANDARD       = 50   # 60-69% = Standard tier, sent to subscribers
-ML_TIER_DISCRETIONARY  = 45  # 55-59% = Discretionary (optional, lower confidence)
+ML_TIER_PREMIUM        = 75   # 75%+ = Unicorn / Premium tier
+ML_TIER_STANDARD       = 62   # 62-74% = Standard tier, sent to subscribers
+ML_TIER_DISCRETIONARY  = 58   # 58-61% = Discretionary, not auto-execute preferred
 
 # Auto-execution threshold: only execute trades when ML agrees this strongly
-ML_AUTO_EXECUTE_THRESHOLD = 50
+ML_AUTO_EXECUTE_THRESHOLD = 65
 
 # Training sample density:
 # Labels run for the full 12-hour H1 setup lifetime (48 M15 bars). We sample
@@ -151,7 +158,18 @@ TRAINING_WINDOW_STEP_M15 = 4
 
 # ==================== RISK MANAGEMENT ====================
 
-MAX_RISK_PIPS        = 50
+MAX_RISK_PIPS        = 45
+MAX_STOP_PIPS_BY_SYMBOL = {
+    'EURUSD': 28,
+    'GBPUSD': 35,
+    'USDJPY': 32,
+    'AUDUSD': 28,
+    'USDCAD': 32,
+    'EURJPY': 42,
+    'GBPJPY': 55,
+    'XAUUSD': 40,
+    'BTCUSD': 900,
+}
 MIN_LOT_SIZE          = 0.01
 MAX_LOT_SIZE          = 10.0
 MIN_LOT_FOR_PARTIAL   = 0.02   # Minimum lot that allows a 50% partial close without sub-minimum remainder
@@ -198,8 +216,35 @@ INDUCEMENT_BODY_CLOSE_RATIO    = 0.6    # Candle body must be at least 60% of to
 
 # ATR filter parameters
 ATR_PERIOD    = 14
-ATR_MIN_RATIO = 0.7    # Setup rejected if ATR is below 70% of average
-ATR_MAX_RATIO = 2.0    # Setup rejected if ATR is above 200% of average (too volatile)
+ATR_MIN_RATIO = 0.8    # Setup rejected if ATR is below 80% of average
+ATR_MAX_RATIO = 1.8    # Setup rejected if ATR is above 180% of average (too volatile)
+
+# High-R trend continuation filters. These intentionally reduce signal count.
+HIGH_RR_BOS_ONLY                = True
+HIGH_RR_REQUIRE_H4_ALIGNMENT    = True
+HIGH_RR_MIN_D1_CONFIDENCE       = 60
+HIGH_RR_MIN_ADX                 = 25.0
+HIGH_RR_REQUIRE_PREMIUM_DISCOUNT = True
+
+# Adaptive ML settings. The bot stores every concluded WIN/LOSS feature vector,
+# reloads that history after restart, and retrains automatically when enough
+# new outcomes are available.
+ML_LIVE_HISTORY_LIMIT      = 3000
+ML_MIN_RETRAIN_SAMPLES     = 200
+ML_AUTO_RETRAIN_OUTCOMES   = 50
+ML_MODEL_VERSION           = 3
+
+# Transfer-learning guardrails:
+# - global model learns the broad strategy edge across every pair;
+# - pair models fine-tune from the global XGBoost booster only when enough
+#   symbol-specific outcomes exist;
+# - promotion is blocked if validation quality is weak or data is one-sided.
+ML_AUTO_TRAIN_INTERVAL_HOURS      = 24
+ML_PAIR_MIN_RETRAIN_SAMPLES       = 80
+ML_PAIR_MIN_NEW_OUTCOMES          = 20
+ML_PAIR_MIN_CLASS_FRACTION        = 0.20
+ML_PAIR_MIN_VALIDATION_AUC        = 0.52
+ML_PAIR_MODEL_WEIGHT              = 0.45
 
 # Confirmation candle requirements (for entry confirmation)
 CONFIRMATION_BODY_RATIO = 0.6   # Body must be at least 60% of candle range

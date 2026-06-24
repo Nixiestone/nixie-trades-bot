@@ -1,8 +1,10 @@
 import logging
 import os
 import pickle
+import json
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from sklearn.preprocessing import StandardScaler
@@ -18,11 +20,14 @@ _XGB_PATH    = os.path.join(_MODEL_DIR, 'xgboost_model.pkl')
 _SCALER_PATH = os.path.join(_MODEL_DIR, 'scaler.pkl')
 _RF_PATH     = os.path.join(_MODEL_DIR, 'rf_model.pkl')
 _META_PATH   = os.path.join(_MODEL_DIR, 'training_metadata.pkl')
-_FEATURE_DIM = 22
+_PAIR_MODEL_PREFIX = 'pair_xgboost_'
+_PAIR_META_PREFIX  = 'pair_metadata_'
+_FEATURE_DIM = 28
 
 # Only train on setups scoring >= this value. Weak setups dilute training and
 # amplify the class imbalance problem on historical labels.
-TRAINING_MIN_QUALITY_SCORE = 35
+TRAINING_MIN_QUALITY_SCORE = int(
+    getattr(config, 'MIN_SETUP_QUALITY_SCORE', 70))
 
 
 class MLEnsemble:
@@ -37,6 +42,8 @@ class MLEnsemble:
         self.mt5            = mt5_connector
         self.xgboost_model  = None
         self.rf_model       = None
+        self.pair_models: Dict[str, object] = {}
+        self.pair_metadata: Dict[str, Dict] = {}
         self.scaler         = StandardScaler()
         self.models_trained = False
         self.training_metadata: Dict = {}
@@ -44,11 +51,13 @@ class MLEnsemble:
         # Lazy-load SMC strategy to avoid circular import at module level
         self._smc = None
 
-        # Live outcome accumulator for auto-retrain every 100 trades
+        # Live outcome accumulator for adaptive auto-retraining.
         self.setups_since_training: int  = 0
-        self.training_threshold:    int  = 100
-        self.training_data_history: List[Tuple[np.ndarray, float]] = []
-        self.max_history_size:      int  = 2000
+        self.training_threshold:    int  = int(
+            getattr(config, 'ML_AUTO_RETRAIN_OUTCOMES', 25))
+        self.training_data_history: List[Tuple[np.ndarray, float, str]] = []
+        self.max_history_size:      int  = int(
+            getattr(config, 'ML_LIVE_HISTORY_LIMIT', 3000))
 
         os.makedirs(_MODEL_DIR, exist_ok=True)
         self._load_from_disk()
@@ -69,6 +78,20 @@ class MLEnsemble:
 
     # ==================== DISK PERSISTENCE ====================
 
+    @staticmethod
+    def _normalise_symbol(symbol: Optional[str]) -> str:
+        return str(symbol or 'GLOBAL').upper().replace('/', '').replace('\\', '')
+
+    @staticmethod
+    def _pair_model_path(symbol: str) -> str:
+        safe = MLEnsemble._normalise_symbol(symbol)
+        return os.path.join(_MODEL_DIR, f"{_PAIR_MODEL_PREFIX}{safe}.pkl")
+
+    @staticmethod
+    def _pair_meta_path(symbol: str) -> str:
+        safe = MLEnsemble._normalise_symbol(symbol)
+        return os.path.join(_MODEL_DIR, f"{_PAIR_META_PREFIX}{safe}.pkl")
+
     def _load_from_disk(self) -> bool:
         try:
             if not all(os.path.exists(p) for p in [_XGB_PATH, _SCALER_PATH]):
@@ -86,7 +109,27 @@ class MLEnsemble:
                     "RF model file not found. Ensemble will use XGBoost only.")
             if os.path.exists(_META_PATH):
                 with open(_META_PATH, 'rb') as f: self.training_metadata = pickle.load(f)
+            model_version = int(self.training_metadata.get('model_version', 0) or 0)
+            feature_dim = int(self.training_metadata.get('feature_dim', 0) or 0)
+            scaler_dim = int(getattr(self.scaler, 'n_features_in_', 0) or 0)
+            expected_version = int(getattr(config, 'ML_MODEL_VERSION', 2))
+            if (
+                model_version != expected_version
+                or feature_dim != _FEATURE_DIM
+                or scaler_dim != _FEATURE_DIM
+            ):
+                self.logger.warning(
+                    "Ignoring stale ML artifacts: version=%s feature_dim=%s "
+                    "scaler_dim=%s expected version=%s feature_dim=%s.",
+                    model_version, feature_dim, scaler_dim,
+                    expected_version, _FEATURE_DIM,
+                )
+                self.xgboost_model = None
+                self.rf_model = None
+                self.models_trained = False
+                return False
             self.models_trained = True
+            self._load_pair_models()
             self.logger.info(
                 "Trained models loaded. Samples: %s. XGBoost accuracy: %s. "
                 "RF loaded: %s.",
@@ -210,6 +253,7 @@ class MLEnsemble:
 
         all_features: List[np.ndarray] = []
         all_labels:   List[float]      = []
+        per_symbol_samples: Dict[str, List[Tuple[np.ndarray, float]]] = defaultdict(list)
 
         for symbol in symbols:
             self.logger.info("Fetching data for %s ...", symbol)
@@ -235,6 +279,8 @@ class MLEnsemble:
                     symbol, len(feats), len(m15_raw))
                 all_features.extend(feats)
                 all_labels.extend(labels)
+                for f, l in zip(feats, labels):
+                    per_symbol_samples[self._normalise_symbol(symbol)].append((f, l))
 
             except Exception as e:
                 self.logger.error("Error processing %s: %s", symbol, e)
@@ -256,7 +302,8 @@ class MLEnsemble:
         if success:
             seed_n = min(len(all_features), self.max_history_size // 2)
             for f, l in zip(all_features[-seed_n:], all_labels[-seed_n:]):
-                self.training_data_history.append((f, l))
+                self.training_data_history.append((f, l, 'HISTORICAL'))
+            self._train_pair_models_from_samples(per_symbol_samples, force=True)
         return success
 
     def _generate_training_samples(
@@ -272,7 +319,7 @@ class MLEnsemble:
           1. Determine D1 trend context
           2. Detect BOS/MSS on H1
           3. Identify the POI (Order Block or Breaker Block)
-          4. Extract the live 22-element feature vector
+          4. Extract the live 28-element feature vector
           5. Label the managed trade outcome across the live expiry window
 
         Inconclusive windows (no fill, or neither TP1 nor SL reached after fill)
@@ -349,6 +396,11 @@ class MLEnsemble:
                 if htf_trend.get('trend') == 'RANGING':
                     _cnt_ranging += 1
                     continue
+                if int(htf_trend.get('confidence', 0)) < int(
+                    getattr(config, 'HIGH_RR_MIN_D1_CONFIDENCE', 60)
+                ):
+                    _cnt_no_ctx += 1
+                    continue
 
                 direction  = htf_trend['trend']  # 'BULLISH' or 'BEARISH'
                 smc_dir    = direction            # alias for clarity
@@ -409,6 +461,9 @@ class MLEnsemble:
                 if poi is None or setup_type is None:
                     _cnt_no_poi += 1
                     continue
+                if getattr(config, 'HIGH_RR_BOS_ONLY', True) and setup_type != 'BOS':
+                    _cnt_no_poi += 1
+                    continue
 
                 # Reject mitigated POIs — live scanner never trades them.
                 if self.smc.is_poi_mitigated(poi, h1_ctx):
@@ -418,6 +473,7 @@ class MLEnsemble:
                 h1_poi = dict(poi)
                 h1_poi['timeframe'] = 'H1'
                 h1_poi['role'] = 'PRIMARY'
+                h1_poi['symbol'] = symbol
 
                 # --- Phase 3: Entry/SL via real SMC ---
                 try:
@@ -608,6 +664,8 @@ class MLEnsemble:
             # so the metadata written to disk only reflects the current ensemble.
             self.training_metadata = {
                 'samples': len(X),
+                'feature_dim': _FEATURE_DIM,
+                'model_version': int(getattr(config, 'ML_MODEL_VERSION', 2)),
             }
 
             # Chronological split: first 80% = train, last 20% = test.
@@ -662,7 +720,7 @@ class MLEnsemble:
                 verbose_eval=False)
             y_prob = self.xgboost_model.predict(dtest)
             acc = accuracy_score(y_te, (y_prob > 0.5).astype(int))
-            auc = roc_auc_score(y_te, y_prob)
+            auc = roc_auc_score(y_te, y_prob) if len(np.unique(y_te)) > 1 else 0.5
         except ImportError:
             self.logger.warning(
                 "XGBoost not installed. Using sklearn GBC substitute. "
@@ -714,7 +772,7 @@ class MLEnsemble:
             self.rf_model.fit(X_tr, y_tr)
             y_prob = self.rf_model.predict_proba(X_te)[:, 1]
             acc    = accuracy_score(y_te, (y_prob > 0.5).astype(int))
-            auc    = roc_auc_score(y_te, y_prob)
+            auc    = roc_auc_score(y_te, y_prob) if len(np.unique(y_te)) > 1 else 0.5
             self.logger.info(
                 "RandomForest training complete. Accuracy: %.1f%%  AUC: %.3f",
                 acc * 100, auc)
@@ -728,21 +786,271 @@ class MLEnsemble:
             self.rf_model = None
             return True  # Non-fatal
 
+    # ==================== TRANSFER LEARNING ====================
+
+    def _train_pair_models_from_samples(
+        self,
+        per_symbol_samples: Dict[str, List[Tuple[np.ndarray, float]]],
+        force: bool = False,
+    ) -> int:
+        """
+        Fine-tune one XGBoost booster per symbol from the global booster.
+
+        This is transfer learning for this tabular setup: the global model
+        learns the shared strategy edge, then each pair model continues boosting
+        from that base on symbol-specific outcomes with conservative rounds.
+        """
+        if self.xgboost_model is None:
+            self.logger.info("Pair fine-tuning skipped: no global XGBoost model.")
+            return 0
+
+        promoted = 0
+        min_samples = int(getattr(config, 'ML_PAIR_MIN_RETRAIN_SAMPLES', 80))
+        min_class_fraction = float(getattr(config, 'ML_PAIR_MIN_CLASS_FRACTION', 0.20))
+
+        for symbol, samples in per_symbol_samples.items():
+            symbol = self._normalise_symbol(symbol)
+            if symbol in ('', 'GLOBAL', 'HISTORICAL'):
+                continue
+            if len(samples) < min_samples and not force:
+                continue
+
+            X = np.array([s[0] for s in samples], dtype=np.float32)
+            y = np.array([s[1] for s in samples], dtype=np.float32)
+            if len(X) < min_samples:
+                self.logger.info(
+                    "%s pair fine-tune skipped: %d samples < %d.",
+                    symbol, len(X), min_samples)
+                continue
+            pos_frac = float(y.mean())
+            if pos_frac < min_class_fraction or pos_frac > (1.0 - min_class_fraction):
+                self.logger.info(
+                    "%s pair fine-tune skipped: class balance %.1f%% wins.",
+                    symbol, pos_frac * 100)
+                continue
+
+            if self._fine_tune_pair_xgboost(symbol, X, y):
+                promoted += 1
+
+        return promoted
+
+    def _fine_tune_pair_xgboost(self, symbol: str, X: np.ndarray, y: np.ndarray) -> bool:
+        try:
+            import xgboost as xgb
+
+            split_idx = max(int(len(X) * 0.8), 1)
+            if len(X) - split_idx < 10:
+                self.logger.info(
+                    "%s pair fine-tune skipped: validation fold too small.", symbol)
+                return False
+
+            X_tr, X_te = X[:split_idx], X[split_idx:]
+            y_tr, y_te = y[:split_idx], y[split_idx:]
+            if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
+                self.logger.info(
+                    "%s pair fine-tune skipped: train/test fold has one class.", symbol)
+                return False
+
+            X_tr_s = self.scaler.transform(X_tr)
+            X_te_s = self.scaler.transform(X_te)
+            dtrain = xgb.DMatrix(X_tr_s, label=y_tr)
+            dtest = xgb.DMatrix(X_te_s, label=y_te)
+            params = {
+                'objective': 'binary:logistic',
+                'max_depth': 2,
+                'learning_rate': 0.01,
+                'subsample': 0.7,
+                'colsample_bytree': 0.7,
+                'min_child_weight': 10,
+                'gamma': 0.3,
+                'reg_alpha': 0.7,
+                'reg_lambda': 4.0,
+                'eval_metric': 'auc',
+                'scale_pos_weight': float(np.sum(np.round(y_tr) == 0)) / max(float(np.sum(np.round(y_tr) == 1)), 1.0),
+                'seed': 100 + (abs(hash(symbol)) % 10000),
+            }
+
+            candidate = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=120,
+                evals=[(dtest, 'test')],
+                early_stopping_rounds=20,
+                verbose_eval=False,
+                xgb_model=self.xgboost_model,
+            )
+            y_prob = candidate.predict(dtest)
+            auc = roc_auc_score(y_te, y_prob)
+            acc = accuracy_score(y_te, (y_prob > 0.5).astype(int))
+            min_auc = float(getattr(config, 'ML_PAIR_MIN_VALIDATION_AUC', 0.52))
+            if auc < min_auc:
+                self.logger.info(
+                    "%s pair model rejected: AUC %.3f below %.3f.",
+                    symbol, auc, min_auc)
+                return False
+
+            metadata = {
+                'symbol': symbol,
+                'samples': int(len(X)),
+                'win_rate': float(y.mean()),
+                'accuracy': f"{acc * 100:.1f}%",
+                'auc': f"{auc:.3f}",
+                'feature_dim': _FEATURE_DIM,
+                'model_version': int(getattr(config, 'ML_MODEL_VERSION', 3)),
+                'trained_at': datetime.now(timezone.utc).isoformat(),
+                'base_samples': self.training_metadata.get('samples', 0),
+            }
+            if self._save_pair_model(symbol, candidate, metadata):
+                self.logger.info(
+                    "%s pair model promoted: samples=%d AUC=%.3f Acc=%.1f%%.",
+                    symbol, len(X), auc, acc * 100)
+                return True
+            return False
+
+        except ImportError:
+            self.logger.warning(
+                "Pair transfer learning requires xgboost. Install xgboost.")
+            return False
+        except Exception as e:
+            self.logger.error("%s pair fine-tune failed: %s", symbol, e)
+            return False
+
     # ==================== LIVE AUTO-RETRAIN ====================
 
-    def record_trade_outcome(self, features: np.ndarray, won: bool) -> bool:
+    def load_live_training_history(self, limit: Optional[int] = None) -> int:
+        """
+        Reload persisted live outcomes from the database so auto-training
+        survives process restarts.
+        """
+        try:
+            import database as db
+
+            rows = db.get_recent_ml_training_data(
+                limit or int(getattr(config, 'ML_LIVE_HISTORY_LIMIT', 3000)))
+            loaded: List[Tuple[np.ndarray, float, str]] = []
+            # Database returns newest first; reverse to keep chronological order.
+            for row in reversed(rows):
+                raw_features = json.loads(row.get('features_json') or '[]')
+                features = np.array(raw_features, dtype=np.float32)
+                if len(features) != _FEATURE_DIM:
+                    continue
+                outcome = float(row.get('outcome'))
+                if outcome not in (0.0, 1.0):
+                    continue
+                symbol = self._normalise_symbol(row.get('symbol'))
+                loaded.append((features, outcome, symbol))
+
+            if loaded:
+                self.training_data_history = loaded[-self.max_history_size:]
+                self.logger.info(
+                    "Loaded %d live ML training examples from database.",
+                    len(self.training_data_history))
+            return len(self.training_data_history)
+        except Exception as e:
+            self.logger.warning("Could not load live ML training history: %s", e)
+            return 0
+
+    def retrain_from_live_history(self, force: bool = False) -> bool:
+        """Train from durable live outcomes when enough examples exist."""
+        if len(self.training_data_history) < int(
+            getattr(config, 'ML_MIN_RETRAIN_SAMPLES', 200)
+        ):
+            if force:
+                self.logger.warning(
+                    "Live retrain skipped: only %d samples available.",
+                    len(self.training_data_history))
+            return False
+
+    def _load_pair_models(self) -> int:
+        loaded = 0
+        try:
+            self.pair_models = {}
+            self.pair_metadata = {}
+            expected_version = int(getattr(config, 'ML_MODEL_VERSION', 3))
+
+            for filename in os.listdir(_MODEL_DIR):
+                if not filename.startswith(_PAIR_MODEL_PREFIX) or not filename.endswith('.pkl'):
+                    continue
+                symbol = filename[len(_PAIR_MODEL_PREFIX):-4].upper()
+                model_path = os.path.join(_MODEL_DIR, filename)
+                meta_path = self._pair_meta_path(symbol)
+                metadata = {}
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'rb') as f:
+                        metadata = pickle.load(f)
+                if (
+                    int(metadata.get('model_version', 0) or 0) != expected_version
+                    or int(metadata.get('feature_dim', 0) or 0) != _FEATURE_DIM
+                ):
+                    self.logger.warning(
+                        "Skipping stale pair model for %s.", symbol)
+                    continue
+                with open(model_path, 'rb') as f:
+                    self.pair_models[symbol] = pickle.load(f)
+                self.pair_metadata[symbol] = metadata
+                loaded += 1
+            if loaded:
+                self.logger.info("Loaded %d pair fine-tuned model(s).", loaded)
+        except Exception as e:
+            self.logger.warning("Could not load pair models: %s", e)
+        return loaded
+
+    def _save_pair_model(self, symbol: str, model: object, metadata: Dict) -> bool:
+        try:
+            symbol = self._normalise_symbol(symbol)
+            with open(self._pair_model_path(symbol), 'wb') as f:
+                pickle.dump(model, f)
+            with open(self._pair_meta_path(symbol), 'wb') as f:
+                pickle.dump(metadata, f)
+            self.pair_models[symbol] = model
+            self.pair_metadata[symbol] = metadata
+            return True
+        except Exception as e:
+            self.logger.error("Failed to save pair model for %s: %s", symbol, e)
+            return False
+
+        X = np.array([h[0] for h in self.training_data_history], dtype=np.float32)
+        y = np.array([h[1] for h in self.training_data_history], dtype=np.float32)
+        if len(np.unique(y)) < 2:
+            self.logger.warning(
+                "Live retrain skipped: outcomes contain only one class.")
+            return False
+        if not self._train_all_models(X, y):
+            return False
+
+        per_symbol_samples: Dict[str, List[Tuple[np.ndarray, float]]] = defaultdict(list)
+        for features, outcome, symbol in self.training_data_history:
+            per_symbol_samples[self._normalise_symbol(symbol)].append((features, outcome))
+        promoted = self._train_pair_models_from_samples(per_symbol_samples, force=force)
+        self.logger.info("Live transfer-learning pass promoted %d pair model(s).", promoted)
+        return True
+
+    def record_trade_outcome(
+        self,
+        features: np.ndarray,
+        won: bool,
+        symbol: Optional[str] = None,
+    ) -> bool:
         """
         Record a live trade outcome. Called by position_monitor after each close.
-        Every 100 outcomes, both models retrain on the combined dataset.
+        Retrains automatically after the configured number of new outcomes.
 
         Args:
-            features: 22-element vector from get_ensemble_prediction()['features']
-            won:      True = TP2 hit. False = stop loss hit.
+            features: 28-element vector from get_ensemble_prediction()['features']
+            won:      True = profitable managed outcome. False = loss.
 
         Returns:
             True if a retrain was triggered and succeeded.
         """
-        self.training_data_history.append((features, 1.0 if won else 0.0))
+        features = np.array(features, dtype=np.float32)
+        if len(features) != _FEATURE_DIM:
+            self.logger.warning(
+                "Ignoring ML outcome with feature length %d; expected %d.",
+                len(features), _FEATURE_DIM)
+            return False
+
+        self.training_data_history.append(
+            (features, 1.0 if won else 0.0, self._normalise_symbol(symbol)))
         if len(self.training_data_history) > self.max_history_size:
             self.training_data_history = self.training_data_history[-self.max_history_size:]
 
@@ -753,17 +1061,12 @@ class MLEnsemble:
                 "Auto-retrain triggered: %d live outcomes accumulated.",
                 self.training_threshold)
             self.setups_since_training = 0
-            X = np.array([h[0] for h in self.training_data_history], dtype=np.float32)
-            y = np.array([h[1] for h in self.training_data_history], dtype=np.float32)
-            if len(X) >= 200:
-                success = self._train_all_models(X, y)
-                if success:
-                    self.logger.info(
-                        "Auto-retrain complete. Total samples: %d.", len(X))
-                return success
-            else:
-                self.logger.warning(
-                    "Auto-retrain skipped: only %d samples (need 200+).", len(X))
+            success = self.retrain_from_live_history(force=True)
+            if success:
+                self.logger.info(
+                    "Auto-retrain complete. Total samples: %d.",
+                    len(self.training_data_history))
+            return success
         return False
 
     # ==================== FEATURE EXTRACTION ====================
@@ -772,7 +1075,7 @@ class MLEnsemble:
         self, data: pd.DataFrame, poi: Dict, htf_trend: Dict, setup_type: str
     ) -> np.ndarray:
         """
-        Convert OHLCV data and POI into a 22-element normalised feature vector.
+        Convert OHLCV data and POI into a 28-element normalised feature vector.
 
         This SAME function is called during:
           - Training: _generate_training_samples() uses this
@@ -803,6 +1106,12 @@ class MLEnsemble:
          19    Close vs POI midpoint (direction-aware)
          20    EMA9 vs EMA21 momentum agrees with direction
          21    Consecutive same-direction closes / 10
+         22    Gold instrument flag
+         23    Crypto instrument flag
+         24    JPY pair/cross flag
+         25    London/NY/overlap session flag
+         26    Current candle range / ATR
+         27    20-bar directional efficiency
         """
         try:
             close  = data['close'].values
@@ -814,6 +1123,7 @@ class MLEnsemble:
 
             direction = poi.get('direction', 'BULLISH')
             is_buy    = direction == 'BULLISH'
+            symbol    = str(poi.get('symbol', '')).upper()
             price     = float(close[-1])
 
             # 0: HTF alignment
@@ -893,12 +1203,31 @@ class MLEnsemble:
                 elif not is_buy and close[k] < open_[k]: cnt += 1
                 else: break
 
+            is_gold = 1.0 if symbol == 'XAUUSD' else 0.0
+            is_crypto = 1.0 if symbol in ('BTCUSD', 'BTCUSDT') else 0.0
+            is_jpy = 1.0 if 'JPY' in symbol else 0.0
+            try:
+                last_ts = data.index[-1]
+                hour = int(getattr(last_ts, 'hour', 0))
+            except Exception:
+                hour = 0
+            liquid_session = 1.0 if 7 <= hour <= 20 else 0.0
+            current_range = max(float(high[-1]) - float(low[-1]), 0.0)
+            range_atr = min(current_range / max(atr, 1e-9), 5.0) / 5.0
+            if len(close) >= 21:
+                net_move = abs(float(close[-1]) - float(close[-21]))
+                path = float(np.sum(np.abs(np.diff(close[-21:]))))
+                efficiency = min(net_move / max(path, 1e-9), 1.0)
+            else:
+                efficiency = 0.0
+
             f = np.array([
                 htf_ok, rsi / 100.0, rsi_zone, atr_norm, atr_r,
                 macd_ok, poi_vr, vol_sg, imp_p, fresh,
                 bb_up_r, bb_lo_r, ab50, ab20,
                 is_ob, is_bb, is_fvg, is_bos, body_r, cpoi,
                 ema_ok, cnt / 10.0,
+                is_gold, is_crypto, is_jpy, liquid_session, range_atr, efficiency,
             ], dtype=np.float32)
             assert len(f) == _FEATURE_DIM, (
                 f"Feature vector length {len(f)} does not match _FEATURE_DIM {_FEATURE_DIM}. "
@@ -929,6 +1258,21 @@ class MLEnsemble:
                 "XGBoost not trained yet, using heuristic fallback (50%%): %s", e)
             return 50
 
+    def predict_pair_xgboost(self, features: np.ndarray, symbol: str) -> Optional[int]:
+        """Predict with the symbol-specific fine-tuned booster when available."""
+        symbol = self._normalise_symbol(symbol)
+        model = self.pair_models.get(symbol)
+        if model is None:
+            return None
+        try:
+            import xgboost as xgb
+            f_s = self.scaler.transform(features.reshape(1, -1))
+            p = model.predict(xgb.DMatrix(f_s))[0]
+            return int(p * 100)
+        except Exception as e:
+            self.logger.debug("%s pair prediction skipped: %s", symbol, e)
+            return None
+
     def get_ensemble_prediction(self, data, poi, htf_trend, setup_type) -> Dict:
         """
         Combined prediction using XGBoost (70%) and RandomForest (30%).
@@ -940,6 +1284,8 @@ class MLEnsemble:
         try:
             features = self.extract_features(data, poi, htf_trend, setup_type)
             xgb_s    = self.predict_xgboost(data, poi, htf_trend, setup_type)
+            symbol   = self._normalise_symbol(poi.get('symbol'))
+            pair_s   = self.predict_pair_xgboost(features, symbol)
 
             rf_s = None
             if self.models_trained and self.rf_model is not None:
@@ -949,11 +1295,19 @@ class MLEnsemble:
                 except Exception as rf_err:
                     self.logger.debug("RF prediction skipped: %s", rf_err)
 
-            consensus = (
+            base_consensus = (
                 int(xgb_s * 0.70 + rf_s * 0.30)
                 if rf_s is not None
                 else xgb_s
             )
+            if pair_s is not None:
+                pair_weight = float(getattr(config, 'ML_PAIR_MODEL_WEIGHT', 0.45))
+                consensus = int(
+                    base_consensus * (1.0 - pair_weight)
+                    + pair_s * pair_weight
+                )
+            else:
+                consensus = base_consensus
 
             # 75%+ = STRONG  -> auto-execute eligible
             # 60-74% = MODERATE -> auto-execute eligible
@@ -964,15 +1318,17 @@ class MLEnsemble:
             )
 
             self.logger.info(
-                "Ensemble: XGBoost=%d%%  RF=%s%%  Consensus=%d%%  "
+                "Ensemble: XGBoost=%d%%  RF=%s%%  Pair=%s%%  Consensus=%d%%  "
                 "Agreement=%s  Trained: %s",
                 xgb_s,
                 rf_s if rf_s is not None else 'N/A',
+                pair_s if pair_s is not None else 'N/A',
                 consensus, agreement, self.models_trained)
 
             return {
                 'xgboost_score':   xgb_s,
                 'rf_score':        rf_s,
+                'pair_score':      pair_s,
                 'consensus_score': consensus,
                 'agreement':       agreement,
                 'direction':       poi.get('direction', 'BULLISH'),
@@ -984,6 +1340,7 @@ class MLEnsemble:
             return {
                 'xgboost_score': 50,
                 'rf_score':      None,
+                'pair_score':    None,
                 'consensus_score': 50,
                 'agreement': 'WEAK',
                 'direction': poi.get('direction', 'BULLISH'),
@@ -1012,10 +1369,11 @@ class MLEnsemble:
                 'trained':     False,
                 'status_text': (
                     'Models not yet trained. Using calibrated heuristics. '
-                    'Run: python train_models.py')}
+                    'Run: python train_models.py'),
+                'pair_models': len(self.pair_models)}
         return {
             'trained':          True,
-            'status_text':      'Trained ML models active (XGBoost + RandomForest ensemble).',
+            'status_text':      'Trained ML active (global XGBoost/RF plus pair transfer models).',
             'xgboost_accuracy': self.training_metadata.get('xgboost_accuracy', 'N/A'),
             'rf_accuracy':      self.training_metadata.get('rf_accuracy',      'N/A'),
             'xgboost_auc':      self.training_metadata.get('xgboost_auc',      'N/A'),
@@ -1024,6 +1382,10 @@ class MLEnsemble:
             'samples':          self.training_metadata.get('samples',           0),
             'live_outcomes_since_last_retrain': self.setups_since_training,
             'retrain_threshold': self.training_threshold,
+            'feature_dim':       self.training_metadata.get('feature_dim', _FEATURE_DIM),
+            'model_version':     self.training_metadata.get(
+                'model_version', getattr(config, 'ML_MODEL_VERSION', 2)),
+            'pair_models':       sorted(self.pair_models.keys()),
         }
 
     # ==================== HEURISTIC FALLBACKS (PRE-TRAINING) ====================

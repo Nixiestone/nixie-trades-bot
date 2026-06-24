@@ -252,6 +252,7 @@ COMMENT ON TABLE message_queue IS
 CREATE TABLE IF NOT EXISTS ml_training_data (
     id              BIGSERIAL       PRIMARY KEY,
     mt5_ticket      BIGINT,
+    symbol          TEXT,
     features_json   TEXT            NOT NULL,
     outcome         NUMERIC(3,1)    NOT NULL,   -- 1.0 = WIN,  0.0 = LOSS
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
@@ -259,6 +260,12 @@ CREATE TABLE IF NOT EXISTS ml_training_data (
 
 CREATE INDEX IF NOT EXISTS idx_ml_training_created
     ON ml_training_data (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_ml_training_symbol_created
+    ON ml_training_data (symbol, created_at DESC);
+
+ALTER TABLE ml_training_data
+    ADD COLUMN IF NOT EXISTS symbol TEXT;
 
 COMMENT ON TABLE ml_training_data IS
     'Feature vectors and outcomes used to retrain ML models on live trade results.';

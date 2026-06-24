@@ -306,6 +306,20 @@ class NixTradesScheduler:
             )
 
             self.scheduler.add_job(
+                self._run_ml_auto_training,
+                IntervalTrigger(
+                    hours=max(1, int(getattr(config, 'ML_AUTO_TRAIN_INTERVAL_HOURS', 24))),
+                    timezone='UTC',
+                ),
+                id='ml_auto_training',
+                name='ML Live Outcome Auto-Training',
+                replace_existing=True,
+                misfire_grace_time=600,
+                coalesce=True,
+                max_instances=1,
+            )
+
+            self.scheduler.add_job(
                 self._check_news_reminders,
                 IntervalTrigger(minutes=5, timezone='UTC'),
                 id='news_reminders',
@@ -317,6 +331,7 @@ class NixTradesScheduler:
             )
 
             self.scheduler.start()
+            self._run_ml_auto_training()
             self.running = True
             self.logger.info(
                 "Scheduler started.\n"
@@ -445,6 +460,20 @@ class NixTradesScheduler:
             )
             return
         await self._reconcile_open_trades()
+
+    def _run_ml_auto_training(self):
+        """Reload live ML outcomes and retrain when enough data is available."""
+        try:
+            if self.ml is None:
+                return
+            loaded = self.ml.load_live_training_history()
+            if loaded >= int(getattr(config, 'ML_MIN_RETRAIN_SAMPLES', 200)):
+                if self.ml.retrain_from_live_history(force=False):
+                    self.logger.info(
+                        "ML auto-training completed from %d live outcomes.",
+                        loaded)
+        except Exception as e:
+            self.logger.warning("ML auto-training skipped: %s", e)
 
     # ==================== DAILY 8 AM ALERT ====================
 
@@ -620,7 +649,15 @@ class NixTradesScheduler:
                 )
                 return
 
-            for symbol in config.MONITORED_SYMBOLS:
+            scan_symbols = getattr(
+                config,
+                'HIGH_RR_TRADING_PAIRS',
+                config.MONITORED_SYMBOLS,
+            )
+            self.logger.info(
+                "High-R scan universe: %s", ", ".join(scan_symbols))
+
+            for symbol in scan_symbols:
                 try:
                     if not await self.mt5.is_worker_reachable():
                         self.logger.warning(
@@ -647,6 +684,12 @@ class NixTradesScheduler:
         Phase 4: Entry/SL/TP calculation and broadcast
         """
         try:
+            high_rr_pairs = set(getattr(config, 'HIGH_RR_TRADING_PAIRS', []))
+            if high_rr_pairs and symbol not in high_rr_pairs:
+                self.logger.info(
+                    "Skipping %s: not in high-R trading universe.", symbol)
+                return
+
             # Bail immediately if the active market-data backend is offline.
             # Without this, the scan blocks for 10+ minutes per symbol
             # retrying 4 times per timeframe with no worker available.
@@ -735,6 +778,16 @@ class NixTradesScheduler:
             if htf_trend.get('trend') == 'RANGING':
                 self.logger.info("%s D1 trend is RANGING. Skipping.", symbol)
                 return
+            if int(htf_trend.get('confidence', 0)) < int(
+                getattr(config, 'HIGH_RR_MIN_D1_CONFIDENCE', 60)
+            ):
+                self.logger.info(
+                    "%s D1 trend confidence %s%% below high-R minimum %s%%. Skipping.",
+                    symbol,
+                    htf_trend.get('confidence', 0),
+                    getattr(config, 'HIGH_RR_MIN_D1_CONFIDENCE', 60),
+                )
+                return
 
             # H4 confirmation is stored here but the gate is NOT applied yet.
             # setup_type is not known until after BOS/MSS detection below.
@@ -780,6 +833,11 @@ class NixTradesScheduler:
                 self.logger.info(
                     "%s: no H1 BOS or MSS confirmed. Skipping.", symbol)
                 return
+            if getattr(config, 'HIGH_RR_BOS_ONLY', True) and setup_type != 'BOS':
+                self.logger.info(
+                    "%s %s skipped: high-R model only trades trend-continuation BOS.",
+                    symbol, setup_type)
+                return
 
             # Detect POI candidates directly on M15 in the recent window.
             # POI impulse does not need to be large on M15 — the H1 BOS/MSS
@@ -820,6 +878,17 @@ class NixTradesScheduler:
             # Apply H4 alignment gate for BOS continuation setups only.
             # MSS is a reversal — requiring H4 alignment is a contradiction.
             if setup_type == 'BOS' and h4_trend_data is not None:
+                if (
+                    getattr(config, 'HIGH_RR_REQUIRE_H4_ALIGNMENT', True)
+                    and not h4_aligned
+                ):
+                    self.logger.info(
+                        "%s BOS: H4 trend (%s) is not aligned with D1 trend (%s). Skipping.",
+                        symbol,
+                        h4_trend_data.get('trend'),
+                        htf_trend.get('trend'),
+                    )
+                    return
                 if not h4_aligned and h4_trend_data.get('trend') != 'RANGING':
                     self.logger.info(
                         "%s BOS: H4 trend (%s) opposes D1 trend (%s). Skipping.",
@@ -831,6 +900,15 @@ class NixTradesScheduler:
             elif setup_type == 'MSS':
                 self.logger.debug(
                     "%s MSS: H4 alignment check skipped (reversal trade).", symbol)
+            if (
+                getattr(config, 'HIGH_RR_REQUIRE_H4_ALIGNMENT', True)
+                and setup_type == 'BOS'
+                and h4_trend_data is None
+            ):
+                self.logger.info(
+                    "%s: H4 trend unavailable; high-R model requires H4 alignment. Skipping.",
+                    symbol)
+                return
 
             # Update trade_direction from the confirmed structure direction.
             trade_direction = trade_dir_from_structure
@@ -993,6 +1071,8 @@ class NixTradesScheduler:
                 )
 
             # Phase 3: ML validation
+            poi = dict(poi)
+            poi['symbol'] = symbol
             ml_result     = self.ml.get_ensemble_prediction(
                 _m15_recent, poi, htf_trend, setup_type)
             consensus     = ml_result['consensus_score']
@@ -1075,6 +1155,19 @@ class NixTradesScheduler:
                     sl_cfg = self.smc.calculate_stop_loss(
                         _refined_poi, trade_direction, symbol, _m5_atr
                     )
+            _sl_pips = utils.calculate_pips(
+                symbol, entry_cfg['entry_price'], sl_cfg['stop_loss'])
+            _max_sl_pips = float(
+                getattr(config, 'MAX_STOP_PIPS_BY_SYMBOL', {}).get(
+                    symbol,
+                    getattr(config, 'MAX_RISK_PIPS', 45),
+                )
+            )
+            if _sl_pips <= 0 or _sl_pips > _max_sl_pips:
+                self.logger.info(
+                    "%s rejected: stop distance %.1f pips exceeds high-R max %.1f pips.",
+                    symbol, _sl_pips, _max_sl_pips)
+                return
             try:
                 tp_cfg = self.smc.calculate_take_profits(
                     entry_cfg['entry_price'],
@@ -1341,14 +1434,17 @@ class NixTradesScheduler:
         try:
             direction = poi.get('direction', 'BULLISH')
 
-            # Filter 1: ATR volatility - disabled, news blackout handles spike protection
+            # Filter 1: ATR volatility sweet spot. High-R targets need enough
+            # movement to travel, but not a news-like spike that blows out risk.
             atr     = self.smc._calculate_atr(data.tail(20))
             atr_avg = float(data.tail(40)['close'].diff().abs().mean())
-            atr_pass, _ = self.smc.check_atr_filter(atr, atr_avg)
+            atr_pass, atr_reason = self.smc.check_atr_filter(atr, atr_avg)
             atr_ratio = round(atr / atr_avg, 2) if atr_avg > 0 else 0
-            self.logger.debug(
-                "%s ATR (informational only, not blocking): ratio=%.2fx - "
-                "setup continues regardless.", symbol, atr_ratio)
+            if not atr_pass:
+                self.logger.info(
+                    "%s failed ATR filter: %s (ratio=%.2fx)",
+                    symbol, atr_reason, atr_ratio)
+                return False
 
             # Filter 2: Session - Asian is Unicorn-only, all other sessions trade
             utc_hour     = datetime.now(timezone.utc).hour
@@ -1367,14 +1463,15 @@ class NixTradesScheduler:
             adx_data = data.tail(60)
             if len(adx_data) >= 33:
                 pass_adx, adx_val, reason_adx = self.smc.check_adx_filter(adx_data)
-                if not pass_adx:
+                min_adx = float(getattr(config, 'HIGH_RR_MIN_ADX', 25.0))
+                if not pass_adx or adx_val < min_adx:
                     self.logger.debug(
-                        "%s failed ADX filter: %s (ADX=%.1f)", symbol, reason_adx, adx_val)
+                        "%s failed ADX filter: %s (ADX=%.1f, min=%.1f)",
+                        symbol, reason_adx, adx_val, min_adx)
                     return False
 
-            # Filter 4: Premium/discount zone - informational and priority tagging only.
-            # Zone position does not block a setup. When price is in the correct zone
-            # (discount for BUY, premium for SELL) it is flagged as HIGH PRIORITY.
+            # Filter 4: Premium/discount zone. For 3R/5R targets, the entry
+            # must be on the favorable side of the HTF range.
             swing_high    = float(htf_trend.get('swing_high', 0))
             swing_low     = float(htf_trend.get('swing_low',  0))
             current_price = float(data.iloc[-1]['close'])
@@ -1393,9 +1490,10 @@ class NixTradesScheduler:
                         'discount' if direction == 'BULLISH' else 'premium')
                 else:
                     self.logger.info(
-                        "%s ZONE - STANDARD: %s (zone_pos=%.2f). "
-                        "Not in optimal zone but setup proceeds on other merits.",
+                        "%s failed premium/discount filter: %s (zone_pos=%.2f).",
                         symbol, zone_desc, zone_pos)
+                    if getattr(config, 'HIGH_RR_REQUIRE_PREMIUM_DISCOUNT', True):
+                        return False
 
             # Filter 5: Composite setup quality score
             try:
@@ -1403,12 +1501,17 @@ class NixTradesScheduler:
                     data.tail(50), htf_trend.get('trend', 'BULLISH'))
                 quality = self.smc.score_setup_quality(
                     data, poi, htf_trend, bos_events, direction, symbol)
-                self.logger.debug(
-                    "%s quality score: %d (informational only, not blocking).",
-                    symbol, quality)
+                min_quality = int(getattr(config, 'MIN_SETUP_QUALITY_SCORE', 70))
+                if quality < min_quality:
+                    self.logger.info(
+                        "%s failed quality filter: %d below minimum %d.",
+                        symbol, quality, min_quality)
+                    return False
             except Exception as qe:
                 self.logger.warning(
-                    "Quality score failed for %s (%s). Continuing without it.", symbol, qe)
+                    "Quality score failed for %s (%s). Rejecting high-R setup.",
+                    symbol, qe)
+                return False
 
             return True
 

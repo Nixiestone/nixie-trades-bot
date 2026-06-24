@@ -95,3 +95,7 @@ service-account.json
 .pytest_cache/
 .coverage
 htmlcov/
+# ---- cleanup additions ----
+venv_old/
+*.log.*
+tmp_*.png
